@@ -1,0 +1,5 @@
+{
+  "name": "ServiAdmin",
+  "description": "Enterprise Home Services Admin Dashboard for managing bookings, providers, and revenue.",
+  "requestFramePermissions": []
+}
