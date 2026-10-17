@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+
+# Environment variables (SECRET KEYS - NEVER PUSH)
+.env
+.env.local
+.env.production
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Uploads (user files, images, etc.)
+uploads/
+public/uploads/
+
+# Database files
+*.sqlite
+*.sqlite3
+*.db
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python (if using Python backend)
+__pycache__/
+*.pyc
+venv/
+env/
+.venv/
+
+# Java (if using Spring Boot)
+target/
+*.class
+*.jar
+
+# Temp & Cache
+tmp/
+temp/
+.cache/
+
+# Misc
+*.pid
+*.seed
