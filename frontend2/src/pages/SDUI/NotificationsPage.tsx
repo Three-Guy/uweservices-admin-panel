@@ -30,11 +30,9 @@ import {
   Square,
   MinusSquare,
 } from 'lucide-react';
+import { apiClient } from '../../lib/api'; // ✅ Single source of truth
 
-// API Base URL
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:5002';
-
-// Types
+// ==================== TYPES ====================
 interface Notification {
   _id: string;
   title: string;
@@ -96,11 +94,11 @@ export default function NotificationsPage() {
   const [selectedNotification, setSelectedNotification] = useState<Notification | null>(null);
   const [showDetailsModal, setShowDetailsModal] = useState(false);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
-  
+
   // Selection state
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkActionLoading, setBulkActionLoading] = useState(false);
-  
+
   // Pagination
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
@@ -115,26 +113,12 @@ export default function NotificationsPage() {
   });
   const [showFilters, setShowFilters] = useState(false);
 
-  // Get auth token
-  const getAuthToken = () => {
-    const tokens = localStorage.getItem('admin_tokens');
-    if (tokens) {
-      try {
-        const parsed = JSON.parse(tokens);
-        return parsed.accessToken;
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  };
-
-  // Clear selection when page/filters change
+  // ==================== CLEAR SELECTION ON PAGE/FILTER CHANGE ====================
   useEffect(() => {
     setSelectedIds(new Set());
   }, [page, filters]);
 
-  // Auto-hide success message
+  // ==================== AUTO-HIDE SUCCESS MESSAGE ====================
   useEffect(() => {
     if (successMessage) {
       const timer = setTimeout(() => setSuccessMessage(null), 3000);
@@ -142,29 +126,25 @@ export default function NotificationsPage() {
     }
   }, [successMessage]);
 
-  // Fetch notifications
+  // ==================== FETCH NOTIFICATIONS ====================
   const fetchNotifications = useCallback(async () => {
     setLoading(true);
     setError(null);
 
     try {
-      const token = getAuthToken();
-      const params = new URLSearchParams({
+      const params: Record<string, string> = {
         page: page.toString(),
         limit: limit.toString(),
         sortBy: 'createdAt',
         sortOrder: 'desc',
-      });
+      };
 
-      if (filters.status) params.append('status', filters.status);
-      if (filters.type) params.append('type', filters.type);
-      if (filters.search) params.append('search', filters.search);
+      if (filters.status) params.status = filters.status;
+      if (filters.type) params.type = filters.type;
+      if (filters.search) params.search = filters.search;
 
-      const response = await fetch(`${API_BASE}/api/v1/admin/notifications?${params}`, {
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-
-      const data = await response.json();
+      const response = await apiClient.get('/admin/notifications', { params });
+      const data = response.data;
 
       if (data.success) {
         setNotifications(data.data.notifications);
@@ -174,23 +154,19 @@ export default function NotificationsPage() {
         setError(data.message || 'Failed to fetch notifications');
       }
     } catch (err: any) {
-      setError(err.message || 'Failed to fetch notifications');
+      setError(err.response?.data?.message || err.message || 'Failed to fetch notifications');
     } finally {
       setLoading(false);
     }
   }, [page, filters]);
 
-  // Fetch stats
+  // ==================== FETCH STATS ====================
   const fetchStats = async () => {
     setStatsLoading(true);
 
     try {
-      const token = getAuthToken();
-      const response = await fetch(`${API_BASE}/api/v1/admin/notifications/stats`, {
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-
-      const data = await response.json();
+      const response = await apiClient.get('/admin/notifications/stats');
+      const data = response.data;
 
       if (data.success) {
         setStats(data.data);
@@ -202,21 +178,19 @@ export default function NotificationsPage() {
     }
   };
 
-  // Initial fetch
+  // ==================== INITIAL FETCH ====================
   useEffect(() => {
     fetchNotifications();
     fetchStats();
   }, [fetchNotifications]);
 
-  // ===== SELECTION HANDLERS =====
-  
+  // ==================== SELECTION HANDLERS ====================
+
   // Toggle select all
   const handleSelectAll = () => {
     if (selectedIds.size === notifications.length) {
-      // Deselect all
       setSelectedIds(new Set());
     } else {
-      // Select all
       setSelectedIds(new Set(notifications.map(n => n._id)));
     }
   };
@@ -234,11 +208,11 @@ export default function NotificationsPage() {
 
   // Check if all selected
   const isAllSelected = notifications.length > 0 && selectedIds.size === notifications.length;
-  
+
   // Check if some selected (for indeterminate state)
   const isSomeSelected = selectedIds.size > 0 && selectedIds.size < notifications.length;
 
-  // ===== BULK DELETE =====
+  // ==================== BULK DELETE ====================
   const handleBulkDelete = async () => {
     if (selectedIds.size === 0) return;
 
@@ -249,21 +223,15 @@ export default function NotificationsPage() {
     setError(null);
 
     try {
-      const token = getAuthToken();
       const idsToDelete = Array.from(selectedIds);
-      
-      // Delete notifications one by one (or you can create a bulk delete endpoint)
+
       let successCount = 0;
       let failCount = 0;
 
       for (const id of idsToDelete) {
         try {
-          const response = await fetch(`${API_BASE}/api/v1/admin/notifications/${id}`, {
-            method: 'DELETE',
-            headers: { 'Authorization': `Bearer ${token}` }
-          });
-
-          const data = await response.json();
+          const response = await apiClient.delete(`/admin/notifications/${id}`);
+          const data = response.data;
 
           if (data.success) {
             successCount++;
@@ -289,13 +257,13 @@ export default function NotificationsPage() {
       fetchNotifications();
       fetchStats();
     } catch (err: any) {
-      setError(err.message || 'Failed to delete notifications');
+      setError(err.response?.data?.message || err.message || 'Failed to delete notifications');
     } finally {
       setBulkActionLoading(false);
     }
   };
 
-  // ===== BULK SEND =====
+  // ==================== BULK SEND ====================
   const handleBulkSend = async () => {
     // Filter only draft/scheduled notifications
     const sendableIds = Array.from(selectedIds).filter(id => {
@@ -315,18 +283,13 @@ export default function NotificationsPage() {
     setError(null);
 
     try {
-      const token = getAuthToken();
       let successCount = 0;
       let failCount = 0;
 
       for (const id of sendableIds) {
         try {
-          const response = await fetch(`${API_BASE}/api/v1/admin/notifications/${id}/send`, {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${token}` }
-          });
-
-          const data = await response.json();
+          const response = await apiClient.post(`/admin/notifications/${id}/send`);
+          const data = response.data;
 
           if (data.success) {
             successCount++;
@@ -352,26 +315,21 @@ export default function NotificationsPage() {
       fetchNotifications();
       fetchStats();
     } catch (err: any) {
-      setError(err.message || 'Failed to send notifications');
+      setError(err.response?.data?.message || err.message || 'Failed to send notifications');
     } finally {
       setBulkActionLoading(false);
     }
   };
 
-  // Handle send notification
+  // ==================== SEND NOTIFICATION ====================
   const handleSend = async (id: string) => {
     if (!confirm('Are you sure you want to send this notification?')) return;
 
     setActionLoading(id);
 
     try {
-      const token = getAuthToken();
-      const response = await fetch(`${API_BASE}/api/v1/admin/notifications/${id}/send`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-
-      const data = await response.json();
+      const response = await apiClient.post(`/admin/notifications/${id}/send`);
+      const data = response.data;
 
       if (data.success) {
         setSuccessMessage('Notification sent successfully!');
@@ -381,26 +339,21 @@ export default function NotificationsPage() {
         alert(data.message || 'Failed to send notification');
       }
     } catch (err: any) {
-      alert(err.message || 'Failed to send notification');
+      alert(err.response?.data?.message || err.message || 'Failed to send notification');
     } finally {
       setActionLoading(null);
     }
   };
 
-  // Handle cancel notification
+  // ==================== CANCEL NOTIFICATION ====================
   const handleCancel = async (id: string) => {
     if (!confirm('Are you sure you want to cancel this notification?')) return;
 
     setActionLoading(id);
 
     try {
-      const token = getAuthToken();
-      const response = await fetch(`${API_BASE}/api/v1/admin/notifications/${id}/cancel`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-
-      const data = await response.json();
+      const response = await apiClient.post(`/admin/notifications/${id}/cancel`);
+      const data = response.data;
 
       if (data.success) {
         setSuccessMessage('Notification cancelled successfully!');
@@ -410,24 +363,19 @@ export default function NotificationsPage() {
         alert(data.message || 'Failed to cancel notification');
       }
     } catch (err: any) {
-      alert(err.message || 'Failed to cancel notification');
+      alert(err.response?.data?.message || err.message || 'Failed to cancel notification');
     } finally {
       setActionLoading(null);
     }
   };
 
-  // Handle duplicate notification
+  // ==================== DUPLICATE NOTIFICATION ====================
   const handleDuplicate = async (id: string) => {
     setActionLoading(id);
 
     try {
-      const token = getAuthToken();
-      const response = await fetch(`${API_BASE}/api/v1/admin/notifications/${id}/duplicate`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-
-      const data = await response.json();
+      const response = await apiClient.post(`/admin/notifications/${id}/duplicate`);
+      const data = response.data;
 
       if (data.success) {
         fetchNotifications();
@@ -436,26 +384,21 @@ export default function NotificationsPage() {
         alert(data.message || 'Failed to duplicate notification');
       }
     } catch (err: any) {
-      alert(err.message || 'Failed to duplicate notification');
+      alert(err.response?.data?.message || err.message || 'Failed to duplicate notification');
     } finally {
       setActionLoading(null);
     }
   };
 
-  // Handle delete notification
+  // ==================== DELETE NOTIFICATION ====================
   const handleDelete = async (id: string) => {
     if (!confirm('Are you sure you want to delete this notification?')) return;
 
     setActionLoading(id);
 
     try {
-      const token = getAuthToken();
-      const response = await fetch(`${API_BASE}/api/v1/admin/notifications/${id}`, {
-        method: 'DELETE',
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-
-      const data = await response.json();
+      const response = await apiClient.delete(`/admin/notifications/${id}`);
+      const data = response.data;
 
       if (data.success) {
         setSuccessMessage('Notification deleted successfully!');
@@ -465,15 +408,17 @@ export default function NotificationsPage() {
         alert(data.message || 'Failed to delete notification');
       }
     } catch (err: any) {
-      alert(err.message || 'Failed to delete notification');
+      alert(err.response?.data?.message || err.message || 'Failed to delete notification');
     } finally {
       setActionLoading(null);
     }
   };
 
+  // ==================== UI HELPERS ====================
+
   // Get status badge
   const getStatusBadge = (status: string) => {
-    const styles = {
+    const styles: Record<string, string> = {
       draft: 'bg-gray-100 text-gray-700',
       scheduled: 'bg-amber-100 text-amber-700',
       sending: 'bg-blue-100 text-blue-700',
@@ -482,7 +427,7 @@ export default function NotificationsPage() {
       cancelled: 'bg-gray-100 text-gray-500',
     };
 
-    const icons = {
+    const icons: Record<string, React.ReactNode> = {
       draft: <Clock size={14} />,
       scheduled: <Calendar size={14} />,
       sending: <Loader2 size={14} className="animate-spin" />,
@@ -492,8 +437,8 @@ export default function NotificationsPage() {
     };
 
     return (
-      <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium ${styles[status as keyof typeof styles] || styles.draft}`}>
-        {icons[status as keyof typeof icons]}
+      <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium ${styles[status] || styles.draft}`}>
+        {icons[status]}
         {status}
       </span>
     );
@@ -532,6 +477,7 @@ export default function NotificationsPage() {
     }
   };
 
+  // ==================== RENDER ====================
   return (
     <div className="p-6 bg-gray-50 min-h-screen">
       {/* Header */}
@@ -546,7 +492,7 @@ export default function NotificationsPage() {
               <p className="text-gray-500">Manage and track all notifications</p>
             </div>
           </div>
-          
+
           <a
             href="/sdui/notifications/send"
             className="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-xl font-semibold hover:from-indigo-700 hover:to-purple-700 transition-all"
@@ -671,16 +617,16 @@ export default function NotificationsPage() {
         </div>
       </div>
 
-      {/* Bulk Action Bar - Shows when items are selected */}
+      {/* Bulk Action Bar */}
       {selectedIds.size > 0 && (
-        <div className="mb-4 p-4 bg-indigo-50 border border-indigo-200 rounded-xl flex items-center justify-between animate-in slide-in-from-top duration-200">
+        <div className="mb-4 p-4 bg-indigo-50 border border-indigo-200 rounded-xl flex items-center justify-between">
           <div className="flex items-center gap-3">
             <CheckSquare size={20} className="text-indigo-600" />
             <span className="font-medium text-indigo-900">
               {selectedIds.size} notification{selectedIds.size > 1 ? 's' : ''} selected
             </span>
           </div>
-          
+
           <div className="flex items-center gap-2">
             {/* Bulk Send Button */}
             <button
@@ -695,7 +641,7 @@ export default function NotificationsPage() {
               )}
               Send Selected
             </button>
-            
+
             {/* Bulk Delete Button */}
             <button
               onClick={handleBulkDelete}
@@ -709,7 +655,7 @@ export default function NotificationsPage() {
               )}
               Delete Selected
             </button>
-            
+
             {/* Clear Selection */}
             <button
               onClick={() => setSelectedIds(new Set())}
@@ -724,7 +670,7 @@ export default function NotificationsPage() {
 
       {/* Success Message */}
       {successMessage && (
-        <div className="mb-6 p-4 bg-green-50 border border-green-200 rounded-xl flex items-center gap-3 text-green-700 animate-in slide-in-from-top duration-200">
+        <div className="mb-6 p-4 bg-green-50 border border-green-200 rounded-xl flex items-center gap-3 text-green-700">
           <CheckCircle size={20} />
           <span>{successMessage}</span>
           <button onClick={() => setSuccessMessage(null)} className="ml-auto p-1 hover:bg-green-100 rounded">
@@ -783,8 +729,8 @@ export default function NotificationsPage() {
                 </thead>
                 <tbody className="divide-y divide-gray-100">
                   {notifications.map((notification) => (
-                    <tr 
-                      key={notification._id} 
+                    <tr
+                      key={notification._id}
                       className={`hover:bg-gray-50 transition-colors ${selectedIds.has(notification._id) ? 'bg-indigo-50' : ''}`}
                     >
                       {/* Row Checkbox */}
@@ -956,7 +902,7 @@ export default function NotificationsPage() {
                 <X size={20} />
               </button>
             </div>
-            
+
             <div className="p-6 space-y-6">
               {/* Header */}
               <div className="flex items-start justify-between">

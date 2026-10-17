@@ -23,11 +23,9 @@ import {
   MessageSquare,
   Zap,
 } from 'lucide-react';
+import { apiClient } from '../../lib/api'; // ✅ Use shared apiClient (single source of truth)
 
-// API Base URL
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:5002';
-
-// Types
+// ==================== TYPES ====================
 interface NotificationForm {
   title: string;
   body: string;
@@ -46,11 +44,13 @@ interface NotificationForm {
 interface City {
   _id: string;
   name: string;
+  cityName?: string;
 }
 
 interface Zone {
   _id: string;
   name: string;
+  zoneName?: string;
   cityId: string;
 }
 
@@ -79,23 +79,8 @@ export default function NotificationSender() {
   const [zones, setZones] = useState<Zone[]>([]);
   const [tagInput, setTagInput] = useState('');
   const [showScheduler, setShowScheduler] = useState(false);
-  const [previewMode, setPreviewMode] = useState(false);
 
-  // Get auth token
-  const getAuthToken = () => {
-    const tokens = localStorage.getItem('admin_tokens');
-    if (tokens) {
-      try {
-        const parsed = JSON.parse(tokens);
-        return parsed.accessToken;
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  };
-
-  // Fetch cities and zones
+  // ==================== FETCH CITIES & ZONES ====================
   useEffect(() => {
     fetchCities();
     fetchZones();
@@ -103,11 +88,8 @@ export default function NotificationSender() {
 
   const fetchCities = async () => {
     try {
-      const token = getAuthToken();
-      const response = await fetch(`${API_BASE}/api/v1/admin/cities`, {
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-      const data = await response.json();
+      const response = await apiClient.get('/admin/cities');
+      const data = response.data;
       if (data.success) {
         setCities(data.data.cities || data.data || []);
       }
@@ -118,11 +100,8 @@ export default function NotificationSender() {
 
   const fetchZones = async () => {
     try {
-      const token = getAuthToken();
-      const response = await fetch(`${API_BASE}/api/v1/admin/zones`, {
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-      const data = await response.json();
+      const response = await apiClient.get('/admin/zones');
+      const data = response.data;
       if (data.success) {
         setZones(data.data.zones || data.data || []);
       }
@@ -131,7 +110,7 @@ export default function NotificationSender() {
     }
   };
 
-  // Handle form change
+  // ==================== FORM HANDLERS ====================
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
     const { name, value } = e.target;
     setForm(prev => ({ ...prev, [name]: value }));
@@ -139,7 +118,6 @@ export default function NotificationSender() {
     setSuccess(null);
   };
 
-  // Handle multi-select change
   const handleMultiSelectChange = (name: string, value: string) => {
     setForm(prev => {
       const currentValues = prev[name as keyof NotificationForm] as string[];
@@ -151,7 +129,6 @@ export default function NotificationSender() {
     });
   };
 
-  // Handle tag add
   const handleAddTag = () => {
     if (tagInput.trim() && !form.tags.includes(tagInput.trim())) {
       setForm(prev => ({ ...prev, tags: [...prev.tags, tagInput.trim()] }));
@@ -159,12 +136,11 @@ export default function NotificationSender() {
     }
   };
 
-  // Handle tag remove
   const handleRemoveTag = (tag: string) => {
     setForm(prev => ({ ...prev, tags: prev.tags.filter(t => t !== tag) }));
   };
 
-  // Save as draft
+  // ==================== SAVE DRAFT ====================
   const handleSaveDraft = async () => {
     if (!form.title || !form.body) {
       setError('Title and body are required');
@@ -175,17 +151,8 @@ export default function NotificationSender() {
     setError(null);
 
     try {
-      const token = getAuthToken();
-      const response = await fetch(`${API_BASE}/api/v1/admin/notifications`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify(form)
-      });
-
-      const data = await response.json();
+      const response = await apiClient.post('/admin/notifications', form);
+      const data = response.data;
 
       if (data.success) {
         setSuccess('Notification saved as draft!');
@@ -194,13 +161,13 @@ export default function NotificationSender() {
         setError(data.message || 'Failed to save notification');
       }
     } catch (err: any) {
-      setError(err.message || 'Failed to save notification');
+      setError(err.response?.data?.message || err.message || 'Failed to save notification');
     } finally {
       setLoading(false);
     }
   };
 
-  // Send now
+  // ==================== SEND NOW ====================
   const handleSendNow = async () => {
     if (!form.title || !form.body) {
       setError('Title and body are required');
@@ -211,17 +178,8 @@ export default function NotificationSender() {
     setError(null);
 
     try {
-      const token = getAuthToken();
-      const response = await fetch(`${API_BASE}/api/v1/admin/notifications/send-now`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify(form)
-      });
-
-      const data = await response.json();
+      const response = await apiClient.post('/admin/notifications/send-now', form);
+      const data = response.data;
 
       if (data.success) {
         setSuccess(`Notification sent successfully! Delivered to ${data.data.notification.stats?.delivered || 0} recipients.`);
@@ -230,13 +188,13 @@ export default function NotificationSender() {
         setError(data.message || 'Failed to send notification');
       }
     } catch (err: any) {
-      setError(err.message || 'Failed to send notification');
+      setError(err.response?.data?.message || err.message || 'Failed to send notification');
     } finally {
       setSendingNow(false);
     }
   };
 
-  // Schedule notification
+  // ==================== SCHEDULE ====================
   const handleSchedule = async () => {
     if (!form.title || !form.body) {
       setError('Title and body are required');
@@ -252,17 +210,8 @@ export default function NotificationSender() {
     setError(null);
 
     try {
-      const token = getAuthToken();
-      const response = await fetch(`${API_BASE}/api/v1/admin/notifications`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify(form)
-      });
-
-      const data = await response.json();
+      const response = await apiClient.post('/admin/notifications', form);
+      const data = response.data;
 
       if (data.success) {
         setSuccess(`Notification scheduled for ${new Date(form.scheduledAt).toLocaleString()}`);
@@ -272,13 +221,13 @@ export default function NotificationSender() {
         setError(data.message || 'Failed to schedule notification');
       }
     } catch (err: any) {
-      setError(err.message || 'Failed to schedule notification');
+      setError(err.response?.data?.message || err.message || 'Failed to schedule notification');
     } finally {
       setLoading(false);
     }
   };
 
-  // Get type icon
+  // ==================== HELPER ICONS ====================
   const getTypeIcon = (type: string) => {
     switch (type) {
       case 'push': return <Smartphone size={18} />;
@@ -290,7 +239,6 @@ export default function NotificationSender() {
     }
   };
 
-  // Get audience icon
   const getAudienceIcon = (audience: string) => {
     switch (audience) {
       case 'all': return <Globe size={18} />;
@@ -476,7 +424,7 @@ export default function NotificationSender() {
                             : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
                         }`}
                       >
-                        {city.name}
+                        {city.cityName || city.name}
                       </button>
                     ))}
                     {cities.length === 0 && (
@@ -502,7 +450,7 @@ export default function NotificationSender() {
                             : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
                         }`}
                       >
-                        {zone.name}
+                        {zone.zoneName || zone.name}
                       </button>
                     ))}
                     {zones.length === 0 && (
