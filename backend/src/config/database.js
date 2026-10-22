@@ -14,6 +14,7 @@ try {
 let adminConnection = null;
 let providerConnection = null;
 let userConnection = null;
+let bookingConnection = null; // ✅ NEW
 let isConnected = false;
 
 // ===== CONNECTION OPTIONS =====
@@ -151,12 +152,52 @@ const connectUserDB = async () => {
 
     console.log('✓ User DB Connected');
     console.log('✓ Database:', userConnection.name || userDbName);
-    console.log('─'.repeat(60) + '\n');
     
     return userConnection;
     
   } catch (error) {
     console.error('✗ User DB Connection Error:', error.message);
+    throw error;
+  }
+};
+
+// ===== CONNECT TO BOOKINGS_DB DATABASE ✅ NEW =====
+const connectBookingDB = async () => {
+  try {
+    const uri = process.env.MONGODB_URI;
+    
+    if (!uri) {
+      throw new Error('MONGODB_URI not found in .env');
+    }
+
+    const bookingDbName = process.env.BOOKING_DB_NAME || 'bookings_db';
+    const bookingDbUri = createDbUri(uri, bookingDbName);
+
+    console.log('\n' + '─'.repeat(60));
+    console.log('🔌 Connecting to BOOKINGS_DB Database...');
+    console.log('─'.repeat(60));
+    console.log('Database:', bookingDbName);
+    
+    bookingConnection = mongoose.createConnection(bookingDbUri, connectionOptions);
+
+    await new Promise((resolve, reject) => {
+      bookingConnection.on('connected', () => resolve());
+      bookingConnection.on('error', (err) => reject(err));
+      setTimeout(() => {
+        if (bookingConnection.readyState !== 1) {
+          reject(new Error('Booking DB connection timeout'));
+        }
+      }, 30000);
+    });
+
+    console.log('✓ Booking DB Connected');
+    console.log('✓ Database:', bookingConnection.name || bookingDbName);
+    console.log('─'.repeat(60) + '\n');
+    
+    return bookingConnection;
+    
+  } catch (error) {
+    console.error('✗ Booking DB Connection Error:', error.message);
     throw error;
   }
 };
@@ -569,6 +610,24 @@ const createUserSchema = () => {
   userSchema.index({ isActive: 1 });
 
   return userSchema;
+};
+
+// ===== BOOKING SCHEMA ✅ NEW (strict: false to preserve all 60+ fields) =====
+const createBookingSchema = () => {
+  const bookingSchema = new mongoose.Schema({}, {
+    strict: false,
+    timestamps: true,
+    collection: 'bookings',
+    minimize: false,
+  });
+
+  bookingSchema.methods.toJSON = function() {
+    const booking = this.toObject();
+    booking.id = booking._id;
+    return booking;
+  };
+
+  return bookingSchema;
 };
 
 // ============================================================================
@@ -2496,6 +2555,17 @@ const getUserModel = () => {
   return userConnection.model('User', createUserSchema(), 'users');
 };
 
+// ===== BOOKING MODEL GETTER ✅ NEW =====
+const getBookingModel = () => {
+  if (!bookingConnection) {
+    throw new Error('Booking database not connected. Call connectDB() first.');
+  }
+  if (bookingConnection.models.Booking) {
+    return bookingConnection.models.Booking;
+  }
+  return bookingConnection.model('Booking', createBookingSchema(), 'bookings');
+};
+
 // ===== SERVER-DRIVEN UI MODEL GETTERS =====
 const getCategoryModel = () => {
   if (!adminConnection) {
@@ -2691,6 +2761,7 @@ const connectDB = async () => {
     await connectAdminDB();
     await connectProviderDB();
     await connectUserDB();
+    await connectBookingDB(); // ✅ NEW
     
     isConnected = true;
 
@@ -2709,6 +2780,11 @@ const connectDB = async () => {
       console.log('\n📦 Collections in user_db:');
       const userCollections = await userConnection.db.listCollections().toArray();
       userCollections.forEach(col => console.log(`   - ${col.name}`));
+
+      // ✅ NEW
+      console.log('\n📦 Collections in bookings_db:');
+      const bookingCollections = await bookingConnection.db.listCollections().toArray();
+      bookingCollections.forEach(col => console.log(`   - ${col.name}`));
     } catch (e) {
       console.log('Could not list collections');
     }
@@ -2742,7 +2818,16 @@ const connectDB = async () => {
       console.warn('⚠️ User DB Disconnected');
     });
 
-    return { adminConnection, providerConnection, userConnection };
+    // ✅ NEW
+    bookingConnection.on('error', (err) => {
+      console.error('❌ Booking DB Error:', err.message);
+    });
+
+    bookingConnection.on('disconnected', () => {
+      console.warn('⚠️ Booking DB Disconnected');
+    });
+
+    return { adminConnection, providerConnection, userConnection, bookingConnection };
     
   } catch (error) {
     console.error('\n' + '═'.repeat(60));
@@ -2771,6 +2856,12 @@ const gracefulShutdown = async (signal) => {
       await userConnection.close();
       console.log('✓ User DB connection closed');
     }
+
+    // ✅ NEW
+    if (bookingConnection) {
+      await bookingConnection.close();
+      console.log('✓ Booking DB connection closed');
+    }
     
     isConnected = false;
     console.log('✓ All connections closed gracefully');
@@ -2791,12 +2882,14 @@ module.exports = connectDB;
 module.exports.getAdminConnection = () => adminConnection;
 module.exports.getProviderConnection = () => providerConnection;
 module.exports.getUserConnection = () => userConnection;
+module.exports.getBookingConnection = () => bookingConnection; // ✅ NEW
 
 // Existing model getters
 module.exports.getAdminModel = getAdminModel;
 module.exports.getProviderModel = getProviderModel;
 module.exports.getVerificationModel = getVerificationModel;
 module.exports.getUserModel = getUserModel;
+module.exports.getBookingModel = getBookingModel; // ✅ NEW
 
 // Server-Driven UI model getters
 module.exports.getCategoryModel = getCategoryModel;
