@@ -15,6 +15,8 @@ let adminConnection = null;
 let providerConnection = null;
 let userConnection = null;
 let bookingConnection = null; // ✅ NEW
+let trackingConnection = null; // ✅ NEW — tracking_db
+let trackingProviderConnection = null; // ✅ NEW — trackingprovider_db
 let isConnected = false;
 
 // ===== CONNECTION OPTIONS =====
@@ -198,6 +200,87 @@ const connectBookingDB = async () => {
     
   } catch (error) {
     console.error('✗ Booking DB Connection Error:', error.message);
+    throw error;
+  }
+};
+
+// ===== CONNECT TO TRACKING_DB DATABASE ✅ NEW =====
+const connectTrackingDB = async () => {
+  try {
+    const uri = process.env.MONGODB_URI;
+    
+    if (!uri) {
+      throw new Error('MONGODB_URI not found in .env');
+    }
+
+    const trackingDbName = process.env.TRACKING_DB_NAME || 'tracking_db';
+    const trackingDbUri = createDbUri(uri, trackingDbName);
+
+    console.log('\n' + '─'.repeat(60));
+    console.log('🔌 Connecting to TRACKING_DB Database...');
+    console.log('─'.repeat(60));
+    console.log('Database:', trackingDbName);
+    
+    trackingConnection = mongoose.createConnection(trackingDbUri, connectionOptions);
+
+    await new Promise((resolve, reject) => {
+      trackingConnection.on('connected', () => resolve());
+      trackingConnection.on('error', (err) => reject(err));
+      setTimeout(() => {
+        if (trackingConnection.readyState !== 1) {
+          reject(new Error('Tracking DB connection timeout'));
+        }
+      }, 30000);
+    });
+
+    console.log('✓ Tracking DB Connected');
+    console.log('✓ Database:', trackingConnection.name || trackingDbName);
+    
+    return trackingConnection;
+    
+  } catch (error) {
+    console.error('✗ Tracking DB Connection Error:', error.message);
+    throw error;
+  }
+};
+
+// ===== CONNECT TO TRACKINGPROVIDER_DB DATABASE ✅ NEW =====
+const connectTrackingProviderDB = async () => {
+  try {
+    const uri = process.env.MONGODB_URI;
+    
+    if (!uri) {
+      throw new Error('MONGODB_URI not found in .env');
+    }
+
+    const dbName = process.env.TRACKING_PROVIDER_DB_NAME || 'trackingprovider_db';
+    const dbUri = createDbUri(uri, dbName);
+
+    console.log('\n' + '─'.repeat(60));
+    console.log('🔌 Connecting to TRACKINGPROVIDER_DB Database...');
+    console.log('─'.repeat(60));
+    console.log('Database:', dbName);
+    
+    trackingProviderConnection = mongoose.createConnection(dbUri, connectionOptions);
+
+    await new Promise((resolve, reject) => {
+      trackingProviderConnection.on('connected', () => resolve());
+      trackingProviderConnection.on('error', (err) => reject(err));
+      setTimeout(() => {
+        if (trackingProviderConnection.readyState !== 1) {
+          reject(new Error('Tracking Provider DB connection timeout'));
+        }
+      }, 30000);
+    });
+
+    console.log('✓ Tracking Provider DB Connected');
+    console.log('✓ Database:', trackingProviderConnection.name || dbName);
+    console.log('─'.repeat(60) + '\n');
+    
+    return trackingProviderConnection;
+    
+  } catch (error) {
+    console.error('✗ Tracking Provider DB Connection Error:', error.message);
     throw error;
   }
 };
@@ -628,6 +711,37 @@ const createBookingSchema = () => {
   };
 
   return bookingSchema;
+};
+
+// ===== TRACKING SCHEMAS ✅ NEW (strict:false to preserve all raw fields) =====
+const createTrackingDeviceSchema = () => {
+  const schema = new mongoose.Schema({}, {
+    strict: false,
+    timestamps: false,
+    collection: 'devices',
+    minimize: false,
+  });
+  return schema;
+};
+
+const createTrackingLeadSchema = () => {
+  const schema = new mongoose.Schema({}, {
+    strict: false,
+    timestamps: false,
+    collection: 'leads',
+    minimize: false,
+  });
+  return schema;
+};
+
+const createTrackingProviderDeviceSchema = () => {
+  const schema = new mongoose.Schema({}, {
+    strict: false,
+    timestamps: false,
+    collection: 'devices',
+    minimize: false,
+  });
+  return schema;
 };
 
 // ============================================================================
@@ -2566,6 +2680,37 @@ const getBookingModel = () => {
   return bookingConnection.model('Booking', createBookingSchema(), 'bookings');
 };
 
+// ===== TRACKING MODEL GETTERS ✅ NEW =====
+const getTrackingDeviceModel = () => {
+  if (!trackingConnection) {
+    throw new Error('Tracking database not connected. Call connectDB() first.');
+  }
+  if (trackingConnection.models.TrackingDevice) {
+    return trackingConnection.models.TrackingDevice;
+  }
+  return trackingConnection.model('TrackingDevice', createTrackingDeviceSchema(), 'devices');
+};
+
+const getTrackingLeadModel = () => {
+  if (!trackingConnection) {
+    throw new Error('Tracking database not connected. Call connectDB() first.');
+  }
+  if (trackingConnection.models.TrackingLead) {
+    return trackingConnection.models.TrackingLead;
+  }
+  return trackingConnection.model('TrackingLead', createTrackingLeadSchema(), 'leads');
+};
+
+const getTrackingProviderDeviceModel = () => {
+  if (!trackingProviderConnection) {
+    throw new Error('Tracking Provider database not connected. Call connectDB() first.');
+  }
+  if (trackingProviderConnection.models.TrackingProviderDevice) {
+    return trackingProviderConnection.models.TrackingProviderDevice;
+  }
+  return trackingProviderConnection.model('TrackingProviderDevice', createTrackingProviderDeviceSchema(), 'devices');
+};
+
 // ===== SERVER-DRIVEN UI MODEL GETTERS =====
 const getCategoryModel = () => {
   if (!adminConnection) {
@@ -2762,6 +2907,8 @@ const connectDB = async () => {
     await connectProviderDB();
     await connectUserDB();
     await connectBookingDB(); // ✅ NEW
+    await connectTrackingDB(); // ✅ NEW
+    await connectTrackingProviderDB(); // ✅ NEW
     
     isConnected = true;
 
@@ -2785,6 +2932,16 @@ const connectDB = async () => {
       console.log('\n📦 Collections in bookings_db:');
       const bookingCollections = await bookingConnection.db.listCollections().toArray();
       bookingCollections.forEach(col => console.log(`   - ${col.name}`));
+
+      // ✅ NEW
+      console.log('\n📦 Collections in tracking_db:');
+      const trackingCollections = await trackingConnection.db.listCollections().toArray();
+      trackingCollections.forEach(col => console.log(`   - ${col.name}`));
+
+      // ✅ NEW
+      console.log('\n📦 Collections in trackingprovider_db:');
+      const trackingProviderCollections = await trackingProviderConnection.db.listCollections().toArray();
+      trackingProviderCollections.forEach(col => console.log(`   - ${col.name}`));
     } catch (e) {
       console.log('Could not list collections');
     }
@@ -2827,7 +2984,25 @@ const connectDB = async () => {
       console.warn('⚠️ Booking DB Disconnected');
     });
 
-    return { adminConnection, providerConnection, userConnection, bookingConnection };
+    // ✅ NEW
+    trackingConnection.on('error', (err) => {
+      console.error('❌ Tracking DB Error:', err.message);
+    });
+
+    trackingConnection.on('disconnected', () => {
+      console.warn('⚠️ Tracking DB Disconnected');
+    });
+
+    // ✅ NEW
+    trackingProviderConnection.on('error', (err) => {
+      console.error('❌ Tracking Provider DB Error:', err.message);
+    });
+
+    trackingProviderConnection.on('disconnected', () => {
+      console.warn('⚠️ Tracking Provider DB Disconnected');
+    });
+
+    return { adminConnection, providerConnection, userConnection, bookingConnection, trackingConnection, trackingProviderConnection };
     
   } catch (error) {
     console.error('\n' + '═'.repeat(60));
@@ -2862,6 +3037,18 @@ const gracefulShutdown = async (signal) => {
       await bookingConnection.close();
       console.log('✓ Booking DB connection closed');
     }
+
+    // ✅ NEW
+    if (trackingConnection) {
+      await trackingConnection.close();
+      console.log('✓ Tracking DB connection closed');
+    }
+
+    // ✅ NEW
+    if (trackingProviderConnection) {
+      await trackingProviderConnection.close();
+      console.log('✓ Tracking Provider DB connection closed');
+    }
     
     isConnected = false;
     console.log('✓ All connections closed gracefully');
@@ -2883,6 +3070,8 @@ module.exports.getAdminConnection = () => adminConnection;
 module.exports.getProviderConnection = () => providerConnection;
 module.exports.getUserConnection = () => userConnection;
 module.exports.getBookingConnection = () => bookingConnection; // ✅ NEW
+module.exports.getTrackingConnection = () => trackingConnection; // ✅ NEW
+module.exports.getTrackingProviderConnection = () => trackingProviderConnection; // ✅ NEW
 
 // Existing model getters
 module.exports.getAdminModel = getAdminModel;
@@ -2890,6 +3079,11 @@ module.exports.getProviderModel = getProviderModel;
 module.exports.getVerificationModel = getVerificationModel;
 module.exports.getUserModel = getUserModel;
 module.exports.getBookingModel = getBookingModel; // ✅ NEW
+
+// ✅ NEW — Tracking model getters
+module.exports.getTrackingDeviceModel = getTrackingDeviceModel;
+module.exports.getTrackingLeadModel = getTrackingLeadModel;
+module.exports.getTrackingProviderDeviceModel = getTrackingProviderDeviceModel;
 
 // Server-Driven UI model getters
 module.exports.getCategoryModel = getCategoryModel;
