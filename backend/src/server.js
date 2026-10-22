@@ -305,8 +305,8 @@ async function startServer() {
     const notificationRoutes = require('./routes/notification.routes');
     const couponRoutes = require('./routes/couponRoutes');
     const checkoutRoutes = require('./routes/checkoutRoutes');
-        const bookingRoutes = require('./routes/booking.routes');
-        const trackingRoutes = require('./routes/tracking.routes'); 
+    const bookingRoutes = require('./routes/booking.routes');
+    const trackingRoutes = require('./routes/tracking.routes'); 
     // ==================== MOUNT CORE ROUTES ====================
     app.use('/api/v1/admin/auth', authRoutes);
     app.use('/api/v1/admin/verifications', verificationRoutes);
@@ -316,10 +316,9 @@ async function startServer() {
     app.use('/api/v1/admin/cities', cityRoutes);
     app.use('/api/v1/admin/zones', zoneRoutes);
     app.use('/api/v1/admin/tracking', trackingRoutes);
-console.log('📍 Tracking routes loaded at /api/v1/admin/tracking');
+    console.log('📍 Tracking routes loaded at /api/v1/admin/tracking');
 
-
-        app.use('/api/v1/admin/bookings', bookingRoutes);
+    app.use('/api/v1/admin/bookings', bookingRoutes);
     console.log('✓ /api/v1/admin/bookings routes mounted');
 
     console.log('✓ /api/v1/admin/auth routes mounted');
