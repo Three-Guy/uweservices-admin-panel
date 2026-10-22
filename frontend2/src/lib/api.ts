@@ -128,6 +128,142 @@ export interface ProviderFilters {
   sortOrder?: string;
 }
 
+// ==================== DETAILED PROVIDER (FULL JSON SHAPE) ====================
+export interface ProviderSelfieImage {
+  url?: string | null;
+  publicId?: string | null;
+  uploadedAt?: string | null;
+}
+
+export interface ProviderPaymentLock {
+  isLocked?: boolean;
+  reason?: string | null;
+  lockedAt?: string | null;
+  unlockedAt?: string | null;
+  unpaidAmount?: number;
+  pendingTransactionCount?: number;
+  lastCheckedAt?: string | null;
+  lastTransactionId?: string | null;
+  lastModifiedBy?: string | null;
+}
+
+export interface ProviderPreOnlineLockState {
+  isAvailable?: boolean;
+  isAcceptingJobs?: boolean;
+  savedAt?: string | null;
+}
+
+export interface ProviderRating {
+  average?: number;
+  count?: number;
+}
+
+export interface ProviderWallet {
+  balance?: number;
+  totalEarnings?: number;
+}
+
+export interface ProviderLocation {
+  type?: string;
+  coordinates?: number[];
+  address?: string;
+  accuracy?: number | null;
+}
+
+export interface DetailedProvider {
+  _id: string;
+  providerId?: string;
+  name?: string;
+  email?: string;
+  phone?: string;
+  profession?: string;
+  gender?: string;
+  dateOfBirth?: string;
+
+  googleId?: string;
+  authProvider?: string;
+  isProfileComplete?: boolean;
+
+  profilePicture?: string | null;
+  profileImage?: string | null;
+  profilePhoto?: string | null;
+  selfieImage?: ProviderSelfieImage;
+
+  services?: string[];
+
+  verificationStatus?: string;
+  isVerified?: boolean;
+  verifiedAt?: string | null;
+  verifiedBy?: string | null;
+  verificationNotes?: string | null;
+  rejectedAt?: string | null;
+  rejectedBy?: string | null;
+  rejectionReason?: string | null;
+
+  isActive?: boolean;
+  isAvailable?: boolean;
+  isAcceptingJobs?: boolean;
+  isBusy?: boolean;
+  isOnline?: boolean;
+  lastOnlineAt?: string | null;
+
+  isCityServiceAvailable?: boolean;
+  cityNotificationRequested?: boolean;
+
+  currentBookingId?: string | null;
+
+  paymentLock?: ProviderPaymentLock;
+  preOnlineLockState?: ProviderPreOnlineLockState;
+
+  stateVersion?: number;
+  lastStateSyncAt?: string | null;
+
+  rating?: ProviderRating | number;
+  totalRatings?: number;
+  completedJobs?: number;
+  completedBookings?: number;
+  totalBookings?: number;
+  cancelledBookings?: number;
+
+  wallet?: ProviderWallet;
+  totalEarnings?: number;
+  todayEarnings?: number;
+  walletBalance?: number;
+
+  emailVerified?: boolean;
+  phoneVerified?: boolean;
+
+  city?: string;
+  cityId?: string;
+  categoryId?: string;
+  categoryName?: string;
+
+  location?: ProviderLocation;
+  serviceRadius?: number;
+
+  lastLogin?: string | null;
+  fcmToken?: string; // Masked by backend
+  refreshToken?: string; // Masked by backend
+
+  isBlocked?: boolean;
+  blockedAt?: string | null;
+  blockedBy?: string | null;
+  blockReason?: string | null;
+
+  isDeleted?: boolean;
+  deletedAt?: string | null;
+  deletedBy?: string | null;
+  restoredAt?: string | null;
+  restoredBy?: string | null;
+
+  createdAt?: string;
+  updatedAt?: string;
+  __v?: number;
+
+  // Allow any additional fields from DB
+  [key: string]: any;
+}
+
 export interface Pagination {
   page: number;
   limit: number;
@@ -540,6 +676,314 @@ export interface FeatureFlagStats {
   categoryDistribution: Record<string, number>;
 }
 
+
+
+// ==================== BOOKING TYPES ====================
+export interface BookingStatusHistoryItem {
+  _id?: string;
+  status: string;
+  changedAt: string;
+  changedBy: string;
+  reason: string;
+}
+
+export interface Booking {
+  _id: string;
+  bookingId: string;
+  bookingType?: string;
+  userId?: string;
+  customerName: string;
+  customerEmail: string;
+  customerPhone: string;
+
+  serviceName: string;
+  servicePrice?: string | number;
+  serviceIcon?: string;
+  serviceId?: string;
+  categoryId?: string;
+  categoryName?: string;
+  cartItems?: any[];
+
+  address: string;
+  houseFlat?: string;
+  buildingStreet?: string;
+  providerInstructions?: string;
+
+  customerLocation?: {
+    type?: string;
+    coordinates?: number[];
+    address?: string;
+    accuracy?: number | null;
+  };
+  latitude?: number;
+  longitude?: number;
+
+  city?: {
+    cityId?: string;
+    cityName?: string;
+    state?: string;
+    country?: string;
+  };
+  zone?: {
+    zoneId?: string;
+    zoneName?: string;
+  };
+
+  scheduledDate?: string;
+  scheduledTime?: string;
+  scheduledDateDay?: string;
+  scheduledDateNum?: string;
+  scheduledDateMonth?: string;
+  scheduledDateTime?: string;
+
+  status: string;
+  paymentMethod?: string;
+  paymentStatus?: string;
+  paymentDetails?: {
+    razorpayOrderId?: string | null;
+    razorpayPaymentId?: string | null;
+    transactionId?: string | null;
+    paidAt?: string | null;
+    method?: string;
+  };
+
+  totalAmount?: number;
+  baseAmount?: number;
+  serviceFee?: number;
+  platformFee?: number;
+  tax?: number;
+  couponCode?: string | null;
+  couponId?: string | null;
+  couponDiscount?: number;
+
+  providerId?: string;
+  providerName?: string;
+  providerPhone?: string;
+  assignedAt?: string;
+  assignmentMethod?: string;
+  assignmentAttempts?: number;
+
+  providerSelfie?: {
+    url?: string | null;
+    publicId?: string | null;
+    sentAt?: string | null;
+    providerName?: string;
+    providerPhone?: string;
+  };
+
+  startedAt?: string | null;
+  completedAt?: string | null;
+  cancelledAt?: string | null;
+  cancellationReason?: string | null;
+  cancelledBy?: string | null;
+
+  providerLiveLocation?: {
+    latitude?: number | null;
+    longitude?: number | null;
+    accuracy?: number | null;
+    heading?: number | null;
+    speed?: number | null;
+    updatedAt?: string | null;
+  };
+
+  otp?: {
+    code?: string;
+    generatedAt?: string;
+    expiresAt?: string;
+    verified?: boolean;
+    verifiedAt?: string | null;
+    attempts?: number;
+    maxAttempts?: number;
+    sentVia?: string;
+  };
+
+  enRouteAt?: string | null;
+  arrivedAt?: string | null;
+  rating?: number | null;
+  review?: string | null;
+  ratedAt?: string | null;
+  specialRequirements?: string;
+  notes?: string;
+  customServiceDescription?: string | null;
+  estimatedPrice?: number | null;
+  pricingMetadata?: any;
+
+  servicePhoto?: {
+    url?: string | null;
+    publicId?: string | null;
+    uploadedAt?: string | null;
+  };
+  servicePhotos?: any[];
+
+  orderId?: string | null;
+  razorpayOrderId?: string | null;
+  razorpayPaymentId?: string | null;
+  source?: string;
+  platform?: string;
+  appVersion?: string | null;
+
+  isDeleted?: boolean;
+  deletedAt?: string | null;
+
+  statusHistory?: BookingStatusHistoryItem[];
+  createdAt: string;
+  updatedAt: string;
+
+  dispatchCompletedAt?: string | null;
+  feeConfig?: {
+    commissionPercent?: number;
+    gstPercent?: number;
+    platformFeeFlatINR?: number;
+    serviceFeeFlatINR?: number;
+  };
+  platformFeeAmount?: number;
+  platformFeeStatus?: string;
+  walletCredited?: boolean;
+  platformFeePaidAt?: string | null;
+}
+
+export interface BookingFilters {
+  page?: number;
+  limit?: number;
+  search?: string;
+  status?: string;
+  paymentStatus?: string;
+  paymentMethod?: string;
+  bookingType?: string;
+  categoryId?: string;
+  cityId?: string;
+  zoneId?: string;
+  providerId?: string;
+  userId?: string;
+  startDate?: string;
+  endDate?: string;
+  sortBy?: string;
+  sortOrder?: string;
+  isDeleted?: string;
+}
+
+export interface BookingStats {
+  totalBookings: number;
+  todayBookings: number;
+  weekBookings: number;
+  monthBookings: number;
+  pendingBookings: number;
+  confirmedBookings: number;
+  inProgressBookings: number;
+  completedBookings: number;
+  cancelledBookings: number;
+  totalRevenue: number;
+  todayRevenue: number;
+  statusDistribution: Record<string, number>;
+  paymentMethodDistribution: Record<string, number>;
+  categoryDistribution: Record<string, number>;
+}
+
+
+// ==================== TRACKING TYPES ====================
+export interface TrackingDevice {
+  _id: string;
+  deviceId: string | null;
+  type: 'customer' | 'provider' | 'lead';
+  userId?: string | null;
+  providerId?: string | null;
+  email?: string | null;
+  city: string | null;
+  platform: string | null;
+  appVersion: string | null;
+  isActive: boolean;
+  isServiceable?: boolean;
+  lat: number | null;
+  lng: number | null;
+  fcmToken: string | null;
+  createdAt: string | null;
+  lastSeenAt: string | null;
+  active: boolean;
+  raw?: Record<string, any>;
+}
+
+export interface TrackingLead {
+  _id: string;
+  deviceId: string | null;
+  type: 'lead';
+  email: string | null;
+  city: string | null;
+  createdAt: string | null;
+  raw?: Record<string, any>;
+}
+
+export interface TrackingStats {
+  totalDevices: number;
+  totalCustomers: number;
+  totalProviders: number;
+  totalLeads: number;
+  activeNow: number;
+  activeCustomers: number;
+  activeProviders: number;
+  byCity: { city: string; count: number }[];
+  byPlatform: { platform: string; count: number }[];
+  activeThresholdMinutes: number;
+}
+
+export interface HeatmapPoint {
+  lat: number;
+  lng: number;
+  type: 'customer' | 'provider' | 'lead';
+  weight: number;
+  city: string | null;
+  deviceId: string | null;
+  providerId?: string | null;
+  lastSeenAt: string | null;
+  active: boolean;
+}
+
+
+
+
+// ==================== BOOKINGS API ====================
+export const bookingsApi = {
+  getAll: async (params?: BookingFilters): Promise<ApiResponse<{ bookings: Booking[]; pagination: Pagination }>> => {
+    console.log('\n📋 Fetching bookings with params:', params);
+    const response = await apiClient.get('/admin/bookings', { params });
+    return response.data;
+  },
+
+  getStats: async (): Promise<ApiResponse<BookingStats>> => {
+    const response = await apiClient.get('/admin/bookings/stats');
+    return response.data;
+  },
+
+  getById: async (id: string): Promise<ApiResponse<{ booking: Booking }>> => {
+    const response = await apiClient.get(`/admin/bookings/${id}`);
+    return response.data;
+  },
+
+  updateStatus: async (id: string, status: string, reason?: string): Promise<ApiResponse<{ booking: Booking }>> => {
+    const response = await apiClient.patch(`/admin/bookings/${id}/status`, { status, reason });
+    return response.data;
+  },
+
+  updatePaymentStatus: async (id: string, paymentStatus: string): Promise<ApiResponse<{ booking: Booking }>> => {
+    const response = await apiClient.patch(`/admin/bookings/${id}/payment-status`, { paymentStatus });
+    return response.data;
+  },
+
+  update: async (id: string, data: Partial<Booking>): Promise<ApiResponse<{ booking: Booking }>> => {
+    const response = await apiClient.patch(`/admin/bookings/${id}`, data);
+    return response.data;
+  },
+
+  delete: async (id: string, permanent: boolean = false): Promise<ApiResponse<any>> => {
+    const response = await apiClient.delete(`/admin/bookings/${id}`, {
+      params: { permanent: permanent.toString() },
+    });
+    return response.data;
+  },
+};
+
+
+
+
 // ==================== AXIOS INSTANCE ====================
 const apiClient: AxiosInstance = axios.create({
   baseURL: API_BASE_URL,
@@ -830,8 +1274,46 @@ export const providersApi = {
     return response.data;
   },
 
+  // NEW: Get full detailed provider (returns ALL raw fields, tokens masked)
+  getFullDetails: async (id: string): Promise<ApiResponse<{ provider: DetailedProvider }>> => {
+    const response = await apiClient.get(`/admin/providers/${id}`);
+    return response.data;
+  },
+
   toggleStatus: async (id: string, isActive: boolean) => {
     const response = await apiClient.patch(`/admin/providers/${id}/status`, { isActive });
+    return response.data;
+  },
+
+  // NEW: Update availability (isAvailable, isAcceptingJobs, isBusy, isOnline)
+  updateAvailability: async (
+    id: string,
+    data: { isAvailable?: boolean; isAcceptingJobs?: boolean; isBusy?: boolean; isOnline?: boolean }
+  ): Promise<ApiResponse<{ provider: DetailedProvider }>> => {
+    const response = await apiClient.patch(`/admin/providers/${id}/availability`, data);
+    return response.data;
+  },
+
+  // NEW: Update verification status (approved/rejected/pending)
+  updateVerification: async (
+    id: string,
+    data: { verificationStatus: string; notes?: string; reason?: string }
+  ): Promise<ApiResponse<{ provider: DetailedProvider }>> => {
+    const response = await apiClient.patch(`/admin/providers/${id}/verification`, data);
+    return response.data;
+  },
+
+  // NEW: Update payment lock
+  updatePaymentLock: async (
+    id: string,
+    data: {
+      isLocked: boolean;
+      reason?: string;
+      unpaidAmount?: number;
+      pendingTransactionCount?: number;
+    }
+  ): Promise<ApiResponse<{ provider: DetailedProvider }>> => {
+    const response = await apiClient.patch(`/admin/providers/${id}/payment-lock`, data);
     return response.data;
   },
 
@@ -1315,6 +1797,56 @@ export const featureFlagsApi = {
 
   bulkToggle: async (ids: string[], enabled: boolean): Promise<ApiResponse<any>> => {
     const response = await apiClient.post('/admin/sdui/feature-flags/bulk-toggle', { ids, enabled });
+    return response.data;
+  },
+};
+
+
+// ==================== TRACKING API ====================
+export const trackingApi = {
+  getStats: async (): Promise<ApiResponse<TrackingStats>> => {
+    console.log('\n📍 Fetching tracking stats...');
+    const response = await apiClient.get('/admin/tracking/stats');
+    return response.data;
+  },
+
+  getDevices: async (params?: {
+    type?: string;
+    city?: string;
+    platform?: string;
+    active?: string;
+    search?: string;
+    page?: number;
+    limit?: number;
+  }): Promise<ApiResponse<{ devices: TrackingDevice[]; pagination: Pagination }>> => {
+    console.log('\n📍 Fetching tracking devices with params:', params);
+    const response = await apiClient.get('/admin/tracking/devices', { params });
+    return response.data;
+  },
+
+  getLeads: async (params?: {
+    city?: string;
+    search?: string;
+    page?: number;
+    limit?: number;
+  }): Promise<ApiResponse<{ leads: TrackingLead[]; pagination: Pagination }>> => {
+    console.log('\n📍 Fetching tracking leads with params:', params);
+    const response = await apiClient.get('/admin/tracking/leads', { params });
+    return response.data;
+  },
+
+  getHeatmap: async (params?: {
+    type?: string;
+    city?: string;
+    activeOnly?: string;
+  }): Promise<ApiResponse<{ points: HeatmapPoint[]; total: number; leadCityCounts: Record<string, number> }>> => {
+    console.log('\n📍 Fetching heatmap with params:', params);
+    const response = await apiClient.get('/admin/tracking/heatmap', { params });
+    return response.data;
+  },
+
+  getDeviceById: async (deviceId: string): Promise<ApiResponse<{ device: TrackingDevice }>> => {
+    const response = await apiClient.get(`/admin/tracking/device/${encodeURIComponent(deviceId)}`);
     return response.data;
   },
 };

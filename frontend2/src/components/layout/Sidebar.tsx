@@ -35,11 +35,17 @@ import {
   Menu,
   X,
   Home,
+  Calendar,
+  Activity,
+  Clock,
+  Zap,
+  Radar,        // ✅ NEW — Live Tracking icon
+  Radio,        // ✅ NEW — alternate pulse icon
 } from 'lucide-react';
 import { useAuth } from '../../store/AuthContext';
-import { usersApi, providersApi } from '../../lib/api';
+import { usersApi, providersApi, bookingsApi } from '../../lib/api';
 
-// Types
+// ─── Types ───
 interface UserStats {
   totalUsers: number;
   activeUsers: number;
@@ -51,61 +57,47 @@ interface ProviderStatsSimple {
   pendingVerifications: number;
 }
 
+interface BookingStatsSimple {
+  pendingBookings: number;
+  todayBookings: number;
+  inProgressBookings: number;
+}
+
 interface NavItem {
   name: string;
   href: string;
   icon: React.ElementType;
   hasBadge?: boolean;
   badgeType?: string;
+  isHot?: boolean;
+  isPinned?: boolean;
 }
 
-// Custom hook for detecting mobile
+// ─── Hooks ───
 const useIsMobile = () => {
   const [isMobile, setIsMobile] = useState(false);
-
   useEffect(() => {
-    const checkMobile = () => {
-      setIsMobile(window.innerWidth < 768);
-    };
-    
+    const checkMobile = () => setIsMobile(window.innerWidth < 768);
     checkMobile();
     window.addEventListener('resize', checkMobile);
     return () => window.removeEventListener('resize', checkMobile);
   }, []);
-
   return isMobile;
 };
 
-// Custom hook for swipe detection
 const useSwipe = (onSwipeLeft: () => void, onSwipeRight: () => void) => {
   const touchStartX = useRef(0);
   const touchEndX = useRef(0);
-
-  const onTouchStart = (e: React.TouchEvent) => {
-    touchStartX.current = e.touches[0].clientX;
-  };
-
-  const onTouchMove = (e: React.TouchEvent) => {
-    touchEndX.current = e.touches[0].clientX;
-  };
-
+  const onTouchStart = (e: React.TouchEvent) => { touchStartX.current = e.touches[0].clientX; };
+  const onTouchMove = (e: React.TouchEvent) => { touchEndX.current = e.touches[0].clientX; };
   const onTouchEnd = () => {
     const diff = touchStartX.current - touchEndX.current;
-    const threshold = 50;
-
-    if (Math.abs(diff) > threshold) {
-      if (diff > 0) {
-        onSwipeLeft();
-      } else {
-        onSwipeRight();
-      }
-    }
+    if (Math.abs(diff) > 50) diff > 0 ? onSwipeLeft() : onSwipeRight();
   };
-
   return { onTouchStart, onTouchMove, onTouchEnd };
 };
 
-// Theme configurations
+// ─── Themes ───
 const themes = {
   light: {
     name: 'Light',
@@ -115,11 +107,13 @@ const themes = {
     textActive: 'text-indigo-600',
     border: 'border-gray-200',
     hover: 'hover:bg-gray-100 active:bg-gray-200',
-    active: 'bg-indigo-50 text-indigo-600 border-r-4 border-indigo-600',
+    active: 'bg-gradient-to-r from-indigo-50 to-purple-50 text-indigo-700 border-r-[3px] border-indigo-600',
     cardBg: 'bg-gray-50',
     accent: 'bg-indigo-600',
     accentHover: 'hover:bg-indigo-700',
-    badge: 'bg-indigo-100 text-indigo-600',
+    badge: 'bg-indigo-100 text-indigo-700',
+    badgeHot: 'bg-gradient-to-r from-pink-500 to-rose-500 text-white',
+    badgeLive: 'bg-emerald-100 text-emerald-700',
     shadow: 'shadow-xl shadow-gray-200/50',
     overlay: 'bg-black/50',
   },
@@ -131,11 +125,13 @@ const themes = {
     textActive: 'text-white',
     border: 'border-gray-800',
     hover: 'hover:bg-gray-800 active:bg-gray-700',
-    active: 'bg-indigo-600/20 text-indigo-400 border-r-4 border-indigo-500',
+    active: 'bg-gradient-to-r from-indigo-600/30 to-purple-600/20 text-white border-r-[3px] border-indigo-500',
     cardBg: 'bg-gray-800',
     accent: 'bg-indigo-600',
     accentHover: 'hover:bg-indigo-700',
-    badge: 'bg-indigo-500/20 text-indigo-400',
+    badge: 'bg-indigo-500/20 text-indigo-300',
+    badgeHot: 'bg-gradient-to-r from-pink-500 to-rose-500 text-white',
+    badgeLive: 'bg-emerald-500/20 text-emerald-400',
     shadow: 'shadow-xl shadow-black/50',
     overlay: 'bg-black/70',
   },
@@ -147,11 +143,13 @@ const themes = {
     textActive: 'text-white',
     border: 'border-purple-700/50',
     hover: 'hover:bg-white/10 active:bg-white/20',
-    active: 'bg-white/20 text-white border-r-4 border-pink-400',
+    active: 'bg-gradient-to-r from-white/20 to-pink-500/20 text-white border-r-[3px] border-pink-400',
     cardBg: 'bg-white/10',
     accent: 'bg-pink-500',
     accentHover: 'hover:bg-pink-600',
-    badge: 'bg-pink-500/20 text-pink-300',
+    badge: 'bg-pink-500/20 text-pink-200',
+    badgeHot: 'bg-gradient-to-r from-pink-500 to-rose-500 text-white',
+    badgeLive: 'bg-emerald-500/20 text-emerald-300',
     shadow: 'shadow-xl shadow-purple-900/50',
     overlay: 'bg-purple-900/80',
   },
@@ -163,11 +161,13 @@ const themes = {
     textActive: 'text-white',
     border: 'border-blue-700/50',
     hover: 'hover:bg-white/10 active:bg-white/20',
-    active: 'bg-white/20 text-white border-r-4 border-cyan-400',
+    active: 'bg-gradient-to-r from-white/20 to-cyan-500/20 text-white border-r-[3px] border-cyan-400',
     cardBg: 'bg-white/10',
     accent: 'bg-cyan-500',
     accentHover: 'hover:bg-cyan-600',
-    badge: 'bg-cyan-500/20 text-cyan-300',
+    badge: 'bg-cyan-500/20 text-cyan-200',
+    badgeHot: 'bg-gradient-to-r from-cyan-400 to-blue-500 text-white',
+    badgeLive: 'bg-emerald-500/20 text-emerald-300',
     shadow: 'shadow-xl shadow-blue-900/50',
     overlay: 'bg-blue-900/80',
   },
@@ -179,11 +179,13 @@ const themes = {
     textActive: 'text-white',
     border: 'border-emerald-700/50',
     hover: 'hover:bg-white/10 active:bg-white/20',
-    active: 'bg-white/20 text-white border-r-4 border-emerald-400',
+    active: 'bg-gradient-to-r from-white/20 to-emerald-500/20 text-white border-r-[3px] border-emerald-400',
     cardBg: 'bg-white/10',
     accent: 'bg-emerald-500',
     accentHover: 'hover:bg-emerald-600',
-    badge: 'bg-emerald-500/20 text-emerald-300',
+    badge: 'bg-emerald-500/20 text-emerald-200',
+    badgeHot: 'bg-gradient-to-r from-emerald-400 to-teal-500 text-white',
+    badgeLive: 'bg-lime-500/20 text-lime-300',
     shadow: 'shadow-xl shadow-emerald-900/50',
     overlay: 'bg-emerald-900/80',
   },
@@ -195,11 +197,13 @@ const themes = {
     textActive: 'text-white',
     border: 'border-orange-700/50',
     hover: 'hover:bg-white/10 active:bg-white/20',
-    active: 'bg-white/20 text-white border-r-4 border-yellow-400',
+    active: 'bg-gradient-to-r from-white/20 to-yellow-500/20 text-white border-r-[3px] border-yellow-400',
     cardBg: 'bg-white/10',
     accent: 'bg-orange-500',
     accentHover: 'hover:bg-orange-600',
-    badge: 'bg-orange-500/20 text-orange-300',
+    badge: 'bg-orange-500/20 text-orange-200',
+    badgeHot: 'bg-gradient-to-r from-yellow-400 to-orange-500 text-white',
+    badgeLive: 'bg-yellow-500/20 text-yellow-300',
     shadow: 'shadow-xl shadow-orange-900/50',
     overlay: 'bg-orange-900/80',
   },
@@ -207,21 +211,23 @@ const themes = {
 
 type ThemeKey = keyof typeof themes;
 
-// Navigation items
+// ─── Navigation Structure ───
+// ✅ BOOKINGS placed at TOP #2 position, pinned & hot
+// ✅ LIVE TRACKING added right after Bookings — pinned, hot, badge-ready
 const navigation: NavItem[] = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
+  { name: 'Bookings', href: '/bookings', icon: Calendar, hasBadge: true, badgeType: 'booking', isHot: true, isPinned: true },
+  { name: 'Live Tracking', href: '/tracking', icon: Radar, hasBadge: true, badgeType: 'tracking', isHot: true, isPinned: true },   // ✅ NEW
   { name: 'Providers', href: '/providers', icon: Briefcase, hasBadge: true, badgeType: 'provider' },
   { name: 'Verifications', href: '/verifications', icon: ClipboardCheck },
   { name: 'Users', href: '/users', icon: UserPlus, hasBadge: true, badgeType: 'user' },
 ];
 
-// Location Management submenu items
 const locationSubMenu: NavItem[] = [
   { name: 'Cities', href: '/locations/cities', icon: Building2 },
   { name: 'Zones', href: '/locations/zones', icon: Map },
 ];
 
-// SDUI menu items
 const sduiMenuItems: NavItem[] = [
   { name: 'Dashboard', href: '/sdui', icon: Smartphone },
   { name: 'Categories', href: '/sdui/categories', icon: Grid },
@@ -235,25 +241,23 @@ const sduiMenuItems: NavItem[] = [
   { name: 'Feature Flags', href: '/sdui/feature-flags', icon: ToggleLeft },
 ];
 
-// Checkout menu items
 const checkoutMenuItems: NavItem[] = [
   { name: 'Coupons', href: '/checkout/coupons', icon: Gift },
   { name: 'Checkout Settings', href: '/checkout/settings', icon: Receipt },
 ];
 
-// Other navigation items
 const otherNavigation: NavItem[] = [
   { name: 'Pricing', href: '/pricing', icon: DollarSign },
   { name: 'Analytics', href: '/analytics', icon: BarChart2 },
   { name: 'Settings', href: '/settings', icon: Settings },
 ];
 
-// Bottom navigation for mobile
+// ✅ Mobile bottom nav — Bookings prominently in center, Tracking replaces SDUI slot
 const bottomNavItems: NavItem[] = [
   { name: 'Home', href: '/', icon: Home },
+  { name: 'Bookings', href: '/bookings', icon: Calendar },
+  { name: 'Tracking', href: '/tracking', icon: Radar },   // ✅ NEW
   { name: 'Providers', href: '/providers', icon: Briefcase },
-  { name: 'SDUI', href: '/sdui', icon: Smartphone },
-  { name: 'Settings', href: '/settings', icon: Settings },
 ];
 
 export default function Sidebar() {
@@ -261,76 +265,63 @@ export default function Sidebar() {
   const location = useLocation();
   const navigate = useNavigate();
   const isMobile = useIsMobile();
-  
+
   // Refs
   const navRef = useRef<HTMLElement>(null);
   const scrollPositionRef = useRef<number>(0);
   const isInitialMountRef = useRef(true);
   const preventScrollRef = useRef(false);
-  
+
+  // State
   const [isOpen, setIsOpen] = useState(false);
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [currentTheme, setCurrentTheme] = useState<ThemeKey>('purple');
   const [showThemePicker, setShowThemePicker] = useState(false);
-
-  // Menu expanded states
   const [isLocationMenuExpanded, setIsLocationMenuExpanded] = useState(false);
   const [isSDUIMenuExpanded, setIsSDUIMenuExpanded] = useState(false);
   const [isCheckoutMenuExpanded, setIsCheckoutMenuExpanded] = useState(false);
 
-  // Stats for badges
+  // Stats
   const [userStats, setUserStats] = useState<UserStats | null>(null);
   const [providerStats, setProviderStats] = useState<ProviderStatsSimple | null>(null);
+  const [bookingStats, setBookingStats] = useState<BookingStatsSimple | null>(null);
+
+  // ✅ NEW — Tracking live count (active devices now)
+  const [trackingActiveNow, setTrackingActiveNow] = useState<number>(0);
 
   const theme = themes[currentTheme];
+  const swipeHandlers = useSwipe(() => setIsOpen(false), () => setIsOpen(true));
 
-  // Swipe handlers for mobile
-  const swipeHandlers = useSwipe(
-    () => setIsOpen(false),
-    () => setIsOpen(true)
-  );
-
-  // Check routes
   const isLocationRoute = location.pathname.startsWith('/locations');
   const isSDUIRoute = location.pathname.startsWith('/sdui');
   const isCheckoutRoute = location.pathname.startsWith('/checkout');
 
-  // Load theme from localStorage
+  // ─── Theme persistence ───
   useEffect(() => {
     const savedTheme = localStorage.getItem('sidebarTheme') as ThemeKey;
-    if (savedTheme && themes[savedTheme]) {
-      setCurrentTheme(savedTheme);
-    }
+    if (savedTheme && themes[savedTheme]) setCurrentTheme(savedTheme);
   }, []);
 
-  // Save theme to localStorage
   const changeTheme = (newTheme: ThemeKey) => {
     setCurrentTheme(newTheme);
     localStorage.setItem('sidebarTheme', newTheme);
     setShowThemePicker(false);
   };
 
-  // Save scroll position before navigation
+  // ─── Scroll preservation ───
   const saveScrollPosition = useCallback(() => {
-    if (navRef.current) {
-      scrollPositionRef.current = navRef.current.scrollTop;
-    }
+    if (navRef.current) scrollPositionRef.current = navRef.current.scrollTop;
   }, []);
 
-  // Restore scroll position after navigation
   const restoreScrollPosition = useCallback(() => {
     if (navRef.current && preventScrollRef.current) {
-      // Use requestAnimationFrame to ensure DOM has updated
       requestAnimationFrame(() => {
-        if (navRef.current) {
-          navRef.current.scrollTop = scrollPositionRef.current;
-        }
+        if (navRef.current) navRef.current.scrollTop = scrollPositionRef.current;
         preventScrollRef.current = false;
       });
     }
   }, []);
 
-  // Auto-expand menus ONLY on initial mount
   useEffect(() => {
     if (isInitialMountRef.current) {
       if (isLocationRoute) setIsLocationMenuExpanded(true);
@@ -340,62 +331,80 @@ export default function Sidebar() {
     }
   }, []);
 
-  // Restore scroll position after route change
-  useEffect(() => {
-    restoreScrollPosition();
-  }, [location.pathname, restoreScrollPosition]);
+  useEffect(() => { restoreScrollPosition(); }, [location.pathname, restoreScrollPosition]);
 
-  // Close sidebar on navigation (mobile)
   useEffect(() => {
-    if (isMobile) {
-      setIsOpen(false);
-    }
+    if (isMobile) setIsOpen(false);
   }, [location.pathname, isMobile]);
 
-  // Prevent body scroll when sidebar is open on mobile
   useEffect(() => {
-    if (isMobile && isOpen) {
-      document.body.style.overflow = 'hidden';
-    } else {
-      document.body.style.overflow = '';
-    }
-    return () => {
-      document.body.style.overflow = '';
-    };
+    document.body.style.overflow = isMobile && isOpen ? 'hidden' : '';
+    return () => { document.body.style.overflow = ''; };
   }, [isMobile, isOpen]);
 
-  // Fetch stats
+  // ─── Fetchers ───
   const fetchUserStats = async () => {
     try {
-      const response = await usersApi.getStats();
-      if (response.success) {
+      const res = await usersApi.getStats();
+      if (res.success) {
         setUserStats({
-          totalUsers: response.data.totalUsers,
-          activeUsers: response.data.activeUsers,
-          todaySignups: response.data.todaySignups,
-          verifiedUsers: response.data.verifiedUsers,
+          totalUsers: res.data.totalUsers,
+          activeUsers: res.data.activeUsers,
+          todaySignups: res.data.todaySignups,
+          verifiedUsers: res.data.verifiedUsers,
         });
       }
-    } catch (error) {
-      console.error('Failed to fetch user stats:', error);
-    }
+    } catch (e) { console.error('user stats:', e); }
   };
 
   const fetchProviderStats = async () => {
     try {
-      const response = await providersApi.getStats();
-      if (response.success) {
-        setProviderStats({
-          pendingVerifications: response.data.pendingVerifications || 0,
+      const res = await providersApi.getStats();
+      if (res.success) setProviderStats({ pendingVerifications: res.data.pendingVerifications || 0 });
+    } catch (e) { console.error('provider stats:', e); }
+  };
+
+  const fetchBookingStats = async () => {
+    try {
+      const res = await bookingsApi.getStats();
+      if (res?.success && res?.data) {
+        const statusStats = res.data.statusStats || [];
+        const pendingCount = statusStats
+          .filter((s: any) => ['pending', 'searching', 'assigned'].includes(s._id))
+          .reduce((sum: number, s: any) => sum + (s.count || 0), 0);
+        const inProgressCount = statusStats
+          .filter((s: any) => ['accepted', 'en-route', 'arrived', 'in-progress'].includes(s._id))
+          .reduce((sum: number, s: any) => sum + (s.count || 0), 0);
+        setBookingStats({
+          pendingBookings: pendingCount,
+          todayBookings: res.data.todayBookings || 0,
+          inProgressBookings: inProgressCount,
         });
       }
-    } catch (error) {
-      console.error('Failed to fetch provider stats:', error);
+    } catch (e) { console.error('booking stats:', e); }
+  };
+
+  // ✅ NEW — Fetch tracking active-now count (soft-fail if trackingApi not loaded yet)
+  const fetchTrackingStats = async () => {
+    try {
+      const mod: any = await import('../../lib/api');
+      if (mod && mod.trackingApi && typeof mod.trackingApi.getStats === 'function') {
+        const data = await mod.trackingApi.getStats();
+        setTrackingActiveNow(data?.activeNow || 0);
+      }
+    } catch (e) {
+      // Silent fail — tracking API may not be available in all environments
+      console.debug('tracking stats skipped:', e);
     }
   };
 
   const fetchBadgeData = useCallback(async () => {
-    await Promise.all([fetchUserStats(), fetchProviderStats()]);
+    await Promise.all([
+      fetchUserStats(),
+      fetchProviderStats(),
+      fetchBookingStats(),
+      fetchTrackingStats(),   // ✅ NEW
+    ]);
   }, []);
 
   useEffect(() => {
@@ -404,24 +413,20 @@ export default function Sidebar() {
     return () => clearInterval(interval);
   }, [fetchBadgeData]);
 
-  // Get badge count
   const getBadgeCount = (badgeType?: string) => {
     if (badgeType === 'user' && userStats?.todaySignups) return userStats.todaySignups;
     if (badgeType === 'provider' && providerStats?.pendingVerifications) return providerStats.pendingVerifications;
+    if (badgeType === 'booking' && bookingStats?.pendingBookings) return bookingStats.pendingBookings;
+    if (badgeType === 'tracking' && trackingActiveNow) return trackingActiveNow;   // ✅ NEW
     return 0;
   };
 
-  // Handle navigation item click - FIXED: Save scroll position before navigation
-  const handleNavClick = useCallback((e: React.MouseEvent) => {
+  const handleNavClick = useCallback(() => {
     saveScrollPosition();
     preventScrollRef.current = true;
-    
-    if (isMobile) {
-      setIsOpen(false);
-    }
+    if (isMobile) setIsOpen(false);
   }, [isMobile, saveScrollPosition]);
 
-  // Handle submenu toggle - Don't scroll when toggling
   const handleSubmenuToggle = useCallback((
     setter: React.Dispatch<React.SetStateAction<boolean>>,
     currentValue: boolean
@@ -429,16 +434,12 @@ export default function Sidebar() {
     saveScrollPosition();
     preventScrollRef.current = true;
     setter(!currentValue);
-    
-    // Restore position after state update
     requestAnimationFrame(() => {
-      if (navRef.current) {
-        navRef.current.scrollTop = scrollPositionRef.current;
-      }
+      if (navRef.current) navRef.current.scrollTop = scrollPositionRef.current;
     });
   }, [saveScrollPosition]);
 
-  // Render navigation item
+  // ─── Render Navigation Item ───
   const renderNavItem = (item: NavItem, compact = false) => {
     const badgeCount = getBadgeCount(item.badgeType);
     const isCollapsedView = isCollapsed && !isMobile;
@@ -450,41 +451,75 @@ export default function Sidebar() {
         onClick={handleNavClick}
         preventScrollReset={true}
         className={({ isActive }) =>
-          `flex items-center gap-3 px-4 py-3.5 rounded-xl mb-1.5 transition-all duration-200 relative group
-          ${compact ? 'py-2.5' : 'py-3.5'}
+          `flex items-center gap-3 px-3 py-2.5 rounded-lg mb-0.5 transition-all duration-200 relative group
           ${isActive ? theme.active : `${theme.text} ${theme.hover}`}
           ${isCollapsedView ? 'justify-center' : ''}
+          ${item.isPinned && !isActive ? 'bg-gradient-to-r from-pink-500/5 to-rose-500/5' : ''}
           touch-manipulation select-none`
         }
       >
         {({ isActive }) => (
           <>
-            <div className={`transition-transform duration-200 flex-shrink-0 ${isActive ? 'scale-110' : 'group-hover:scale-110'}`}>
-              <item.icon size={compact ? 18 : 20} strokeWidth={isActive ? 2.5 : 2} />
+            {/* Active indicator pill on left */}
+            {isActive && !isCollapsedView && (
+              <span className={`absolute left-0 top-1/2 -translate-y-1/2 w-1 h-6 rounded-r-full ${theme.accent}`} />
+            )}
+
+            <div className={`transition-transform duration-200 flex-shrink-0 relative ${isActive ? 'scale-110' : 'group-hover:scale-105'}`}>
+              <item.icon size={compact ? 17 : 18} strokeWidth={isActive ? 2.5 : 2} />
+              {/* Pulsing dot for hot items when collapsed */}
+              {item.isHot && isCollapsedView && (
+                <span className="absolute -top-1 -right-1 flex h-2.5 w-2.5">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-pink-400 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-pink-500" />
+                </span>
+              )}
+              {/* Badge count on collapsed view */}
+              {item.hasBadge && badgeCount > 0 && isCollapsedView && !item.isHot && (
+                <span className={`absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-1 rounded-full ${theme.accent} text-white text-[9px] font-bold flex items-center justify-center`}>
+                  {badgeCount > 9 ? '9+' : badgeCount}
+                </span>
+              )}
             </div>
+
             {(!isCollapsedView || isMobile) && (
               <>
-                <span className={`flex-1 font-medium ${compact ? 'text-sm' : ''} ${isActive ? 'font-semibold' : ''}`}>
+                <span className={`flex-1 text-[13.5px] ${isActive ? 'font-semibold' : 'font-medium'}`}>
                   {item.name}
                 </span>
+
+                {/* NEW badge for hot items (no count) */}
+                {item.isHot && !badgeCount && (
+                  <span className={`px-1.5 py-0.5 rounded-md text-[9px] font-black ${theme.badgeHot} shadow-sm uppercase tracking-wider flex-shrink-0`}>
+                    NEW
+                  </span>
+                )}
+
+                {/* Live count badge */}
                 {item.hasBadge && badgeCount > 0 && (
-                  <span className={`px-2.5 py-1 rounded-full text-xs font-bold ${theme.badge} animate-pulse flex-shrink-0`}>
-                    {item.badgeType === 'provider' ? badgeCount : `+${badgeCount}`}
+                  <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                    item.isHot ? theme.badgeHot : theme.badge
+                  } flex-shrink-0 shadow-sm`}>
+                    {item.isHot && <span className="w-1 h-1 rounded-full bg-white animate-pulse" />}
+                    {badgeCount > 99 ? '99+' : badgeCount}
                   </span>
                 )}
               </>
             )}
-            
-            {/* Desktop collapsed tooltip */}
+
+            {/* Collapsed tooltip */}
             {isCollapsedView && !isMobile && (
-              <div className={`absolute left-full ml-3 px-4 py-2.5 ${theme.cardBg} backdrop-blur-xl text-sm rounded-xl 
-                opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 
+              <div className={`absolute left-full ml-3 px-3 py-2 ${theme.cardBg} backdrop-blur-xl text-xs rounded-lg 
+                opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-150 
                 whitespace-nowrap z-[100] border ${theme.border} ${theme.shadow}`}
               >
-                <span className={`font-medium ${theme.text}`}>{item.name}</span>
+                <span className={`font-semibold ${theme.text}`}>{item.name}</span>
+                {item.isHot && (
+                  <span className={`ml-2 px-1.5 py-0.5 ${theme.badgeHot} rounded-md text-[9px] font-black uppercase`}>NEW</span>
+                )}
                 {item.hasBadge && badgeCount > 0 && (
-                  <span className={`ml-2 px-2 py-0.5 ${theme.badge} rounded-full text-xs font-bold`}>
-                    {item.badgeType === 'provider' ? badgeCount : `+${badgeCount}`}
+                  <span className={`ml-2 px-1.5 py-0.5 ${item.isHot ? theme.badgeHot : theme.badge} rounded-md text-[10px] font-bold`}>
+                    {badgeCount}
                   </span>
                 )}
               </div>
@@ -495,7 +530,7 @@ export default function Sidebar() {
     );
   };
 
-  // Render submenu - FIXED: No auto-scroll on expand
+  // ─── Render Submenu ───
   const renderSubMenu = (
     title: string,
     icon: React.ElementType,
@@ -508,48 +543,45 @@ export default function Sidebar() {
     const isCollapsedView = isCollapsed && !isMobile;
 
     return (
-      <div className="mb-1.5">
+      <div className="mb-0.5">
         <button
           onClick={() => !isCollapsedView && handleSubmenuToggle(setIsExpanded, isExpanded)}
-          className={`w-full flex items-center gap-3 px-4 py-3.5 rounded-xl transition-all duration-200 relative group
+          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all duration-200 relative group
             ${isActiveRoute ? theme.active : `${theme.text} ${theme.hover}`}
             ${isCollapsedView ? 'justify-center' : ''}
             touch-manipulation select-none`}
         >
-          <div className={`transition-transform duration-200 flex-shrink-0 ${isActiveRoute ? 'scale-110' : 'group-hover:scale-110'}`}>
-            <Icon size={20} strokeWidth={isActiveRoute ? 2.5 : 2} />
+          {isActiveRoute && !isCollapsedView && (
+            <span className={`absolute left-0 top-1/2 -translate-y-1/2 w-1 h-6 rounded-r-full ${theme.accent}`} />
+          )}
+          <div className={`transition-transform duration-200 flex-shrink-0 ${isActiveRoute ? 'scale-110' : 'group-hover:scale-105'}`}>
+            <Icon size={18} strokeWidth={isActiveRoute ? 2.5 : 2} />
           </div>
           {(!isCollapsedView || isMobile) && (
             <>
-              <span className={`flex-1 text-left font-medium ${isActiveRoute ? 'font-semibold' : ''}`}>
+              <span className={`flex-1 text-left text-[13.5px] ${isActiveRoute ? 'font-semibold' : 'font-medium'}`}>
                 {title}
               </span>
               <div className={`transition-transform duration-300 flex-shrink-0 ${isExpanded ? 'rotate-180' : ''}`}>
-                <ChevronDown size={16} className={theme.textMuted} />
+                <ChevronDown size={14} className={theme.textMuted} />
               </div>
             </>
           )}
-          
-          {/* Desktop collapsed tooltip */}
+
           {isCollapsedView && !isMobile && (
-            <div className={`absolute left-full ml-3 px-4 py-3 ${theme.cardBg} backdrop-blur-xl text-sm rounded-xl 
-              opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 
-              whitespace-nowrap z-[100] border ${theme.border} ${theme.shadow} min-w-[180px]`}
+            <div className={`absolute left-full ml-3 px-3 py-2.5 ${theme.cardBg} backdrop-blur-xl text-xs rounded-lg 
+              opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-150 
+              whitespace-nowrap z-[100] border ${theme.border} ${theme.shadow} min-w-[170px]`}
             >
-              <p className={`font-semibold mb-3 ${theme.text}`}>{title}</p>
-              <div className="space-y-1">
+              <p className={`font-semibold mb-2 ${theme.text}`}>{title}</p>
+              <div className="space-y-0.5">
                 {items.map((subItem) => (
-                  <NavLink
-                    key={subItem.name}
-                    to={subItem.href}
-                    onClick={handleNavClick}
-                    preventScrollReset={true}
+                  <NavLink key={subItem.name} to={subItem.href} onClick={handleNavClick} preventScrollReset={true}
                     className={({ isActive }) =>
-                      `flex items-center gap-2 px-3 py-2 rounded-lg text-xs transition-colors
+                      `flex items-center gap-2 px-2.5 py-1.5 rounded-md text-[11px] transition-colors
                       ${isActive ? theme.active : `${theme.text} ${theme.hover}`}`
-                    }
-                  >
-                    <subItem.icon size={14} />
+                    }>
+                    <subItem.icon size={13} />
                     <span className="font-medium">{subItem.name}</span>
                   </NavLink>
                 ))}
@@ -558,29 +590,21 @@ export default function Sidebar() {
           )}
         </button>
 
-        {/* Expanded Submenu - No scroll into view */}
         {(!isCollapsedView || isMobile) && (
-          <div 
-            className={`overflow-hidden transition-all duration-300 ease-in-out ${
-              isExpanded ? 'max-h-[600px] opacity-100' : 'max-h-0 opacity-0'
-            }`}
-          >
-            <div className="ml-4 mt-2 space-y-1 pl-4 border-l-2 border-white/20">
+          <div className={`overflow-hidden transition-all duration-300 ease-in-out ${
+            isExpanded ? 'max-h-[600px] opacity-100 mt-1' : 'max-h-0 opacity-0'
+          }`}>
+            <div className="ml-3 space-y-0.5 pl-3 border-l border-white/10">
               {items.map((subItem) => (
-                <NavLink
-                  key={subItem.name}
-                  to={subItem.href}
-                  onClick={handleNavClick}
-                  preventScrollReset={true}
+                <NavLink key={subItem.name} to={subItem.href} onClick={handleNavClick} preventScrollReset={true}
                   className={({ isActive }) =>
-                    `flex items-center gap-3 px-3 py-3 rounded-lg transition-all duration-200 touch-manipulation select-none
-                    ${isActive ? `${theme.accent} text-white shadow-lg` : `${theme.text} ${theme.hover}`}`
-                  }
-                >
+                    `flex items-center gap-2.5 px-2.5 py-2 rounded-md transition-all duration-200 touch-manipulation select-none
+                    ${isActive ? `${theme.accent} text-white shadow-md` : `${theme.text} ${theme.hover}`}`
+                  }>
                   {({ isActive }) => (
                     <>
-                      <subItem.icon size={16} strokeWidth={isActive ? 2.5 : 2} className="flex-shrink-0" />
-                      <span className={`text-sm ${isActive ? 'font-semibold' : 'font-medium'}`}>
+                      <subItem.icon size={14} strokeWidth={isActive ? 2.5 : 2} className="flex-shrink-0" />
+                      <span className={`text-[12.5px] ${isActive ? 'font-semibold' : 'font-medium'}`}>
                         {subItem.name}
                       </span>
                     </>
@@ -594,144 +618,242 @@ export default function Sidebar() {
     );
   };
 
-  // Section divider
-  const SectionDivider = ({ icon: Icon, label }: { icon: React.ElementType; label: string }) => (
+  // ─── Section Divider ───
+  const SectionDivider = ({ label }: { label: string }) => (
     (!isCollapsed || isMobile) ? (
-      <div className="my-5 px-4">
-        <div className={`flex items-center gap-3 ${theme.textMuted}`}>
-          <div className="h-px flex-1 bg-current opacity-30" />
-          <div className="flex items-center gap-2">
-            <Icon size={12} />
-            <span className="text-[10px] font-bold uppercase tracking-widest">{label}</span>
-          </div>
-          <div className="h-px flex-1 bg-current opacity-30" />
-        </div>
+      <div className="mt-4 mb-1.5 px-3">
+        <p className={`text-[9.5px] font-black uppercase tracking-[0.15em] ${theme.textMuted}`}>
+          {label}
+        </p>
       </div>
     ) : (
-      <div className="my-3 mx-3">
+      <div className="my-2 mx-3">
         <div className={`h-px bg-current opacity-20 ${theme.textMuted}`} />
       </div>
     )
   );
 
-  // Mobile hamburger button
-  const MobileMenuButton = () => (
-    <button
-      onClick={() => setIsOpen(true)}
-      className={`md:hidden fixed top-4 left-4 z-40 p-3 rounded-xl ${theme.sidebar} ${theme.shadow} ${theme.text}
-        transition-all duration-200 active:scale-95 touch-manipulation`}
-      aria-label="Open menu"
-    >
-      <Menu size={24} />
-    </button>
-  );
+  // ─── Mobile Hamburger ───
+  const MobileMenuButton = () => {
+    const pendingBookings = bookingStats?.pendingBookings || 0;
+    return (
+      <button
+        onClick={() => setIsOpen(true)}
+        className={`md:hidden fixed top-4 left-4 z-40 p-2.5 rounded-xl ${theme.sidebar} ${theme.shadow} ${theme.text}
+          transition-all duration-200 active:scale-95 touch-manipulation relative border ${theme.border}`}
+        aria-label="Open menu"
+      >
+        <Menu size={22} />
+        {pendingBookings > 0 && (
+          <span className="absolute -top-1 -right-1 flex h-3 w-3">
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-pink-400 opacity-75" />
+            <span className="relative inline-flex rounded-full h-3 w-3 bg-pink-500" />
+          </span>
+        )}
+      </button>
+    );
+  };
 
-  // Mobile bottom navigation
+  // ─── Mobile Bottom Nav ───
   const MobileBottomNav = () => (
-    <div className={`md:hidden fixed bottom-0 left-0 right-0 z-30 ${theme.sidebar} border-t ${theme.border}`}
+    <div className={`md:hidden fixed bottom-0 left-0 right-0 z-30 ${theme.sidebar} border-t ${theme.border} backdrop-blur-xl`}
       style={{ paddingBottom: 'env(safe-area-inset-bottom, 0)' }}
     >
-      <div className="flex items-center justify-around px-2 py-2">
+      <div className="flex items-center justify-around px-1 py-1.5">
         {bottomNavItems.map((item) => {
-          const isActive = location.pathname === item.href || 
+          const isActive = location.pathname === item.href ||
             (item.href !== '/' && location.pathname.startsWith(item.href));
-          
+          // ✅ UPDATED — badge logic now covers Bookings AND Tracking
+          const badgeCount =
+            item.name === 'Bookings' ? (bookingStats?.pendingBookings || 0) :
+            item.name === 'Tracking' ? trackingActiveNow :
+            0;
+
           return (
             <NavLink
               key={item.name}
               to={item.href}
               preventScrollReset={true}
-              className={`flex flex-col items-center gap-1 px-4 py-2 rounded-xl transition-all duration-200 
-                touch-manipulation min-w-[64px]
+              className={`flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-xl transition-all duration-200 
+                touch-manipulation min-w-[60px] relative
                 ${isActive ? theme.textActive : theme.textMuted}`}
             >
-              <item.icon size={22} strokeWidth={isActive ? 2.5 : 2} />
-              <span className={`text-[10px] font-medium ${isActive ? 'font-semibold' : ''}`}>
+              <div className="relative">
+                <item.icon size={21} strokeWidth={isActive ? 2.5 : 2} />
+                {badgeCount > 0 && (
+                  <span className={`absolute -top-1.5 -right-2 min-w-[16px] h-4 px-1 rounded-full 
+                    ${theme.badgeHot} text-[9px] font-bold flex items-center justify-center shadow-md`}>
+                    {badgeCount > 99 ? '99+' : badgeCount}
+                  </span>
+                )}
+              </div>
+              <span className={`text-[9.5px] ${isActive ? 'font-bold' : 'font-medium'}`}>
                 {item.name}
               </span>
+              {isActive && (
+                <span className={`absolute bottom-0 left-1/2 -translate-x-1/2 w-6 h-0.5 rounded-full ${theme.accent}`} />
+              )}
             </NavLink>
           );
         })}
         <button
           onClick={() => setIsOpen(true)}
-          className={`flex flex-col items-center gap-1 px-4 py-2 rounded-xl transition-all duration-200 
-            touch-manipulation min-w-[64px] ${theme.textMuted}`}
+          className={`flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-xl transition-all duration-200 
+            touch-manipulation min-w-[60px] ${theme.textMuted}`}
         >
-          <Menu size={22} />
-          <span className="text-[10px] font-medium">More</span>
+          <Menu size={21} />
+          <span className="text-[9.5px] font-medium">More</span>
         </button>
       </div>
     </div>
   );
 
-  // Sidebar content
+  // ─── Sidebar Content ───
   const SidebarContent = () => (
     <>
-      {/* Header */}
-      <div className={`p-5 flex items-center justify-between border-b ${theme.border} flex-shrink-0`}>
-        {(!isCollapsed || isMobile) && (
-          <div className="flex items-center gap-3">
-            <div className={`w-10 h-10 rounded-xl ${theme.accent} flex items-center justify-center shadow-lg flex-shrink-0`}>
-              <Sparkles className="w-5 h-5 text-white" />
+      {/* ─── Compact Header ─── */}
+      <div className={`px-3 py-3 flex items-center justify-between border-b ${theme.border} flex-shrink-0`}>
+        {(!isCollapsed || isMobile) ? (
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className={`w-9 h-9 rounded-lg ${theme.accent} flex items-center justify-center shadow-md flex-shrink-0`}>
+              <Sparkles className="w-4.5 h-4.5 text-white" strokeWidth={2.5} />
             </div>
             <div className="min-w-0">
-              <h1 className={`text-lg font-bold ${theme.textActive} truncate`}>Admin</h1>
-              <p className={`text-xs ${theme.textMuted} truncate`}>Control Panel</p>
+              <h1 className={`text-sm font-black ${theme.textActive} truncate leading-tight`}>Admin Panel</h1>
+              <p className={`text-[10px] ${theme.textMuted} truncate leading-tight`}>Control Center</p>
             </div>
           </div>
-        )}
-        {isCollapsed && !isMobile && (
-          <div className={`w-10 h-10 rounded-xl ${theme.accent} flex items-center justify-center mx-auto shadow-lg`}>
-            <Sparkles className="w-5 h-5 text-white" />
+        ) : (
+          <div className={`w-9 h-9 rounded-lg ${theme.accent} flex items-center justify-center mx-auto shadow-md`}>
+            <Sparkles className="w-4.5 h-4.5 text-white" strokeWidth={2.5} />
           </div>
         )}
-        
+
         {isMobile ? (
-          <button
-            onClick={() => setIsOpen(false)}
-            className={`p-2 ${theme.text} ${theme.hover} rounded-lg transition-all duration-200 touch-manipulation flex-shrink-0`}
-            aria-label="Close menu"
-          >
-            <X size={24} />
+          <button onClick={() => setIsOpen(false)}
+            className={`p-1.5 ${theme.text} ${theme.hover} rounded-lg transition-all duration-200 touch-manipulation flex-shrink-0`}
+            aria-label="Close menu">
+            <X size={20} />
           </button>
         ) : (
-          <button
-            onClick={() => setIsCollapsed(!isCollapsed)}
-            className={`p-2 ${theme.text} ${theme.hover} rounded-lg transition-all duration-200 hover:scale-110 flex-shrink-0`}
-          >
-            {isCollapsed ? <ChevronRight size={18} /> : <ChevronLeft size={18} />}
+          <button onClick={() => setIsCollapsed(!isCollapsed)}
+            className={`p-1.5 ${theme.text} ${theme.hover} rounded-lg transition-all duration-200 hover:scale-110 flex-shrink-0`}>
+            {isCollapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
           </button>
         )}
       </div>
 
-      {/* Theme Picker */}
+      {/* ─── Compact Live Stats (Bookings prominent) ─── */}
+      {(!isCollapsed || isMobile) && bookingStats && (
+        <div className="px-3 pt-3 pb-1 flex-shrink-0">
+          <NavLink
+            to="/bookings"
+            onClick={handleNavClick}
+            className={`block p-2.5 rounded-xl ${theme.cardBg} border ${theme.border} relative overflow-hidden
+              hover:scale-[1.02] transition-transform duration-200 group`}
+          >
+            <div className={`absolute -top-4 -right-4 w-20 h-20 ${theme.accent} opacity-10 rounded-full blur-2xl`} />
+            <div className="relative flex items-center gap-2.5">
+              <div className={`w-8 h-8 rounded-lg bg-gradient-to-br from-pink-500 to-rose-500 flex items-center justify-center shadow-sm flex-shrink-0`}>
+                <Activity className="w-4 h-4 text-white" strokeWidth={2.5} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-1.5">
+                  <p className={`text-[10px] font-bold uppercase tracking-wider ${theme.textMuted}`}>Live Bookings</p>
+                  <span className="flex h-1.5 w-1.5">
+                    <span className="animate-ping absolute inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400 opacity-75" />
+                    <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500" />
+                  </span>
+                </div>
+                <div className="flex items-baseline gap-2 mt-0.5">
+                  <span className={`text-lg font-black ${theme.textActive} leading-none`}>
+                    {bookingStats.todayBookings}
+                  </span>
+                  <span className={`text-[10px] ${theme.textMuted}`}>today</span>
+                </div>
+              </div>
+              {bookingStats.pendingBookings > 0 && (
+                <div className={`px-1.5 py-0.5 rounded-md ${theme.badgeHot} text-[10px] font-black shadow-sm`}>
+                  {bookingStats.pendingBookings}
+                </div>
+              )}
+            </div>
+            {/* Mini stats row */}
+            <div className={`mt-2 pt-2 border-t ${theme.border} flex items-center justify-between text-[10px]`}>
+              <div className="flex items-center gap-1">
+                <Clock size={10} className={theme.textMuted} />
+                <span className={theme.textMuted}>Pending</span>
+                <span className={`font-bold ${theme.textActive}`}>{bookingStats.pendingBookings}</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <Zap size={10} className={theme.textMuted} />
+                <span className={theme.textMuted}>Active</span>
+                <span className={`font-bold ${theme.textActive}`}>{bookingStats.inProgressBookings}</span>
+              </div>
+            </div>
+          </NavLink>
+        </div>
+      )}
+
+      {/* ─── ✅ NEW — Live Tracking Mini Card ─── */}
       {(!isCollapsed || isMobile) && (
-        <div className="px-5 py-3 flex-shrink-0">
+        <div className="px-3 pt-1 pb-1 flex-shrink-0">
+          <NavLink
+            to="/tracking"
+            onClick={handleNavClick}
+            className={`block p-2.5 rounded-xl ${theme.cardBg} border ${theme.border} relative overflow-hidden
+              hover:scale-[1.02] transition-transform duration-200 group`}
+          >
+            <div className={`absolute -top-4 -right-4 w-20 h-20 bg-emerald-500 opacity-10 rounded-full blur-2xl`} />
+            <div className="relative flex items-center gap-2.5">
+              <div className={`w-8 h-8 rounded-lg bg-gradient-to-br from-emerald-500 to-teal-500 flex items-center justify-center shadow-sm flex-shrink-0`}>
+                <Radar className="w-4 h-4 text-white" strokeWidth={2.5} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-1.5">
+                  <p className={`text-[10px] font-bold uppercase tracking-wider ${theme.textMuted}`}>Live Tracking</p>
+                  <span className="flex h-1.5 w-1.5 relative">
+                    <span className="animate-ping absolute inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400 opacity-75" />
+                    <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500" />
+                  </span>
+                </div>
+                <div className="flex items-baseline gap-2 mt-0.5">
+                  <span className={`text-lg font-black ${theme.textActive} leading-none`}>
+                    {trackingActiveNow.toLocaleString()}
+                  </span>
+                  <span className={`text-[10px] ${theme.textMuted}`}>active now</span>
+                </div>
+              </div>
+              <div className={`px-1.5 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 text-[9px] font-black uppercase tracking-wider shadow-sm`}>
+                NEW
+              </div>
+            </div>
+          </NavLink>
+        </div>
+      )}
+
+      {/* ─── Compact Theme Picker ─── */}
+      {(!isCollapsed || isMobile) && (
+        <div className="px-3 py-2 flex-shrink-0">
           <div className="relative">
-            <button
-              onClick={() => setShowThemePicker(!showThemePicker)}
-              className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl ${theme.cardBg} ${theme.text} 
-                ${theme.hover} transition-all duration-200 touch-manipulation`}
-            >
-              <Palette size={18} className="flex-shrink-0" />
-              <span className="flex-1 text-left text-sm font-medium truncate">Theme: {theme.name}</span>
-              <ChevronDown size={16} className={`transition-transform flex-shrink-0 ${showThemePicker ? 'rotate-180' : ''}`} />
+            <button onClick={() => setShowThemePicker(!showThemePicker)}
+              className={`w-full flex items-center gap-2 px-2.5 py-2 rounded-lg ${theme.cardBg} ${theme.text} 
+                ${theme.hover} transition-all duration-200 touch-manipulation`}>
+              <Palette size={14} className="flex-shrink-0" />
+              <span className="flex-1 text-left text-[11.5px] font-medium truncate">{theme.name} Theme</span>
+              <ChevronDown size={13} className={`transition-transform flex-shrink-0 ${showThemePicker ? 'rotate-180' : ''}`} />
             </button>
-            
+
             {showThemePicker && (
-              <div className={`absolute top-full left-0 right-0 mt-2 p-3 ${theme.cardBg} backdrop-blur-xl 
-                rounded-xl border ${theme.border} ${theme.shadow} z-[100]`}
-              >
-                <div className="grid grid-cols-3 gap-2">
+              <div className={`absolute top-full left-0 right-0 mt-1.5 p-2 ${theme.cardBg} backdrop-blur-xl 
+                rounded-xl border ${theme.border} ${theme.shadow} z-[100]`}>
+                <div className="grid grid-cols-3 gap-1.5">
                   {(Object.keys(themes) as ThemeKey[]).map((themeKey) => (
-                    <button
-                      key={themeKey}
-                      onClick={() => changeTheme(themeKey)}
-                      className={`p-3 rounded-xl transition-all duration-200 touch-manipulation
-                        ${currentTheme === themeKey ? `ring-2 ring-white/50 ${themes[themeKey].accent}` : theme.hover}`}
-                    >
-                      <div className={`w-full h-8 rounded-lg ${themes[themeKey].sidebar} mb-2`} />
-                      <span className={`text-xs font-medium ${theme.text}`}>{themes[themeKey].name}</span>
+                    <button key={themeKey} onClick={() => changeTheme(themeKey)}
+                      className={`p-1.5 rounded-lg transition-all duration-200 touch-manipulation
+                        ${currentTheme === themeKey ? `ring-2 ring-white/60 ${themes[themeKey].accent}` : theme.hover}`}>
+                      <div className={`w-full h-6 rounded ${themes[themeKey].sidebar} mb-1 shadow-inner`} />
+                      <span className={`text-[9px] font-semibold ${theme.text}`}>{themes[themeKey].name}</span>
                     </button>
                   ))}
                 </div>
@@ -741,98 +863,62 @@ export default function Sidebar() {
         </div>
       )}
 
-      {/* Navigation - FIXED: Added ref and scroll behavior */}
-      <nav 
-        ref={navRef}
-        className="flex-1 px-3 py-4 overflow-y-auto custom-scrollbar overscroll-contain"
-        style={{ scrollBehavior: 'auto' }}
-      >
+      {/* ─── Navigation (compact & scrollable) ─── */}
+      <nav ref={navRef} className="flex-1 px-2 py-2 overflow-y-auto custom-scrollbar overscroll-contain" style={{ scrollBehavior: 'auto' }}>
+        {/* Primary nav */}
+        <SectionDivider label="Main" />
         {navigation.map((item) => renderNavItem(item))}
 
-        {renderSubMenu(
-          'Locations',
-          MapPin,
-          locationSubMenu,
-          isLocationMenuExpanded,
-          setIsLocationMenuExpanded,
-          isLocationRoute
-        )}
+        {renderSubMenu('Locations', MapPin, locationSubMenu, isLocationMenuExpanded, setIsLocationMenuExpanded, isLocationRoute)}
 
-        <SectionDivider icon={Sparkles} label="Server-Driven UI" />
+        <SectionDivider label="Server-Driven UI" />
+        {renderSubMenu('SDUI Manager', Smartphone, sduiMenuItems, isSDUIMenuExpanded, setIsSDUIMenuExpanded, isSDUIRoute)}
 
-        {renderSubMenu(
-          'SDUI Manager',
-          Smartphone,
-          sduiMenuItems,
-          isSDUIMenuExpanded,
-          setIsSDUIMenuExpanded,
-          isSDUIRoute
-        )}
+        <SectionDivider label="Checkout" />
+        {renderSubMenu('Checkout', ShoppingCart, checkoutMenuItems, isCheckoutMenuExpanded, setIsCheckoutMenuExpanded, isCheckoutRoute)}
 
-        <SectionDivider icon={ShoppingCart} label="Checkout" />
-
-        {renderSubMenu(
-          'Checkout',
-          ShoppingCart,
-          checkoutMenuItems,
-          isCheckoutMenuExpanded,
-          setIsCheckoutMenuExpanded,
-          isCheckoutRoute
-        )}
-
-        <SectionDivider icon={Settings} label="System" />
+        <SectionDivider label="System" />
         {otherNavigation.map((item) => renderNavItem(item))}
       </nav>
 
-      {/* Admin Info & Logout */}
-      <div className={`p-4 border-t ${theme.border} flex-shrink-0 ${isMobile ? 'pb-6' : ''}`}>
+      {/* ─── Compact Footer: Admin + Logout ─── */}
+      <div className={`p-2.5 border-t ${theme.border} flex-shrink-0 ${isMobile ? 'pb-5' : ''}`}>
         {(!isCollapsed || isMobile) ? (
-          <div className="space-y-3">
-            <div className={`flex items-center gap-3 p-3 ${theme.cardBg} rounded-xl`}>
-              <div className={`h-11 w-11 rounded-xl ${theme.accent} flex items-center justify-center text-white 
-                font-bold shadow-lg flex-shrink-0`}
-              >
+          <div className="space-y-1.5">
+            <div className={`flex items-center gap-2.5 p-2 ${theme.cardBg} rounded-lg`}>
+              <div className={`h-9 w-9 rounded-lg ${theme.accent} flex items-center justify-center text-white 
+                font-black shadow-md flex-shrink-0 text-sm`}>
                 {admin?.name?.charAt(0).toUpperCase() || 'A'}
               </div>
               <div className="flex-1 min-w-0">
-                <p className={`text-sm font-semibold ${theme.textActive} truncate`}>{admin?.name}</p>
-                <p className={`text-xs ${theme.textMuted} truncate`}>{admin?.role}</p>
+                <p className={`text-[12.5px] font-bold ${theme.textActive} truncate leading-tight`}>{admin?.name}</p>
+                <p className={`text-[10px] ${theme.textMuted} truncate leading-tight mt-0.5`}>{admin?.role}</p>
               </div>
+              <button onClick={logout}
+                className={`p-1.5 rounded-md ${theme.text} hover:text-red-400 ${theme.hover} transition-all duration-200 flex-shrink-0`}
+                title="Sign Out">
+                <LogOut size={15} />
+              </button>
             </div>
-            <button
-              onClick={logout}
-              className={`flex items-center justify-center gap-2 w-full py-3.5 ${theme.cardBg} ${theme.text} 
-                ${theme.hover} rounded-xl transition-all duration-200 font-medium hover:text-red-400 
-                touch-manipulation active:scale-[0.98]`}
-            >
-              <LogOut size={18} />
-              <span>Sign Out</span>
-            </button>
           </div>
         ) : (
-          <div className="flex flex-col items-center gap-3">
-            <div className={`h-11 w-11 rounded-xl ${theme.accent} flex items-center justify-center text-white 
-              font-bold group relative shadow-lg`}
-            >
+          <div className="flex flex-col items-center gap-2">
+            <div className={`h-9 w-9 rounded-lg ${theme.accent} flex items-center justify-center text-white 
+              font-black group relative shadow-md text-sm`}>
               {admin?.name?.charAt(0).toUpperCase() || 'A'}
-              <div className={`absolute left-full ml-3 px-4 py-3 ${theme.cardBg} backdrop-blur-xl text-sm 
-                rounded-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all 
-                duration-200 whitespace-nowrap z-[100] border ${theme.border} ${theme.shadow}`}
-              >
+              <div className={`absolute left-full ml-3 px-3 py-2 ${theme.cardBg} backdrop-blur-xl text-xs 
+                rounded-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all 
+                duration-150 whitespace-nowrap z-[100] border ${theme.border} ${theme.shadow}`}>
                 <p className={`font-bold ${theme.textActive}`}>{admin?.name}</p>
                 <p className={theme.textMuted}>{admin?.role}</p>
               </div>
             </div>
-            <button
-              onClick={logout}
-              className={`p-2.5 ${theme.text} hover:text-red-400 ${theme.hover} rounded-xl transition-all 
-                duration-200 group relative hover:scale-110`}
-            >
-              <LogOut size={18} />
-              <div className={`absolute left-full ml-3 px-4 py-2.5 ${theme.cardBg} backdrop-blur-xl text-sm 
-                rounded-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all 
-                duration-200 whitespace-nowrap z-[100] border ${theme.border} ${theme.shadow}`}
-              >
+            <button onClick={logout}
+              className={`p-2 ${theme.text} hover:text-red-400 ${theme.hover} rounded-lg transition-all duration-200 group relative hover:scale-110`}>
+              <LogOut size={15} />
+              <div className={`absolute left-full ml-3 px-3 py-1.5 ${theme.cardBg} backdrop-blur-xl text-xs 
+                rounded-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all 
+                duration-150 whitespace-nowrap z-[100] border ${theme.border} ${theme.shadow}`}>
                 <span className={theme.text}>Sign Out</span>
               </div>
             </button>
@@ -844,10 +930,8 @@ export default function Sidebar() {
 
   return (
     <>
-      {/* Mobile Menu Button */}
       {isMobile && !isOpen && <MobileMenuButton />}
 
-      {/* Mobile Overlay */}
       {isMobile && (
         <div
           className={`fixed inset-0 z-40 transition-all duration-300 ${
@@ -858,14 +942,13 @@ export default function Sidebar() {
         />
       )}
 
-      {/* Sidebar */}
       <div
         {...(isMobile ? swipeHandlers : {})}
         className={`
-          ${isMobile 
-            ? `fixed inset-y-0 left-0 z-50 w-[85vw] max-w-[320px] transform transition-transform duration-300 ease-out
+          ${isMobile
+            ? `fixed inset-y-0 left-0 z-50 w-[82vw] max-w-[300px] transform transition-transform duration-300 ease-out
                ${isOpen ? 'translate-x-0' : '-translate-x-full'}`
-            : `${isCollapsed ? 'w-20' : 'w-72'} relative transition-all duration-300`
+            : `${isCollapsed ? 'w-[68px]' : 'w-[248px]'} relative transition-all duration-300`
           }
           ${theme.sidebar} min-h-screen flex flex-col ${theme.shadow}
         `}
@@ -873,50 +956,37 @@ export default function Sidebar() {
         <SidebarContent />
       </div>
 
-      {/* Mobile Bottom Navigation */}
       {isMobile && <MobileBottomNav />}
+      {isMobile && <div className="h-16 flex-shrink-0" />}
 
-      {/* Spacer for mobile bottom nav */}
-      {isMobile && <div className="h-20 flex-shrink-0" />}
-
-      {/* Custom Styles */}
       <style>{`
         .custom-scrollbar {
           scrollbar-width: thin;
-          scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+          scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
         }
-        
-        .custom-scrollbar::-webkit-scrollbar {
-          width: 4px;
-        }
-        
-        .custom-scrollbar::-webkit-scrollbar-track {
-          background: transparent;
-        }
-        
+        .custom-scrollbar::-webkit-scrollbar { width: 3px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
         .custom-scrollbar::-webkit-scrollbar-thumb {
-          background: rgba(255, 255, 255, 0.2);
-          border-radius: 4px;
+          background: rgba(255, 255, 255, 0.15);
+          border-radius: 3px;
         }
-        
         .custom-scrollbar::-webkit-scrollbar-thumb:hover {
           background: rgba(255, 255, 255, 0.3);
         }
-        
         .touch-manipulation {
           touch-action: manipulation;
           -webkit-tap-highlight-color: transparent;
         }
-        
         @media (max-width: 767px) {
-          .custom-scrollbar {
-            -webkit-overflow-scrolling: touch;
-          }
+          .custom-scrollbar { -webkit-overflow-scrolling: touch; }
         }
-        
-        /* Prevent focus scroll */
-        [data-focus-guard] {
-          position: fixed;
+        [data-focus-guard] { position: fixed; }
+        @keyframes gentle-pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.7; }
+        }
+        .animate-pulse {
+          animation: gentle-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
         }
       `}</style>
     </>

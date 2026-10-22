@@ -7,6 +7,7 @@ import Sidebar from './components/layout/Sidebar';
 import Header from './components/layout/Header';
 import Dashboard from './components/pages/Dashboard';
 import ProvidersModule from "./components/pages/ProviderModule";
+import ProviderDetails from "./pages/ProviderDetails";
 import VerificationModule from './components/pages/VerificationModule';
 import CategoriesModule from './components/pages/CategoriesModule';
 import PricingModule from './components/pages/PricingModule';
@@ -35,6 +36,10 @@ import TrendingPage from './pages/SDUI/TrendingPage';
 import LayoutEditorPage from './pages/SDUI/LayoutEditorPage';
 import FeatureFlagsPage from './pages/SDUI/FeatureFlagsPage';
 import ASAPSectionManager from './pages/SDUI/ASAPSectionManager';
+import BookingsManager from './pages/BookingsManager';
+
+// ==================== LIVE TRACKING ==================== ✅ NEW
+import LiveTracking from './pages/LiveTracking';
 
 import LoginPage from './pages/LoginPage';
 import './index.css';
@@ -77,74 +82,276 @@ function App() {
             <Route path="/login" element={<LoginPage />} />
 
             {/* ==================== DASHBOARD ==================== */}
-            <Route path="/" element={<ProtectedRoute><AppLayout><Dashboard /></AppLayout></ProtectedRoute>} />
+            <Route
+              path="/"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <Dashboard />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
 
             {/* ==================== PROVIDERS & USERS ==================== */}
-            <Route path="/providers" element={<ProtectedRoute><AppLayout><ProvidersModule /></AppLayout></ProtectedRoute>} />
-            <Route path="/verifications" element={<ProtectedRoute><AppLayout><VerificationModule /></AppLayout></ProtectedRoute>} />
-            <Route path="/users" element={<ProtectedRoute><AppLayout><UsersModule /></AppLayout></ProtectedRoute>} />
-            
+            <Route
+              path="/providers"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <ProvidersModule />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/providers/:id"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <ProviderDetails />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/verifications"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <VerificationModule />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/users"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <UsersModule />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+
             {/* ==================== LOCATION MANAGEMENT ==================== */}
-            <Route path="/locations/cities" element={<ProtectedRoute><AppLayout><CitiesModule /></AppLayout></ProtectedRoute>} />
-            <Route path="/locations/zones" element={<ProtectedRoute><AppLayout><ZonesModule /></AppLayout></ProtectedRoute>} />
+            <Route
+              path="/locations/cities"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <CitiesModule />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/locations/zones"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <ZonesModule />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+
+            {/* ==================== LIVE TRACKING ==================== ✅ NEW */}
+            <Route
+              path="/tracking"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <LiveTracking />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
 
             {/* ==================== CATEGORIES & PRICING ==================== */}
-            <Route path="/categories" element={<ProtectedRoute><AppLayout><CategoriesModule /></AppLayout></ProtectedRoute>} />
-            <Route path="/pricing" element={<ProtectedRoute><AppLayout><PricingModule /></AppLayout></ProtectedRoute>} />
+            <Route
+              path="/categories"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <CategoriesModule />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/pricing"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <PricingModule />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
 
             {/* ==================== ANALYTICS ==================== */}
-            <Route path="/analytics" element={<ProtectedRoute><AppLayout><RevenueAnalytics /></AppLayout></ProtectedRoute>} />
+            <Route
+              path="/analytics"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <RevenueAnalytics />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
 
             {/* ==================== SDUI MANAGER ==================== */}
-            <Route path="/sdui" element={<ProtectedRoute><AppLayout><SDUIDashboard /></AppLayout></ProtectedRoute>} />
-            <Route path="/sdui/categories" element={<ProtectedRoute><AppLayout><CategoriesPage /></AppLayout></ProtectedRoute>} />
-            <Route path="/sdui/services" element={<ProtectedRoute><AppLayout><ServicesPage /></AppLayout></ProtectedRoute>} />
-            <Route path="/sdui/subservices" element={<ProtectedRoute><AppLayout><SubservicesPage /></AppLayout></ProtectedRoute>} />
-            <Route path="/sdui/banners" element={<ProtectedRoute><AppLayout><BannersPage /></AppLayout></ProtectedRoute>} />
-            <Route path="/sdui/trending" element={<ProtectedRoute><AppLayout><TrendingPage /></AppLayout></ProtectedRoute>} />
-            <Route path="/sdui/layout-editor" element={<ProtectedRoute><AppLayout><LayoutEditorPage /></AppLayout></ProtectedRoute>} />
-            <Route path="/sdui/feature-flags" element={<ProtectedRoute><AppLayout><FeatureFlagsPage /></AppLayout></ProtectedRoute>} />
-            
+            <Route
+              path="/sdui"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <SDUIDashboard />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/sdui/categories"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <CategoriesPage />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/sdui/services"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <ServicesPage />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/sdui/subservices"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <SubservicesPage />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/sdui/banners"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <BannersPage />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/sdui/trending"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <TrendingPage />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/sdui/layout-editor"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <LayoutEditorPage />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/sdui/feature-flags"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <FeatureFlagsPage />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+
             {/* ✅ ASAP SECTIONS ROUTE */}
-            <Route path="/sdui/asap-sections" element={
-              <ProtectedRoute>
-                <AppLayout>
-                  <ASAPSectionManager />
-                </AppLayout>
-              </ProtectedRoute>
-            } />
+            <Route
+              path="/sdui/asap-sections"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <ASAPSectionManager />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
 
             {/* ✅ NOTIFICATIONS ROUTES */}
-            <Route path="/sdui/notifications" element={
-              <ProtectedRoute>
-                <AppLayout>
-                  <NotificationsPage />
-                </AppLayout>
-              </ProtectedRoute>
-            } />
-            <Route path="/sdui/notifications/send" element={
-              <ProtectedRoute>
-                <AppLayout>
-                  <NotificationSender />
-                </AppLayout>
-              </ProtectedRoute>
-            } />
+            <Route
+              path="/sdui/notifications"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <NotificationsPage />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/sdui/notifications/send"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <NotificationSender />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+
+            {/* ==================== BOOKINGS ==================== */}
+            <Route
+              path="/bookings"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <BookingsManager />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
 
             {/* ==================== CHECKOUT MANAGEMENT ==================== */}
-            <Route path="/checkout/coupons" element={
-              <ProtectedRoute>
-                <AppLayout>
-                  <CouponManagement />
-                </AppLayout>
-              </ProtectedRoute>
-            } />
-            <Route path="/checkout/settings" element={
-              <ProtectedRoute>
-                <AppLayout>
-                  <CheckoutSettingsPage />
-                </AppLayout>
-              </ProtectedRoute>
-            } />
+            <Route
+              path="/checkout/coupons"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <CouponManagement />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/checkout/settings"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <CheckoutSettingsPage />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
 
             {/* ==================== CATCH ALL ==================== */}
             <Route path="*" element={<Navigate to="/" replace />} />
