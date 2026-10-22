@@ -9,14 +9,26 @@ const getProviderCollection = () => {
   return providerConn.db.collection('providers');
 };
 
-// ==================== GET PROVIDER STATS (NEW) ====================
+// Helper to emit socket event to admins
+const emitToAdmins = (req, event, data) => {
+  try {
+    const io = req.app.get('io');
+    if (io) {
+      io.to('admins').emit(event, data);
+      console.log(`📡 Emitted ${event} to admins`);
+    }
+  } catch (err) {
+    console.error('Socket emit error:', err.message);
+  }
+};
+
+// ==================== GET PROVIDER STATS ====================
 exports.getProviderStats = async (req, res, next) => {
   try {
     console.log('\n📊 Fetching provider statistics...');
     
     const providersCollection = getProviderCollection();
 
-    // Get all counts in parallel for better performance
     const [
       totalProviders,
       activeProviders,
@@ -48,7 +60,6 @@ exports.getProviderStats = async (req, res, next) => {
       }),
     ]);
 
-    // Get profession distribution
     const professionDistribution = await providersCollection.aggregate([
       { $match: { profession: { $exists: true, $ne: null } } },
       { $group: { _id: '$profession', count: { $sum: 1 } } },
@@ -56,21 +67,18 @@ exports.getProviderStats = async (req, res, next) => {
       { $limit: 10 },
     ]).toArray();
 
-    // Get weekly signups (last 7 days)
     const weekAgo = new Date();
     weekAgo.setDate(weekAgo.getDate() - 7);
     const weeklySignups = await providersCollection.countDocuments({
       createdAt: { $gte: weekAgo },
     });
 
-    // Get monthly signups (last 30 days)
     const monthAgo = new Date();
     monthAgo.setDate(monthAgo.getDate() - 30);
     const monthlySignups = await providersCollection.countDocuments({
       createdAt: { $gte: monthAgo },
     });
 
-    // Calculate total earnings
     const earningsResult = await providersCollection.aggregate([
       {
         $group: {
@@ -118,7 +126,7 @@ exports.getProviderStats = async (req, res, next) => {
   }
 };
 
-// ==================== GET RECENT PROVIDERS (NEW) ====================
+// ==================== GET RECENT PROVIDERS ====================
 exports.getRecentProviders = async (req, res, next) => {
   try {
     console.log('\n📋 Fetching recent providers...');
@@ -140,7 +148,7 @@ exports.getRecentProviders = async (req, res, next) => {
       email: p.email,
       phone: p.phone,
       profession: p.profession || 'General',
-      profileImage: p.profileImage || p.profilePhoto,
+      profileImage: p.profileImage || p.profilePhoto || p.profilePicture,
       verificationStatus: p.verificationStatus || 'pending',
       isActive: p.isActive !== false,
       isBlocked: p.isBlocked || false,
@@ -182,7 +190,6 @@ exports.getAllProviders = async (req, res, next) => {
 
     const providersCollection = getProviderCollection();
 
-    // Build query
     const query = {};
 
     if (verificationStatus && verificationStatus !== 'all') {
@@ -211,15 +218,12 @@ exports.getAllProviders = async (req, res, next) => {
       ];
     }
 
-    // Count total
     const total = await providersCollection.countDocuments(query);
     console.log('📊 Total providers:', total);
     
-    // Sort options
     const sortOptions = {};
     sortOptions[sortBy] = sortOrder === 'asc' ? 1 : -1;
 
-    // Fetch providers
     const providers = await providersCollection
       .find(query)
       .sort(sortOptions)
@@ -229,7 +233,6 @@ exports.getAllProviders = async (req, res, next) => {
 
     console.log('📥 Fetched providers:', providers.length);
 
-    // Transform providers
     const transformedProviders = providers.map(p => ({
       _id: p._id,
       providerId: p.providerId || p._id.toString(),
@@ -237,7 +240,7 @@ exports.getAllProviders = async (req, res, next) => {
       email: p.email,
       phone: p.phone,
       profession: p.profession || p.service || 'N/A',
-      profileImage: p.profileImage || p.profilePhoto,
+      profileImage: p.profileImage || p.profilePhoto || p.profilePicture,
       gender: p.gender,
       verificationStatus: p.verificationStatus || 'pending',
       isActive: p.isActive !== false,
@@ -248,13 +251,13 @@ exports.getAllProviders = async (req, res, next) => {
       isVerified: p.isVerified || false,
       serviceRadius: p.serviceRadius || 10,
       location: p.location || { coordinates: [0, 0] },
-      rating: p.rating || 0,
-      totalRatings: p.totalRatings || 0,
+      rating: typeof p.rating === 'object' ? (p.rating?.average || 0) : (p.rating || 0),
+      totalRatings: typeof p.rating === 'object' ? (p.rating?.count || 0) : (p.totalRatings || 0),
       totalBookings: p.totalBookings || 0,
-      completedBookings: p.completedBookings || 0,
+      completedBookings: p.completedBookings || p.completedJobs || 0,
       cancelledBookings: p.cancelledBookings || 0,
       todayEarnings: p.todayEarnings || 0,
-      totalEarnings: p.totalEarnings || 0,
+      totalEarnings: p.totalEarnings || (p.wallet?.totalEarnings) || 0,
       blockedAt: p.blockedAt,
       blockedBy: p.blockedBy,
       blockReason: p.blockReason,
@@ -285,7 +288,7 @@ exports.getAllProviders = async (req, res, next) => {
   }
 };
 
-// ==================== GET PROVIDER BY ID ====================
+// ==================== GET PROVIDER BY ID (FULL RAW + SANITIZED) ====================
 exports.getProviderById = async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -308,52 +311,27 @@ exports.getProviderById = async (req, res, next) => {
       throw ApiError.notFound('Provider not found');
     }
 
-    // Transform provider data
-    const transformedProvider = {
-      _id: provider._id,
-      providerId: provider.providerId || provider._id.toString(),
-      name: provider.name,
-      email: provider.email,
-      phone: provider.phone,
-      profession: provider.profession || 'N/A',
-      profileImage: provider.profileImage || provider.profilePhoto,
-      gender: provider.gender,
-      dateOfBirth: provider.dateOfBirth,
-      verificationStatus: provider.verificationStatus || 'pending',
-      isActive: provider.isActive !== false,
-      isBlocked: provider.isBlocked || false,
-      isAvailable: provider.isAvailable || false,
-      isOnline: provider.isOnline || false,
-      isAcceptingJobs: provider.isAcceptingJobs || false,
-      isVerified: provider.isVerified || false,
-      serviceRadius: provider.serviceRadius || 10,
-      location: provider.location || { coordinates: [0, 0] },
-      rating: provider.rating || 0,
-      totalRatings: provider.totalRatings || 0,
-      totalBookings: provider.totalBookings || 0,
-      completedBookings: provider.completedBookings || 0,
-      cancelledBookings: provider.cancelledBookings || 0,
-      todayEarnings: provider.todayEarnings || 0,
-      totalEarnings: provider.totalEarnings || 0,
-      walletBalance: provider.walletBalance || 0,
-      blockedAt: provider.blockedAt,
-      blockedBy: provider.blockedBy,
-      blockReason: provider.blockReason,
-      verifiedAt: provider.verifiedAt,
-      verifiedBy: provider.verifiedBy,
-      verificationNotes: provider.verificationNotes,
-      rejectedAt: provider.rejectedAt,
-      rejectedBy: provider.rejectedBy,
-      rejectionReason: provider.rejectionReason,
-      lastActiveAt: provider.lastActiveAt,
-      createdAt: provider.createdAt,
-      updatedAt: provider.updatedAt,
-    };
+    // Mask sensitive tokens but keep ALL other fields
+    const safeProvider = { ...provider };
+    
+    if (safeProvider.refreshToken && typeof safeProvider.refreshToken === 'string') {
+      const t = safeProvider.refreshToken;
+      safeProvider.refreshToken = t.length > 12 
+        ? `${t.slice(0, 6)}•••••••${t.slice(-6)}` 
+        : '••••••••';
+    }
+    
+    if (safeProvider.fcmToken && typeof safeProvider.fcmToken === 'string') {
+      const t = safeProvider.fcmToken;
+      safeProvider.fcmToken = t.length > 12 
+        ? `${t.slice(0, 8)}•••••••${t.slice(-6)}` 
+        : '••••••••';
+    }
 
     res.json({
       success: true,
       data: {
-        provider: transformedProvider,
+        provider: safeProvider,
       },
     });
   } catch (error) {
@@ -361,7 +339,7 @@ exports.getProviderById = async (req, res, next) => {
   }
 };
 
-// ==================== TOGGLE PROVIDER STATUS ====================
+// ==================== TOGGLE PROVIDER STATUS (isActive) ====================
 exports.toggleProviderStatus = async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -393,6 +371,11 @@ exports.toggleProviderStatus = async (req, res, next) => {
 
     logger.info(`Provider status updated: ${id} - isActive: ${isActive}`);
 
+    emitToAdmins(req, 'provider:status_changed', {
+      providerId: id,
+      isActive,
+    });
+
     res.json({
       success: true,
       message: `Provider ${isActive ? 'activated' : 'deactivated'} successfully`,
@@ -405,7 +388,218 @@ exports.toggleProviderStatus = async (req, res, next) => {
   }
 };
 
-// ==================== BLOCK/UNBLOCK PROVIDER (NEW) ====================
+// ==================== UPDATE AVAILABILITY (isAvailable, isAcceptingJobs, isBusy) ====================
+exports.updateAvailability = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { isAvailable, isAcceptingJobs, isBusy, isOnline } = req.body;
+
+    const providersCollection = getProviderCollection();
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      throw ApiError.badRequest('Invalid provider ID');
+    }
+
+    const existing = await providersCollection.findOne({ 
+      _id: new mongoose.Types.ObjectId(id) 
+    });
+
+    if (!existing) {
+      throw ApiError.notFound('Provider not found');
+    }
+
+    const updateData = { updatedAt: new Date() };
+    
+    if (isAvailable !== undefined) updateData.isAvailable = !!isAvailable;
+    if (isAcceptingJobs !== undefined) updateData.isAcceptingJobs = !!isAcceptingJobs;
+    if (isBusy !== undefined) updateData.isBusy = !!isBusy;
+    if (isOnline !== undefined) {
+      updateData.isOnline = !!isOnline;
+      if (!!isOnline) updateData.lastOnlineAt = new Date();
+    }
+
+    // Bump stateVersion for sync
+    updateData.stateVersion = (existing.stateVersion || 0) + 1;
+    updateData.lastStateSyncAt = new Date();
+
+    await providersCollection.updateOne(
+      { _id: new mongoose.Types.ObjectId(id) },
+      { $set: updateData }
+    );
+
+    const provider = await providersCollection.findOne({ 
+      _id: new mongoose.Types.ObjectId(id) 
+    });
+
+    logger.info(`Provider availability updated: ${id}`, updateData);
+
+    emitToAdmins(req, 'provider:availability_changed', {
+      providerId: id,
+      ...updateData,
+    });
+
+    res.json({
+      success: true,
+      message: 'Provider availability updated successfully',
+      data: { provider },
+    });
+  } catch (error) {
+    console.error('❌ Error updating availability:', error);
+    next(error);
+  }
+};
+
+// ==================== UPDATE VERIFICATION STATUS ====================
+exports.updateVerification = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { verificationStatus, notes, reason } = req.body;
+    const adminId = req.admin?._id || req.admin?.id;
+
+    const providersCollection = getProviderCollection();
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      throw ApiError.badRequest('Invalid provider ID');
+    }
+
+    const allowed = ['pending', 'approved', 'verified', 'rejected', 'incomplete'];
+    if (!allowed.includes(verificationStatus)) {
+      throw ApiError.badRequest(`Invalid verification status. Allowed: ${allowed.join(', ')}`);
+    }
+
+    const existing = await providersCollection.findOne({ 
+      _id: new mongoose.Types.ObjectId(id) 
+    });
+
+    if (!existing) {
+      throw ApiError.notFound('Provider not found');
+    }
+
+    const updateData = {
+      verificationStatus,
+      updatedAt: new Date(),
+    };
+
+    if (verificationStatus === 'approved' || verificationStatus === 'verified') {
+      updateData.isVerified = true;
+      updateData.verifiedAt = new Date();
+      updateData.verifiedBy = adminId;
+      if (notes) updateData.verificationNotes = notes;
+      // Clear rejection
+      updateData.rejectedAt = null;
+      updateData.rejectedBy = null;
+      updateData.rejectionReason = null;
+    } else if (verificationStatus === 'rejected') {
+      updateData.isVerified = false;
+      updateData.rejectedAt = new Date();
+      updateData.rejectedBy = adminId;
+      updateData.rejectionReason = reason || notes || 'No reason provided';
+    } else if (verificationStatus === 'pending' || verificationStatus === 'incomplete') {
+      updateData.isVerified = false;
+    }
+
+    await providersCollection.updateOne(
+      { _id: new mongoose.Types.ObjectId(id) },
+      { $set: updateData }
+    );
+
+    const provider = await providersCollection.findOne({ 
+      _id: new mongoose.Types.ObjectId(id) 
+    });
+
+    logger.info(`Provider verification updated: ${id} -> ${verificationStatus} by admin: ${adminId}`);
+
+    emitToAdmins(req, 'provider:verification_changed', {
+      providerId: id,
+      verificationStatus,
+    });
+
+    res.json({
+      success: true,
+      message: `Provider verification set to ${verificationStatus}`,
+      data: { provider },
+    });
+  } catch (error) {
+    console.error('❌ Error updating verification:', error);
+    next(error);
+  }
+};
+
+// ==================== UPDATE PAYMENT LOCK ====================
+exports.updatePaymentLock = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { isLocked, reason, unpaidAmount, pendingTransactionCount } = req.body;
+    const adminId = req.admin?._id || req.admin?.id;
+
+    const providersCollection = getProviderCollection();
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      throw ApiError.badRequest('Invalid provider ID');
+    }
+
+    const existing = await providersCollection.findOne({ 
+      _id: new mongoose.Types.ObjectId(id) 
+    });
+
+    if (!existing) {
+      throw ApiError.notFound('Provider not found');
+    }
+
+    const currentLock = existing.paymentLock || {};
+
+    const newLock = {
+      ...currentLock,
+      isLocked: !!isLocked,
+      reason: reason !== undefined ? reason : (currentLock.reason || null),
+      unpaidAmount: unpaidAmount !== undefined ? Number(unpaidAmount) : (currentLock.unpaidAmount || 0),
+      pendingTransactionCount: pendingTransactionCount !== undefined 
+        ? Number(pendingTransactionCount) 
+        : (currentLock.pendingTransactionCount || 0),
+      lastCheckedAt: new Date(),
+      lastModifiedBy: adminId,
+    };
+
+    if (isLocked) {
+      newLock.lockedAt = new Date();
+      newLock.unlockedAt = null;
+    } else {
+      newLock.unlockedAt = new Date();
+    }
+
+    await providersCollection.updateOne(
+      { _id: new mongoose.Types.ObjectId(id) },
+      { 
+        $set: { 
+          paymentLock: newLock,
+          updatedAt: new Date(),
+        } 
+      }
+    );
+
+    const provider = await providersCollection.findOne({ 
+      _id: new mongoose.Types.ObjectId(id) 
+    });
+
+    logger.info(`Provider payment lock updated: ${id} - isLocked: ${isLocked} by admin: ${adminId}`);
+
+    emitToAdmins(req, 'provider:payment_lock_changed', {
+      providerId: id,
+      isLocked: !!isLocked,
+    });
+
+    res.json({
+      success: true,
+      message: `Payments ${isLocked ? 'locked' : 'unlocked'} successfully`,
+      data: { provider },
+    });
+  } catch (error) {
+    console.error('❌ Error updating payment lock:', error);
+    next(error);
+  }
+};
+
+// ==================== BLOCK/UNBLOCK PROVIDER ====================
 exports.blockProvider = async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -420,7 +614,6 @@ exports.blockProvider = async (req, res, next) => {
       throw ApiError.badRequest('Invalid provider ID');
     }
 
-    // Check if provider exists
     const existingProvider = await providersCollection.findOne({ 
       _id: new mongoose.Types.ObjectId(id) 
     });
@@ -438,7 +631,7 @@ exports.blockProvider = async (req, res, next) => {
       updateData.blockedAt = new Date();
       updateData.blockedBy = adminId;
       updateData.blockReason = reason || 'No reason provided';
-      updateData.isActive = false; // Also deactivate when blocking
+      updateData.isActive = false;
       updateData.isAvailable = false;
       updateData.isOnline = false;
       updateData.isAcceptingJobs = false;
@@ -446,7 +639,6 @@ exports.blockProvider = async (req, res, next) => {
       updateData.blockedAt = null;
       updateData.blockedBy = null;
       updateData.blockReason = null;
-      // Don't automatically reactivate - admin should do that separately
     }
 
     const result = await providersCollection.updateOne(
@@ -463,6 +655,11 @@ exports.blockProvider = async (req, res, next) => {
     });
 
     logger.info(`Provider ${isBlocked ? 'blocked' : 'unblocked'}: ${id} by admin: ${adminId}`);
+
+    emitToAdmins(req, 'provider:block_changed', {
+      providerId: id,
+      isBlocked,
+    });
 
     res.json({
       success: true,
@@ -486,7 +683,7 @@ exports.blockProvider = async (req, res, next) => {
   }
 };
 
-// ==================== UPDATE PROVIDER ====================
+// ==================== UPDATE PROVIDER (GENERIC PATCH) ====================
 exports.updateProvider = async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -494,10 +691,11 @@ exports.updateProvider = async (req, res, next) => {
 
     const providersCollection = getProviderCollection();
 
-    // Remove protected fields
     delete updates._id;
     delete updates.providerId;
     delete updates.createdAt;
+    delete updates.refreshToken; // Never allow updating via this endpoint
+    delete updates.fcmToken;
 
     if (!mongoose.Types.ObjectId.isValid(id)) {
       throw ApiError.badRequest('Invalid provider ID');
@@ -519,6 +717,8 @@ exports.updateProvider = async (req, res, next) => {
     });
 
     logger.info(`Provider updated: ${id}`);
+
+    emitToAdmins(req, 'provider:updated', { providerId: id });
 
     res.json({
       success: true,
@@ -547,7 +747,6 @@ exports.deleteProvider = async (req, res, next) => {
       throw ApiError.badRequest('Invalid provider ID');
     }
 
-    // Check if provider exists
     const existingProvider = await providersCollection.findOne({ 
       _id: new mongoose.Types.ObjectId(id) 
     });
@@ -557,7 +756,6 @@ exports.deleteProvider = async (req, res, next) => {
     }
 
     if (permanent === 'true' || permanent === true) {
-      // Permanent delete
       const result = await providersCollection.deleteOne({ 
         _id: new mongoose.Types.ObjectId(id) 
       });
@@ -581,7 +779,6 @@ exports.deleteProvider = async (req, res, next) => {
         },
       });
     } else {
-      // Soft delete - mark as deleted but keep record
       const result = await providersCollection.updateOne(
         { _id: new mongoose.Types.ObjectId(id) },
         { 
@@ -623,7 +820,7 @@ exports.deleteProvider = async (req, res, next) => {
   }
 };
 
-// ==================== RESTORE DELETED PROVIDER (NEW) ====================
+// ==================== RESTORE DELETED PROVIDER ====================
 exports.restoreProvider = async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -681,7 +878,7 @@ exports.restoreProvider = async (req, res, next) => {
   }
 };
 
-// ==================== DELETE MULTIPLE PROVIDERS (NEW) ====================
+// ==================== DELETE MULTIPLE PROVIDERS ====================
 exports.deleteMultipleProviders = async (req, res, next) => {
   try {
     const { providerIds, permanent = false } = req.body;

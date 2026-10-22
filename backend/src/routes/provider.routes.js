@@ -7,36 +7,26 @@ const authMiddleware = require('../middleware/authMiddleware');
 router.use(authMiddleware);
 
 // ==================== STATS & RECENT (Must be before /:id routes) ====================
-// Get provider statistics
 router.get('/stats', providerController.getProviderStats);
-
-// Get recent providers
 router.get('/recent', providerController.getRecentProviders);
 
 // ==================== BULK OPERATIONS ====================
-// Delete multiple providers
 router.post('/delete-multiple', providerController.deleteMultipleProviders);
 
 // ==================== CRUD OPERATIONS ====================
-// Get all providers
 router.get('/', providerController.getAllProviders);
-
-// Get provider by ID
 router.get('/:id', providerController.getProviderById);
-
-// Update provider
 router.patch('/:id', providerController.updateProvider);
 
-// Toggle provider status (active/inactive)
+// ==================== STATUS CONTROLS ====================
 router.patch('/:id/status', providerController.toggleProviderStatus);
-
-// Block/Unblock provider
+router.patch('/:id/availability', providerController.updateAvailability);
+router.patch('/:id/verification', providerController.updateVerification);
+router.patch('/:id/payment-lock', providerController.updatePaymentLock);
 router.patch('/:id/block', providerController.blockProvider);
-
-// Restore deleted provider
 router.patch('/:id/restore', providerController.restoreProvider);
 
-// Delete provider (soft delete by default, permanent with query param)
+// ==================== DELETE ====================
 router.delete('/:id', providerController.deleteProvider);
 
 module.exports = router;
