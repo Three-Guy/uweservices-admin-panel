@@ -50,3 +50,10 @@ temp/
 # Misc
 *.pid
 *.seed
+
+cd C:\Users\bhavu\Downloads\SERVICEADMINPANEEL (3)\SERVICEADMINPANEEL
+
+echo "" >> .gitignore
+echo "# Firebase Service Account Keys (NEVER push)" >> .gitignore
+echo "**/*-firebase-adminsdk.json" >> .gitignore
+echo "**/serviceAccount*.json" >> .gitignore
