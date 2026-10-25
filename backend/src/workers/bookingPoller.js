@@ -1,156 +1,124 @@
-// src/workers/bookingPoller.js
+// backend/src/workers/bookingPoller.js
+// EVENT-DRIVEN with MongoDB Change Streams + light safety-net cron (every 2 min)
 const cron = require('node-cron');
-const { getBookingModel } = require('../config/database');
-const { getDispatchJobModel } = require('../models/DispatchJob');
-const { dispatchBooking } = require('../services/dispatchService');
-const { createAdminAlert, emitLive } = require('../services/adminAlertService');
 const logger = require('../utils/logger');
+const { getBookingModel } = require('../config/database');
+const { triggerDispatchById, activeDispatches, recentlyFailed } = require('../services/dispatchService');
 
-const STUCK_MINUTES = Number(process.env.DISPATCH_STUCK_BOOKING_MINUTES || 2);
-const POLL_INTERVAL_SEC = Number(process.env.DISPATCH_POLL_INTERVAL_SECONDS || 10);
+let changeStream = null;
 
-let pollerTask = null;
-let isPolling = false;
-const seenBookings = new Set(); // in-memory dedupe for "new booking" alerts
-
-async function pollOnce() {
-  if (isPolling) return;
-  isPolling = true;
+// ─── 1. CHANGE STREAM: Instantly detect new bookings ───
+async function startChangeStream() {
   try {
     const Booking = getBookingModel();
-    const DispatchJob = getDispatchJobModel();
-
-    const stuckThreshold = new Date(Date.now() - STUCK_MINUTES * 60 * 1000);
-    const retryThreshold = new Date();
-
-    // Case 1: New bookings needing dispatch
-    //   - status = confirmed/pending AND no providerId
-    //   - OR status = no_provider_found AND nextRunAt reached
-    //   - OR status = searching for > STUCK_MINUTES
-
-    const candidates = await Booking.find({
-      $and: [
-        { isDeleted: { $ne: true } },
+    changeStream = Booking.watch(
+      [
         {
-          $or: [
-            {
-              $and: [
-                { status: { $in: ['confirmed', 'pending'] } },
-                {
-                  $or: [
-                    { providerId: null },
-                    { providerId: { $exists: false } },
-                    { providerId: '' },
-                  ],
-                },
-              ],
-            },
-            {
-              status: 'searching',
-              updatedAt: { $lt: stuckThreshold },
-            },
-          ],
+          $match: {
+            $or: [
+              // New booking inserted
+              { operationType: 'insert' },
+              // Booking updated to a status that needs dispatch
+              {
+                operationType: 'update',
+                'updateDescription.updatedFields.status': { $in: ['confirmed', 'pending', 'no_provider_found'] },
+              },
+            ],
+          },
         },
       ],
-    })
-      .limit(20)
-      .lean();
+      { fullDocument: 'updateLookup' }
+    );
 
-    // Case 2: no_provider_found bookings whose retry time is due
-    const retryJobs = await DispatchJob.find({
-      status: 'no_provider_found',
-      nextRunAt: { $lte: retryThreshold },
-    })
-      .limit(10)
-      .lean();
+    changeStream.on('change', async (change) => {
+      try {
+        const doc = change.fullDocument;
+        if (!doc) return;
 
-    const retryBookingIds = retryJobs.map((j) => String(j.bookingObjectId));
+        // Only dispatch if truly unassigned
+        if (doc.providerId) return;
+        if (!['confirmed', 'pending', 'no_provider_found', 'searching'].includes(doc.status)) return;
 
-    const retryBookings =
-      retryBookingIds.length > 0
-        ? await Booking.find({
-            _id: { $in: retryBookingIds },
-            status: 'no_provider_found',
-            isDeleted: { $ne: true },
-          }).lean()
-        : [];
-
-    const allToProcess = [...candidates, ...retryBookings];
-
-    for (const booking of allToProcess) {
-      const key = String(booking._id);
-
-      // Emit "new booking" alert ONCE per booking
-      if (!seenBookings.has(key)) {
-        seenBookings.add(key);
-        // keep set bounded
-        if (seenBookings.size > 5000) {
-          const arr = Array.from(seenBookings);
-          arr.slice(0, 2000).forEach((k) => seenBookings.delete(k));
-        }
-
-        emitLive('booking:new', {
-          bookingId: booking.bookingId || key,
-          customerName: booking.customerName,
-          serviceName: booking.serviceName,
-          totalAmount: booking.totalAmount,
-          address: booking.address,
-          createdAt: booking.createdAt,
-        });
-
-        await createAdminAlert({
-          type: 'new_booking',
-          title: '🔔 New Booking Received',
-          message: `${booking.customerName || 'Customer'} • ${booking.serviceName || 'Service'} • ₹${booking.totalAmount || 0}`,
-          severity: 'info',
-          bookingId: booking.bookingId || key,
-          userId: booking.userId,
-          data: {
-            address: booking.address,
-            scheduledDate: booking.scheduledDate,
-            scheduledTime: booking.scheduledTime,
-          },
-          actionUrl: `/bookings?open=${booking.bookingId || key}`,
-        }).catch(() => {});
+        logger.info(`⚡ Change stream: dispatching booking ${doc._id} (status=${doc.status})`);
+        triggerDispatchById(doc._id).catch((e) =>
+          logger.error(`Change stream dispatch error: ${e.message}`)
+        );
+      } catch (err) {
+        logger.error(`Change stream handler error: ${err.message}`);
       }
+    });
 
-      // Fire & forget dispatch
-      dispatchBooking(booking).catch((e) =>
-        logger.error(`Dispatch error for ${key}: ${e.message}`)
-      );
+    changeStream.on('error', (err) => {
+      logger.error(`Change stream error: ${err.message}. Restarting in 10s...`);
+      try { changeStream.close(); } catch {}
+      changeStream = null;
+      setTimeout(startChangeStream, 10000);
+    });
+
+    logger.info('✅ Change Stream started on bookings collection');
+  } catch (err) {
+    logger.warn(`Change stream unavailable (${err.message}) — falling back to cron only`);
+  }
+}
+
+// ─── 2. SAFETY-NET CRON: Every 2 min, catch anything missed ───
+async function safetyNetScan() {
+  try {
+    const Booking = getBookingModel();
+    const stuck = await Booking.find({
+      status: { $in: ['no_provider_found', 'searching', 'confirmed'] },
+      $or: [{ providerId: null }, { providerId: { $exists: false } }, { providerId: '' }],
+      createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+    })
+      .select('_id status')
+      .sort({ createdAt: -1 })
+      .limit(10) // cap at 10 per scan
+      .lean();
+
+    if (stuck.length === 0) return;
+
+    const toDispatch = stuck.filter((b) => {
+      const key = String(b._id);
+      if (activeDispatches.has(key)) return false;
+      if (recentlyFailed.has(key)) return false;
+      return true;
+    });
+
+    if (toDispatch.length === 0) {
+      logger.debug(`🛡️  Safety-net: ${stuck.length} stuck, all skipped (active/cooldown)`);
+      return;
     }
 
-    // Mark job retries that are now re-queued
-    if (retryBookingIds.length > 0) {
-      await DispatchJob.updateMany(
-        { bookingObjectId: { $in: retryBookingIds }, status: 'no_provider_found' },
-        { $set: { nextRunAt: null } }
+    logger.info(`🛡️  Safety-net: dispatching ${toDispatch.length}/${stuck.length} bookings`);
+    for (const b of toDispatch) {
+      triggerDispatchById(b._id).catch((e) =>
+        logger.error(`Safety-net dispatch error: ${e.message}`)
       );
+      // Stagger by 500ms to avoid thundering herd
+      await new Promise((r) => setTimeout(r, 500));
     }
   } catch (err) {
-    logger.error(`Poller error: ${err.message}`);
-  } finally {
-    isPolling = false;
+    logger.error(`Safety-net scan error: ${err.message}`);
   }
 }
 
-function startPoller() {
-  if (process.env.DISPATCH_ENABLED !== 'true') {
-    logger.warn('⚠️  DISPATCH_ENABLED !== true — booking poller NOT started');
-    return;
-  }
+function startBookingPoller() {
+  // Change stream for instant pickup
+  startChangeStream();
 
-  const cronExpr = `*/${Math.max(1, POLL_INTERVAL_SEC)} * * * * *`;
-  pollerTask = cron.schedule(cronExpr, pollOnce);
-  logger.info(`✅ Booking poller started (every ${POLL_INTERVAL_SEC}s)`);
+  // Safety net every 2 minutes (NOT every 2 seconds!)
+  cron.schedule('*/2 * * * *', safetyNetScan);
+  logger.info('✅ Safety-net cron started (every 2 min)');
+
+  // One-time scan on startup after 15s
+  setTimeout(safetyNetScan, 15000);
 }
 
-function stopPoller() {
-  if (pollerTask) {
-    pollerTask.stop();
-    pollerTask = null;
-    logger.info('Booking poller stopped');
+function stopBookingPoller() {
+  if (changeStream) {
+    try { changeStream.close(); } catch {}
+    changeStream = null;
   }
 }
 
-module.exports = { startPoller, stopPoller, pollOnce };
+module.exports = { startBookingPoller, stopBookingPoller };
