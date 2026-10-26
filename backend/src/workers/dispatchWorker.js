@@ -1,123 +1,199 @@
-// src/workers/dispatchWorker.js
-// Watches for external provider acceptances (e.g. provider app updates DB directly)
-// and emits live events + alerts to admin panel. Also handles cleanup.
-
-const cron = require('node-cron');
+// backend/src/workers/dispatchWorker.js
+const { getDispatchJobModel } = require('../models/DispatchJob');
 const { getBookingModel } = require('../config/database');
-const { getProviderOfferModel } = require('../models/ProviderOffer');
-const { emitLive, createAdminAlert } = require('../services/adminAlertService');
+const { triggerDispatchById, activeDispatches, recentlyFailed, CFG } = require('../services/dispatchService');
+const liveEmitter = require('../services/liveEmitter');
 const logger = require('../utils/logger');
 
-let watcherTask = null;
-let isRunning = false;
-const lastSeenStatus = new Map(); // bookingId -> status (for change detection)
+let watcherInterval = null;
+let staleOfferInterval = null;
+let isShuttingDown = false;
 
-async function watchOnce() {
-  if (isRunning) return;
-  isRunning = true;
+// Track jobs currently being retried
+const inFlight = new Set();
+
+const WATCHER_INTERVAL_MS = Number(process.env.DISPATCH_WATCHER_INTERVAL_MS || 10000); // 10s
+const STALE_OFFER_INTERVAL_MS = Number(process.env.STALE_OFFER_INTERVAL_MS || 30000); // 30s
+const RETRY_AFTER_NO_PROVIDER_MS = Number(process.env.DISPATCH_RETRY_AFTER_MS || 5 * 60 * 1000); // 5 min
+
+/**
+ * Safe trigger — never crashes, respects locks and cooldown
+ */
+function safeTrigger(bookingId) {
+  const key = String(bookingId);
+  if (inFlight.has(key)) return;
+  if (activeDispatches.has(key)) return;
+  if (recentlyFailed.has(key)) {
+    const age = Date.now() - recentlyFailed.get(key);
+    if (age < CFG.cooldownAfterFailMs) return;
+  }
+  inFlight.add(key);
+  Promise.resolve()
+    .then(() => triggerDispatchById(bookingId))
+    .catch((e) => logger.error(`dispatchWorker.safeTrigger error for ${key}: ${e.message}`))
+    .finally(() => {
+      setTimeout(() => inFlight.delete(key), 2000); // Keep lock for 2s after completion
+    });
+}
+
+/**
+ * Safe emit — never throws
+ */
+function safeEmit(event, data) {
   try {
-    const Booking = getBookingModel();
-    const Offer = getProviderOfferModel();
+    if (liveEmitter && typeof liveEmitter.emitLive === 'function') {
+      liveEmitter.emitLive(event, data || {});
+    }
+  } catch (e) {
+    logger.error(`safeEmit error: ${e.message}`);
+  }
+}
 
-    // Look at bookings updated in last 30 seconds
-    const since = new Date(Date.now() - 30 * 1000);
-    const recent = await Booking.find({
-      updatedAt: { $gte: since },
-      isDeleted: { $ne: true },
+/**
+ * 1. WATCHER — scans DispatchJob for jobs needing retry
+ */
+async function watcherTick() {
+  try {
+    if (isShuttingDown) return;
+
+    const DispatchJob = getDispatchJobModel();
+    const now = new Date();
+
+    const jobs = await DispatchJob.find({
+      $or: [
+        { status: 'queued' },
+        {
+          status: 'no_provider_found',
+          nextRunAt: { $lte: now },
+        },
+      ],
     })
-      .limit(200)
+      .limit(10)
       .lean();
 
-    for (const b of recent) {
-      const key = String(b._id);
-      const prev = lastSeenStatus.get(key);
-      const curr = `${b.status}|${b.providerId || ''}`;
+    if (!jobs || jobs.length === 0) return;
 
-      if (prev === curr) continue;
-      lastSeenStatus.set(key, curr);
-
-      // Only emit on actual change
-      if (prev) {
-        emitLive('booking:status_changed', {
-          bookingId: b.bookingId || key,
-          status: b.status,
-          providerId: b.providerId,
-          providerName: b.providerName,
-          updatedAt: b.updatedAt,
-        });
-
-        // External acceptance detection
-        if (b.providerId && ['assigned', 'accepted'].includes(b.status)) {
-          await Offer.updateMany(
-            {
-              bookingObjectId: b._id,
-              providerId: String(b.providerId),
-              isCurrentOffer: true,
-              status: { $in: ['sent', 'delivered', 'viewed'] },
-            },
-            { $set: { status: 'accepted', respondedAt: new Date() } }
-          );
-          await Offer.updateMany(
-            {
-              bookingObjectId: b._id,
-              isCurrentOffer: true,
-              providerId: { $ne: String(b.providerId) },
-              status: { $in: ['sent', 'delivered', 'viewed'] },
-            },
-            { $set: { status: 'superseded', respondedAt: new Date() } }
-          );
-        }
-
-        if (b.status === 'cancelled') {
-          await createAdminAlert({
-            type: 'booking_cancelled',
-            title: '🚫 Booking Cancelled',
-            message: `Booking ${b.bookingId || key} was cancelled`,
-            severity: 'warning',
-            bookingId: b.bookingId || key,
-            providerId: b.providerId,
-            data: { reason: b.cancellationReason, cancelledBy: b.cancelledBy },
-            actionUrl: `/bookings?open=${b.bookingId || key}`,
-          }).catch(() => {});
-        }
-
-        if (b.status === 'completed') {
-          await createAdminAlert({
-            type: 'booking_completed',
-            title: '✅ Booking Completed',
-            message: `Booking ${b.bookingId || key} completed by ${b.providerName || b.providerId}`,
-            severity: 'success',
-            bookingId: b.bookingId || key,
-            providerId: b.providerId,
-            actionUrl: `/bookings?open=${b.bookingId || key}`,
-          }).catch(() => {});
-        }
+    let triggered = 0;
+    for (const job of jobs) {
+      if (isShuttingDown) break;
+      const key = String(job.bookingObjectId);
+      if (inFlight.has(key)) continue;
+      if (activeDispatches.has(key)) continue;
+      if (recentlyFailed.has(key)) {
+        const age = Date.now() - recentlyFailed.get(key);
+        if (age < CFG.cooldownAfterFailMs) continue;
       }
+
+      // Verify booking still needs dispatch
+      try {
+        const Booking = getBookingModel();
+        const b = await Booking.findById(job.bookingObjectId).lean();
+        if (!b) continue;
+        if (b.providerId) continue; // Already assigned
+        if (!['pending', 'confirmed', 'searching', 'no_provider_found'].includes(b.status)) continue;
+
+        // For no_provider_found — ensure retry delay has passed
+        if (b.status === 'no_provider_found') {
+          const lastHist = (b.statusHistory || []).slice(-1)[0];
+          const lastChangedAt = lastHist?.changedAt ? new Date(lastHist.changedAt).getTime() : 0;
+          const age = Date.now() - lastChangedAt;
+          if (age < RETRY_AFTER_NO_PROVIDER_MS) continue;
+        }
+      } catch (e) {
+        logger.error(`Booking verify error: ${e.message}`);
+        continue;
+      }
+
+      safeTrigger(job.bookingObjectId);
+      triggered++;
+
+      // Stagger
+      await new Promise((r) => setTimeout(r, 200));
     }
 
-    // Bound memory
-    if (lastSeenStatus.size > 5000) {
-      const keys = Array.from(lastSeenStatus.keys()).slice(0, 2000);
-      keys.forEach((k) => lastSeenStatus.delete(k));
+    if (triggered > 0) {
+      safeEmit('dispatch:watcher_tick', { triggered, total: jobs.length });
     }
-  } catch (err) {
-    logger.error(`Dispatch watcher error: ${err.message}`);
-  } finally {
-    isRunning = false;
+  } catch (e) {
+    logger.error(`Dispatch watcher error: ${e.message}`);
+  }
+}
+
+/**
+ * 2. STALE OFFER CLEANER — mark old offers as expired
+ */
+async function cleanStaleOffers() {
+  try {
+    if (isShuttingDown) return;
+
+    const { getProviderOfferModel } = require('../models/ProviderOffer');
+    const Offer = getProviderOfferModel();
+
+    const now = new Date();
+    const result = await Offer.updateMany(
+      {
+        status: { $in: ['sent', 'delivered', 'viewed'] },
+        expiresAt: { $lt: now },
+      },
+      {
+        $set: {
+          status: 'expired',
+          respondedAt: now,
+          isCurrentOffer: false,
+        },
+      }
+    );
+
+    if (result.modifiedCount > 0) {
+      logger.info(`🧹 Expired ${result.modifiedCount} stale offers`);
+      safeEmit('dispatch:offers_expired', { count: result.modifiedCount });
+    }
+  } catch (e) {
+    logger.error(`cleanStaleOffers error: ${e.message}`);
   }
 }
 
 function startWatcher() {
-  if (process.env.DISPATCH_ENABLED !== 'true') return;
-  watcherTask = cron.schedule('*/5 * * * * *', watchOnce);
-  logger.info('✅ Dispatch watcher started (every 5s)');
+  if (watcherInterval) {
+    logger.warn('Dispatch watcher already running');
+    return;
+  }
+
+  isShuttingDown = false;
+
+  watcherInterval = setInterval(() => {
+    watcherTick().catch((e) => logger.error(`watcherTick fatal: ${e.message}`));
+  }, WATCHER_INTERVAL_MS);
+
+  staleOfferInterval = setInterval(() => {
+    cleanStaleOffers().catch((e) => logger.error(`cleanStaleOffers fatal: ${e.message}`));
+  }, STALE_OFFER_INTERVAL_MS);
+
+  logger.info(`✅ Dispatch watcher started (every ${WATCHER_INTERVAL_MS / 1000}s)`);
+  logger.info(`✅ Stale offer cleaner started (every ${STALE_OFFER_INTERVAL_MS / 1000}s)`);
 }
 
 function stopWatcher() {
-  if (watcherTask) {
-    watcherTask.stop();
-    watcherTask = null;
-  }
+  isShuttingDown = true;
+  try {
+    if (watcherInterval) {
+      clearInterval(watcherInterval);
+      watcherInterval = null;
+    }
+  } catch {}
+  try {
+    if (staleOfferInterval) {
+      clearInterval(staleOfferInterval);
+      staleOfferInterval = null;
+    }
+  } catch {}
+  logger.info('🛑 Dispatch watcher stopped');
 }
 
-module.exports = { startWatcher, stopWatcher, watchOnce };
+module.exports = {
+  startWatcher,
+  stopWatcher,
+  // Aliases
+  start: startWatcher,
+  stop: stopWatcher,
+};

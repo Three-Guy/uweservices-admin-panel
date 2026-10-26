@@ -2,13 +2,11 @@
 const mongoose = require('mongoose');
 const cron = require('node-cron');
 const { getBookingModel } = require('../config/database');
-const { getDispatchJobModel } = require('../models/DispatchJob');
 const { triggerDispatchById, activeDispatches, recentlyFailed, CFG } = require('../services/dispatchService');
 const logger = require('../utils/logger');
 
 let changeStream = null;
 let safetyNetCron = null;
-let watcherInterval = null;
 let isShuttingDown = false;
 
 // Track bookings currently being considered (not just actively dispatching, but queued)
@@ -29,7 +27,9 @@ function safeTrigger(bookingId) {
   Promise.resolve()
     .then(() => triggerDispatchById(bookingId))
     .catch((e) => logger.error(`safeTrigger error for ${key}: ${e.message}`))
-    .finally(() => inFlight.delete(key));
+    .finally(() => {
+      setTimeout(() => inFlight.delete(key), 2000);
+    });
 }
 
 // ─── 1. CHANGE STREAM (real-time) ───
@@ -83,7 +83,6 @@ async function startChangeStream() {
 
     changeStream.on('error', (err) => {
       logger.error(`Change stream error: ${err.message}`);
-      // Auto-restart after 10s
       setTimeout(() => {
         if (!isShuttingDown) {
           logger.info('🔄 Restarting change stream...');
@@ -109,7 +108,6 @@ function startSafetyNet() {
       if (isShuttingDown) return;
       const Booking = getBookingModel();
 
-      // Pending/searching bookings OLDER than 2 minutes without provider
       const twoMinAgo = new Date(Date.now() - 2 * 60 * 1000);
       const retryAgo = new Date(Date.now() - RETRY_AFTER_NO_PROVIDER_MS);
 
@@ -132,7 +130,6 @@ function startSafetyNet() {
       const bookings = await Booking.find(query).limit(20).lean();
       if (bookings.length === 0) return;
 
-      // Filter out ones already in-flight or in cooldown
       const dispatchable = bookings.filter((b) => {
         const key = String(b._id);
         if (inFlight.has(key)) return false;
@@ -149,7 +146,6 @@ function startSafetyNet() {
       logger.info(`🛡️  Safety-net: dispatching ${dispatchable.length}/${bookings.length} bookings`);
       for (const b of dispatchable) {
         safeTrigger(b._id);
-        // Stagger to avoid DB storm
         await new Promise((r) => setTimeout(r, 300));
       }
     } catch (e) {
@@ -159,41 +155,7 @@ function startSafetyNet() {
   logger.info('✅ Safety-net cron started (every 2 min)');
 }
 
-// ─── 3. DISPATCH WATCHER (every 5s — queued jobs) ───
-function startDispatchWatcher() {
-  watcherInterval = setInterval(async () => {
-    try {
-      if (isShuttingDown) return;
-      const DispatchJob = getDispatchJobModel();
-      const now = new Date();
-      // Find jobs that are "queued" or "no_provider_found" and ready for retry
-      const jobs = await DispatchJob.find({
-        $or: [
-          { status: 'queued' },
-          { status: 'no_provider_found', nextRunAt: { $lte: now } },
-        ],
-      }).limit(10).lean();
-
-      if (!jobs || jobs.length === 0) return;
-
-      for (const job of jobs) {
-        const key = String(job.bookingObjectId);
-        if (inFlight.has(key)) continue;
-        if (activeDispatches.has(key)) continue;
-        if (recentlyFailed.has(key)) {
-          const age = Date.now() - recentlyFailed.get(key);
-          if (age < CFG.cooldownAfterFailMs) continue;
-        }
-        safeTrigger(job.bookingObjectId);
-      }
-    } catch (e) {
-      logger.error(`Dispatch watcher error: ${e.message}`);
-    }
-  }, 5000);
-  logger.info('✅ Dispatch watcher started (every 5s)');
-}
-
-// ─── 4. STARTUP SCAN (15s after boot) ───
+// ─── 3. STARTUP SCAN (15s after boot) ───
 function startupScan() {
   setTimeout(async () => {
     try {
@@ -218,9 +180,8 @@ function startupScan() {
 async function startPoller() {
   await startChangeStream();
   startSafetyNet();
-  startDispatchWatcher();
   startupScan();
-  logger.info('✅ Dispatch engine started');
+  logger.info('✅ Booking poller started (change stream + safety-net + startup scan)');
 }
 
 async function stopPoller() {
@@ -231,16 +192,12 @@ async function stopPoller() {
   try {
     if (safetyNetCron) safetyNetCron.stop();
   } catch {}
-  try {
-    if (watcherInterval) clearInterval(watcherInterval);
-  } catch {}
-  logger.info('🛑 Dispatch engine stopped');
+  logger.info('🛑 Booking poller stopped');
 }
 
 module.exports = {
   startPoller,
   stopPoller,
-  // Aliases for backward compat
   start: startPoller,
   stop: stopPoller,
   startBookingPoller: startPoller,

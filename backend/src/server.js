@@ -1,4 +1,6 @@
 ﻿// src/server.js
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -7,7 +9,23 @@ const http = require('http');
 const { Server } = require('socket.io');
 const os = require('os');
 
-require('dotenv').config();
+// ✅ GLOBAL SAFETY NET — prevents "emitLive is not a function" crashes
+try {
+  const liveEmitterSafe = require('./services/liveEmitter');
+  global.emitLive = (...args) => {
+    try {
+      if (liveEmitterSafe && typeof liveEmitterSafe.emitLive === 'function') {
+        return liveEmitterSafe.emitLive(...args);
+      }
+    } catch (e) {
+      console.error('global.emitLive error:', e.message);
+    }
+    return false;
+  };
+} catch (e) {
+  console.warn('⚠️  Could not set global.emitLive:', e.message);
+  global.emitLive = () => false;
+}
 
 const connectDB = require('./config/database');
 const logger = require('./utils/logger');
@@ -260,7 +278,6 @@ async function startServer() {
     app.use('/api/v1/admin/provider-offers', providerOfferRoutes);
     app.use('/api/v1/admin/admin-notifications', adminNotificationRoutes);
 
-    // ✅ FCM routes (only if loaded successfully)
     if (adminFcmTokenRoutes) {
       app.use('/api/v1/admin/fcm', adminFcmTokenRoutes);
       console.log('✓ /api/v1/admin/fcm routes mounted');
@@ -302,12 +319,31 @@ async function startServer() {
       const { setIo } = require('./services/adminAlertService');
       setIo(io);
 
-      // ✅ Use correct exports from bookingPoller
-      const { startBookingPoller } = require('./workers/bookingPoller');
-      const { startWatcher } = require('./workers/dispatchWorker');
-      startBookingPoller();
-      startWatcher();
-      logger.info('✅ Dispatch engine started');
+      // Also attach to liveEmitter directly as a safety measure
+      try {
+        const liveEmitter = require('./services/liveEmitter');
+        if (typeof liveEmitter.setLiveIo === 'function') {
+          liveEmitter.setLiveIo(io);
+        }
+      } catch (e) {}
+
+      // ✅ Start booking poller (change stream + safety-net + startup scan)
+      try {
+        const { startBookingPoller } = require('./workers/bookingPoller');
+        startBookingPoller();
+      } catch (e) {
+        logger.error(`bookingPoller start failed: ${e.message}`);
+      }
+
+      // ✅ Start dispatch watcher (DispatchJob queue processor)
+      try {
+        const { startWatcher } = require('./workers/dispatchWorker');
+        startWatcher();
+      } catch (e) {
+        logger.error(`dispatchWorker start failed: ${e.message}`);
+      }
+
+      logger.info('✅ Dispatch engine fully started');
     } catch (dispatchErr) {
       logger.error(`Dispatch engine failed to start: ${dispatchErr.message}`);
       logger.error(dispatchErr.stack);
@@ -340,8 +376,10 @@ const gracefulShutdown = async (signal) => {
   logger.info(`\n${signal} received, shutting down gracefully...`);
   try {
     const { stopBookingPoller } = require('./workers/bookingPoller');
-    const { stopWatcher } = require('./workers/dispatchWorker');
     stopBookingPoller();
+  } catch (e) {}
+  try {
+    const { stopWatcher } = require('./workers/dispatchWorker');
     stopWatcher();
   } catch (e) {}
 

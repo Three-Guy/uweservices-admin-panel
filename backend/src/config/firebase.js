@@ -5,40 +5,38 @@ let adminWebApp = null;
 let providerApp = null;
 
 /**
- * Firebase-admin v12+ uses default export directly.
- * Access cert via admin.credential.cert OR require('firebase-admin/app')
+ * Find cert() function — works for firebase-admin v10, v11, v12+
  */
 function getCertFunction() {
-  // Try v11 and below style
+  // v12+ style: admin.cert directly
+  if (typeof admin.cert === 'function') {
+    return admin.cert.bind(admin);
+  }
+  // v11 and below: admin.credential.cert
   if (admin.credential && typeof admin.credential.cert === 'function') {
     return admin.credential.cert.bind(admin.credential);
   }
-  // Try v12+ named export style
+  // Try named import
   try {
-    const { cert } = require('firebase-admin/app');
-    if (typeof cert === 'function') return cert;
-  } catch (e) {
-    // ignore
-  }
-  // Try direct cert on admin
-  if (typeof admin.cert === 'function') return admin.cert.bind(admin);
+    const appModule = require('firebase-admin/app');
+    if (typeof appModule.cert === 'function') return appModule.cert;
+  } catch (e) {}
   return null;
 }
 
 function getInitializeAppFunction() {
-  // v12+ style
   try {
-    const { initializeApp, getApp } = require('firebase-admin/app');
-    if (typeof initializeApp === 'function') {
-      return { initializeApp, getApp };
+    const appModule = require('firebase-admin/app');
+    if (typeof appModule.initializeApp === 'function') {
+      return {
+        initializeApp: appModule.initializeApp,
+        getApp: appModule.getApp,
+      };
     }
-  } catch (e) {
-    // ignore
-  }
-  // v11 style
+  } catch (e) {}
   return {
     initializeApp: admin.initializeApp.bind(admin),
-    getApp: admin.app ? admin.app.bind(admin) : null,
+    getApp: admin.getApp ? admin.getApp.bind(admin) : (admin.app ? admin.app.bind(admin) : null),
   };
 }
 
@@ -59,7 +57,6 @@ function parseServiceAccount(raw) {
 function decodeBase64ServiceAccount(base64Str) {
   if (!base64Str) return null;
   try {
-    // Remove surrounding quotes if present
     let cleaned = base64Str.trim();
     if ((cleaned.startsWith('"') && cleaned.endsWith('"')) ||
         (cleaned.startsWith("'") && cleaned.endsWith("'"))) {
@@ -78,14 +75,12 @@ function loadServiceAccountFromEnv(envKey) {
   const raw = process.env[envKey];
   if (!raw) return null;
   const trimmed = raw.trim();
-  // If starts with { → raw JSON
   if (trimmed.startsWith('{') || trimmed.startsWith('"{')) {
     console.info(`✅ Loading Firebase credentials from ${envKey} (raw JSON)`);
     let cleaned = trimmed;
     if (cleaned.startsWith('"') && cleaned.endsWith('"')) cleaned = cleaned.slice(1, -1);
     return parseServiceAccount(cleaned);
   }
-  // Else base64
   console.info(`✅ Loading Firebase credentials from ${envKey} (base64)`);
   return decodeBase64ServiceAccount(trimmed);
 }
@@ -110,10 +105,18 @@ function initializeFirebase() {
   const { initializeApp, getApp } = getInitializeAppFunction();
 
   if (!certFn) {
-    console.error('❌ Cannot find Firebase cert() function. firebase-admin version:', admin.SDK_VERSION || 'unknown');
+    console.error('❌ Cannot find Firebase cert() function.');
+    console.error('   firebase-admin version:', admin.SDK_VERSION || 'unknown');
     console.error('   Available admin keys:', Object.keys(admin));
     return;
   }
+
+  if (typeof initializeApp !== 'function') {
+    console.error('❌ Cannot find Firebase initializeApp() function.');
+    return;
+  }
+
+  console.info(`✅ Firebase SDK ready — version: ${admin.SDK_VERSION || 'unknown'}`);
 
   // ─── ADMIN WEB FIREBASE ───
   let adminServiceAccount =
@@ -137,10 +140,14 @@ function initializeFirebase() {
         } catch {}
       } else {
         console.error('❌ Admin Web Firebase init failed:', e.message);
+        console.error('   Stack:', e.stack);
       }
     }
   } else {
     console.warn('⚠️  No Admin Web Firebase credentials found. Admin FCM disabled.');
+    if (adminServiceAccount) {
+      console.warn('   Loaded but missing project_id. Keys:', Object.keys(adminServiceAccount));
+    }
   }
 
   // ─── PROVIDER FIREBASE ───
@@ -175,8 +182,13 @@ function isProviderFirebaseReady() { return !!providerApp; }
 async function sendAdminFcmNotification(token, title, body, data = {}) {
   if (!adminWebApp) return { success: false, error: 'Admin Firebase not initialized' };
   try {
-    const { getMessaging } = require('firebase-admin/messaging');
-    const messaging = getMessaging(adminWebApp);
+    let messaging;
+    try {
+      const { getMessaging } = require('firebase-admin/messaging');
+      messaging = getMessaging(adminWebApp);
+    } catch (e) {
+      messaging = admin.messaging(adminWebApp);
+    }
     const message = {
       token,
       notification: { title, body },
@@ -202,8 +214,13 @@ async function sendAdminFcmNotification(token, title, body, data = {}) {
 async function sendProviderFcmNotification(token, title, body, data = {}) {
   if (!providerApp) return { success: false, error: 'Provider Firebase not initialized' };
   try {
-    const { getMessaging } = require('firebase-admin/messaging');
-    const messaging = getMessaging(providerApp);
+    let messaging;
+    try {
+      const { getMessaging } = require('firebase-admin/messaging');
+      messaging = getMessaging(providerApp);
+    } catch (e) {
+      messaging = admin.messaging(providerApp);
+    }
     const message = {
       token,
       notification: { title, body },
