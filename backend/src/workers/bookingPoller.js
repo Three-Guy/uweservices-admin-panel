@@ -1,246 +1,299 @@
-// backend/src/workers/bookingPoller.js
-// ✅ FCM alert to admin on every NEW booking (change stream)
-// ✅ Safe model loading
-
-/* ─── SAFE BOOKING MODEL LOADER ─── */
-function getBookingModel() {
-  try {
-    const Booking = require('../models/Booking');
-    const M = Booking?.Booking || Booking?.default || Booking;
-    if (M && typeof M.find === 'function' && typeof M.watch === 'function') {
-      return M;
-    }
-  } catch (e) {
-    console.error('[Poller] Booking model load error:', e.message);
-  }
-  // Fallback
-  try {
-    const db = require('../config/database');
-    if (typeof db.getBookingModel === 'function') {
-      const M = db.getBookingModel();
-      if (M && typeof M.find === 'function') return M;
-    }
-  } catch (_) {}
-  const mongoose = require('mongoose');
-  try { return mongoose.model('Booking'); } catch {
-    const s = new mongoose.Schema({}, { strict: false, collection: 'bookings' });
-    return mongoose.model('Booking', s);
-  }
-}
-
-const { dispatchBooking, isInCooldown } = require('../services/dispatchService');
+// src/workers/bookingPoller.js
+const logger = require('../utils/logger');
 
 let changeStream = null;
-let safetyNetInterval = null;
-const inFlight = new Set();
-const notifiedBookings = new Set();
+let isRunning = false;
+let pollInterval = null;
+let lastPolledAt = null;
 
-const SAFETY_NET_STUCK_MIN = parseInt(process.env.DISPATCH_SAFETY_NET_STUCK_MIN || '30', 10);
-const SAFETY_NET_INTERVAL_MS = parseInt(process.env.DISPATCH_SAFETY_NET_INTERVAL_MS || '120000', 10);
+// Track which booking IDs we've already notified (prevent duplicates)
+const notifiedBookingIds = new Set();
+const MAX_TRACKED = 500;
 
-let adminAlertService = null;
-try {
-  adminAlertService = require('../services/adminAlertService');
-} catch (e) {
-  console.warn('[Poller] ⚠️ adminAlertService not available:', e.message);
-}
-
-let socketEmitter = null;
-try {
-  socketEmitter = require('../socket/socketServer');
-} catch (_) {
-  try { socketEmitter = require('../config/socket'); } catch (_) {}
-}
-
-function emitToAdmins(event, payload) {
-  try {
-    if (!socketEmitter) return;
-    if (typeof socketEmitter.emitToAdmins === 'function') {
-      socketEmitter.emitToAdmins(event, payload);
-    } else if (typeof socketEmitter.emitLive === 'function') {
-      socketEmitter.emitLive(event, payload);
-    } else if (socketEmitter.io && typeof socketEmitter.io.emit === 'function') {
-      socketEmitter.io.emit(event, payload);
-    } else if (typeof socketEmitter.getIO === 'function') {
-      const io = socketEmitter.getIO();
-      if (io) io.emit(event, payload);
-    }
-  } catch (e) {
-    console.warn('[Poller] socket emit failed:', e.message);
+function trackBookingId(id) {
+  const idStr = String(id);
+  if (notifiedBookingIds.has(idStr)) return false;
+  notifiedBookingIds.add(idStr);
+  if (notifiedBookingIds.size > MAX_TRACKED) {
+    const first = notifiedBookingIds.values().next().value;
+    notifiedBookingIds.delete(first);
   }
+  return true;
 }
 
 async function notifyAdminsOfNewBooking(booking) {
-  const bid = booking.bookingId || String(booking._id);
-  if (notifiedBookings.has(bid)) return;
-  notifiedBookings.add(bid);
-  setTimeout(() => notifiedBookings.delete(bid), 60 * 60 * 1000);
-
-  const payload = {
-    bookingId: bid,
-    customerName: booking.customerName,
-    serviceName: booking.serviceName,
-    categoryName: booking.categoryName,
-    cityName: booking.city?.cityName || booking.cityName,
-    bookingType: booking.bookingType,
-    status: booking.status,
-    createdAt: booking.createdAt,
-  };
-
-  emitToAdmins('new:booking', payload);
-  emitToAdmins('new_booking', payload);
-  emitToAdmins('booking:created', payload);
-
   try {
-    if (adminAlertService && typeof adminAlertService.createAdminAlert === 'function') {
-      await adminAlertService.createAdminAlert({
-        type: 'new_booking',
-        title: '🆕 New Booking Received',
-        message: `${bid} · ${booking.serviceName || 'Service'} · ${booking.customerName || 'Customer'}`,
-        bookingId: bid,
-        priority: 'high',
-        data: payload,
-      });
+    const bookingId = String(booking._id);
+
+    // Skip if already notified
+    if (!trackBookingId(bookingId)) {
+      return;
     }
-  } catch (e) {
-    console.warn('[Poller] Admin alert failed:', e.message);
-  }
 
-  console.log(`[Poller] 🔔 Admin alerted: ${bid}`);
+    console.log(`\n🔔🔔🔔 [BookingPoller] NEW BOOKING DETECTED: ${bookingId} 🔔🔔🔔`);
+    console.log(`   Service: ${booking.serviceName || booking.service || 'unknown'}`);
+    console.log(`   Status: ${booking.status}`);
+    console.log(`   Customer: ${booking.customerName || booking.customerId || 'unknown'}`);
+
+    const payload = {
+      _id: bookingId,
+      id: bookingId,
+      type: 'new_booking',
+      title: '🆕 New Booking Received',
+      message: `New booking for ${booking.serviceName || booking.service || 'service'} from ${booking.customerName || 'customer'}`,
+      bookingId: bookingId,
+      serviceName: booking.serviceName || booking.service || '',
+      customerName: booking.customerName || '',
+      status: booking.status || 'pending',
+      amount: booking.totalAmount || booking.amount || 0,
+      timestamp: new Date().toISOString(),
+      createdAt: booking.createdAt || new Date().toISOString(),
+    };
+
+    // ── METHOD 1: Emit via liveEmitter ──
+    try {
+      const liveEmitter = require('../services/liveEmitter');
+      if (typeof liveEmitter.emitLive === 'function') {
+        const result = liveEmitter.emitLive('admin:notification', payload, 'admins');
+        console.log(`✅ [BookingPoller] liveEmitter.emitLive result: ${result}`);
+      } else {
+        console.warn('⚠️ [BookingPoller] liveEmitter.emitLive is not a function');
+      }
+
+      if (typeof liveEmitter.emitToAdmins === 'function') {
+        liveEmitter.emitToAdmins('new_booking', payload);
+        liveEmitter.emitToAdmins('new:booking', payload);
+        liveEmitter.emitToAdmins('booking:created', payload);
+        console.log(`✅ [BookingPoller] emitToAdmins called`);
+      }
+    } catch (e) {
+      console.error('❌ [BookingPoller] liveEmitter error:', e.message);
+    }
+
+    // ── METHOD 2: Emit via adminAlertService ──
+    try {
+      const adminAlertService = require('../services/adminAlertService');
+      if (typeof adminAlertService.createAdminAlert === 'function') {
+        await adminAlertService.createAdminAlert({
+          type: 'new_booking',
+          title: payload.title,
+          message: payload.message,
+          bookingId: bookingId,
+          severity: 'info',
+          data: payload,
+        });
+        console.log(`✅ [BookingPoller] adminAlertService.createAdminAlert called`);
+      }
+    } catch (e) {
+      console.error('❌ [BookingPoller] adminAlertService error:', e.message);
+    }
+
+    // ── METHOD 3: Direct io emit (ultimate fallback) ──
+    try {
+      const liveEmitter = require('../services/liveEmitter');
+      const io = liveEmitter.getIo ? liveEmitter.getIo() : null;
+      if (io) {
+        io.to('admins').emit('admin:notification', payload);
+        io.emit('admin:notification', payload);
+        console.log(`✅ [BookingPoller] Direct io.emit to 'admins' room + global`);
+
+        // Log room info
+        try {
+          const adminRoom = io.sockets.adapter.rooms.get('admins');
+          const count = adminRoom ? adminRoom.size : 0;
+          console.log(`👥 [BookingPoller] Sockets in 'admins' room: ${count}`);
+        } catch (e) {}
+      } else {
+        console.error('❌ [BookingPoller] io is NULL — cannot emit directly');
+      }
+    } catch (e) {
+      console.error('❌ [BookingPoller] Direct io emit error:', e.message);
+    }
+
+    console.log(`✅ [BookingPoller] Notification complete for booking ${bookingId}\n`);
+  } catch (err) {
+    console.error('❌ [BookingPoller] notifyAdminsOfNewBooking error:', err.message);
+    console.error(err.stack);
+  }
 }
 
-async function safeDispatch(bookingId, reason) {
-  if (inFlight.has(bookingId)) return;
-  if (typeof isInCooldown === 'function' && isInCooldown(bookingId)) return;
-
-  inFlight.add(bookingId);
+// ============================================================
+// POLLING FALLBACK — works even if change streams fail
+// Checks for new bookings every 15 seconds
+// ============================================================
+async function pollForNewBookings() {
   try {
-    console.log(`[Poller] 🚀 Triggering dispatch for ${bookingId} (${reason})`);
-    await dispatchBooking(bookingId, { reason });
-  } catch (e) {
-    console.error(`[Poller] Dispatch error for ${bookingId}:`, e.message);
-  } finally {
-    setTimeout(() => inFlight.delete(bookingId), 5000);
+    const Booking = require('../models/Booking');
+
+    // Determine time window
+    const now = new Date();
+    const since = lastPolledAt
+      ? new Date(lastPolledAt.getTime() - 5000) // 5s overlap to avoid missing any
+      : new Date(now.getTime() - 60000); // First poll: look back 60s
+
+    lastPolledAt = now;
+
+    // Query for recently created bookings
+    const newBookings = await Booking.find({
+      createdAt: { $gte: since, $lte: now },
+    })
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .lean();
+
+    if (newBookings.length > 0) {
+      console.log(`\n🔍 [Polling] Found ${newBookings.length} new booking(s) since ${since.toISOString()}`);
+      for (const booking of newBookings) {
+        await notifyAdminsOfNewBooking(booking);
+      }
+    }
+  } catch (err) {
+    // Don't log every 15s if model doesn't exist — only log once
+    if (!pollForNewBookings._loggedError) {
+      console.error('❌ [Polling] Error polling bookings:', err.message);
+      pollForNewBookings._loggedError = true;
+    }
   }
 }
 
-async function startChangeStream() {
-  const Booking = getBookingModel();
-
-  if (typeof Booking.watch !== 'function') {
-    console.warn('[Poller] ⚠️ Booking.watch not available, change stream disabled');
-    return;
-  }
-
+// ============================================================
+// CHANGE STREAM (primary method — may not work on all MongoDB setups)
+// ============================================================
+function startChangeStream() {
   try {
-    changeStream = Booking.watch(
-      [
-        {
-          $match: {
-            $or: [
-              { operationType: 'insert' },
-              {
-                operationType: 'update',
-                'updateDescription.updatedFields.status': { $exists: true },
-              },
-            ],
-          },
+    const Booking = require('../models/Booking');
+    const conn = Booking.db || require('mongoose').connection;
+
+    if (!conn || conn.readyState !== 1) {
+      console.warn('⚠️ [BookingPoller] MongoDB not connected, skipping change stream');
+      return;
+    }
+
+    const pipeline = [
+      {
+        $match: {
+          operationType: { $in: ['insert', 'update'] },
         },
-      ],
-      { fullDocument: 'updateLookup' }
-    );
+      },
+    ];
+
+    changeStream = conn.watch(pipeline, { fullDocument: 'updateLookup' });
 
     changeStream.on('change', async (change) => {
-      const doc = change.fullDocument;
-      if (!doc) return;
+      try {
+        console.log(`\n📡 [ChangeStream] Event: ${change.operationType}`);
 
-      const status = doc.status;
-      const bookingId = doc.bookingId || String(doc._id);
-
-      if (change.operationType === 'insert') {
-        await notifyAdminsOfNewBooking(doc);
-      }
-
-      if (status === 'confirmed' && !doc.providerId) {
-        if (doc.bookingType === 'instant' || !doc.scheduledDateTime) {
-          await safeDispatch(bookingId, 'change_stream:confirmed_instant');
-        } else if (doc.scheduledDateTime) {
-          const diffMs = new Date(doc.scheduledDateTime) - new Date();
-          if (diffMs <= 2 * 60 * 60 * 1000 && diffMs > -5 * 60 * 1000) {
-            await safeDispatch(bookingId, 'change_stream:scheduled_near');
+        if (change.operationType === 'insert') {
+          const doc = change.fullDocument;
+          if (doc) {
+            console.log(`📡 [ChangeStream] New document in ${change.ns?.coll || 'unknown'}`);
+            // Only process booking-related collections
+            const collName = (change.ns?.coll || '').toLowerCase();
+            if (collName.includes('booking')) {
+              await notifyAdminsOfNewBooking(doc);
+            }
           }
         }
-      }
 
-      if (change.operationType === 'update') {
-        emitToAdmins('booking:updated', {
-          bookingId,
-          status,
-          providerId: doc.providerId,
-        });
+        if (change.operationType === 'update') {
+          const doc = change.fullDocument;
+          if (doc) {
+            const collName = (change.ns?.coll || '').toLowerCase();
+            if (collName.includes('booking') && doc.status === 'pending') {
+              await notifyAdminsOfNewBooking(doc);
+            }
+          }
+        }
+      } catch (err) {
+        console.error('❌ [ChangeStream] Error processing change:', err.message);
       }
     });
 
     changeStream.on('error', (err) => {
-      console.error('[Poller] Change stream error:', err.message);
-      setTimeout(() => {
-        try { changeStream.close(); } catch (_) {}
-        startChangeStream();
-      }, 5000);
+      console.error('❌ [ChangeStream] Stream error:', err.message);
+      console.log('🔄 [ChangeStream] Relying on polling fallback instead');
     });
 
-    console.log('[Poller] ✅ Change stream started');
-  } catch (e) {
-    console.error('[Poller] Failed to start change stream:', e.message);
+    changeStream.on('close', () => {
+      console.warn('⚠️ [ChangeStream] Stream closed');
+    });
+
+    console.log('✅ [BookingPoller] Change stream started');
+  } catch (err) {
+    console.error('❌ [BookingPoller] Change stream failed:', err.message);
+    console.log('🔄 [BookingPoller] Will rely on polling fallback');
   }
 }
 
-async function runSafetyNet() {
+// ============================================================
+// STARTUP SCAN — check for any bookings created while server was down
+// ============================================================
+async function startupScan() {
   try {
-    const Booking = getBookingModel();
-    if (typeof Booking.find !== 'function') return;
+    const Booking = require('../models/Booking');
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
 
-    const cutoff = new Date(Date.now() - SAFETY_NET_STUCK_MIN * 60 * 1000);
-    const stuck = await Booking.find({
-      status: { $in: ['confirmed', 'no_provider_found'] },
-      providerId: { $in: [null, undefined, ''] },
-      isDeleted: { $ne: true },
-      updatedAt: { $lt: cutoff },
-    }).sort({ updatedAt: 1 }).limit(5).lean();
+    const recentBookings = await Booking.find({
+      createdAt: { $gte: fiveMinutesAgo },
+    })
+      .sort({ createdAt: -1 })
+      .limit(10)
+      .lean();
 
-    if (stuck.length === 0) return;
-    console.log(`[Poller] 🩺 Safety net: ${stuck.length} stuck bookings`);
-    for (const b of stuck) {
-      await safeDispatch(b.bookingId, `safety_net:stuck_${SAFETY_NET_STUCK_MIN}min`);
+    if (recentBookings.length > 0) {
+      console.log(`\n🔍 [Startup] Found ${recentBookings.length} recent booking(s) from last 5 minutes`);
+      for (const booking of recentBookings) {
+        await notifyAdminsOfNewBooking(booking);
+      }
+    } else {
+      console.log('🔍 [Startup] No recent bookings found');
     }
-  } catch (e) {
-    console.error('[Poller] Safety net error:', e.message);
+  } catch (err) {
+    console.error('❌ [Startup] Scan error:', err.message);
   }
 }
 
-async function startBookingPoller() {
-  console.log('[Poller] Starting booking poller...');
-  await startChangeStream();
-  safetyNetInterval = setInterval(runSafetyNet, SAFETY_NET_INTERVAL_MS);
-  console.log(`[Poller] ✅ Safety net every ${SAFETY_NET_INTERVAL_MS / 1000}s, stuck > ${SAFETY_NET_STUCK_MIN}min`);
+// ============================================================
+// MAIN START FUNCTION
+// ============================================================
+function startBookingPoller() {
+  if (isRunning) {
+    console.log('⚠️ [BookingPoller] Already running');
+    return;
+  }
+
+  isRunning = true;
+  console.log('\n🚀 [BookingPoller] Starting...');
+
+  // 1. Start change stream (primary)
+  startChangeStream();
+
+  // 2. Start polling fallback (every 15 seconds)
+  lastPolledAt = new Date();
+  pollInterval = setInterval(pollForNewBookings, 15000);
+  console.log('✅ [BookingPoller] Polling fallback started (every 15s)');
+
+  // 3. Run startup scan after 5 seconds
+  setTimeout(startupScan, 5000);
+
+  console.log('✅ [BookingPoller] Fully started (change stream + polling + startup scan)\n');
 }
 
-async function stopBookingPoller() {
-  if (changeStream) { try { await changeStream.close(); } catch (_) {} changeStream = null; }
-  if (safetyNetInterval) { clearInterval(safetyNetInterval); safetyNetInterval = null; }
-  console.log('[Poller] Stopped');
+function stopBookingPoller() {
+  isRunning = false;
+  if (changeStream) {
+    try { changeStream.close(); } catch (e) {}
+    changeStream = null;
+  }
+  if (pollInterval) {
+    clearInterval(pollInterval);
+    pollInterval = null;
+  }
+  console.log('🛑 [BookingPoller] Stopped');
 }
-
-const startPoller = startBookingPoller;
-const stopPoller = stopBookingPoller;
-const startWatcher = startBookingPoller;
-const stopWatcher = stopBookingPoller;
 
 module.exports = {
   startBookingPoller,
   stopBookingPoller,
-  startPoller,
-  stopPoller,
-  startWatcher,
-  stopWatcher,
+  notifyAdminsOfNewBooking,
 };

@@ -1,94 +1,112 @@
-// backend/src/services/liveEmitter.js
-// ✅ FIXED: Always broadcasts globally so events reach ALL connected admin sockets,
-//          even if room-join logic (admin:register) is broken on socket server.
+// src/services/liveEmitter.js
 
-let io = null;
+let _io = null;
 
-function setLiveIo(socketIO) {
-  io = socketIO;
-  console.info('✅ Socket.IO attached to liveEmitter');
+function getIo() {
+  // 1. Return cached io if valid
+  if (_io && _io.sockets) return _io;
+
+  // 2. Try to get from global app
+  try {
+    const app = require('express')();
+    // This won't work — need the actual app instance
+  } catch (e) {}
+
+  // 3. Try global
+  if (global.__IO_INSTANCE__ && global.__IO_INSTANCE__.sockets) {
+    _io = global.__IO_INSTANCE__;
+    return _io;
+  }
+
+  return _io;
 }
 
-/**
- * emitLive — emits to BOTH the target room AND globally (as safety net)
- * This guarantees delivery even if admin never joined the 'admins' room.
- */
-function emitLive(event, data = {}, room = 'admins') {
-  try {
-    if (!io) {
-      console.warn(`[liveEmitter] ⚠️ io not set — cannot emit "${event}"`);
-      return false;
-    }
-    const payload = { ...data, timestamp: new Date().toISOString() };
+function setLiveIo(io) {
+  _io = io;
+  global.__IO_INSTANCE__ = io;
+  console.log('✅ [LiveEmitter] io instance set');
 
-    // Strategy 1: Emit to room (works if admin joined the room)
+  // Log current socket count
+  try {
+    const count = io.engine.clientsCount || 0;
+    const adminRoom = io.sockets.adapter.rooms.get('admins');
+    const adminCount = adminRoom ? adminRoom.size : 0;
+    console.log(`   Connected: ${count} total, ${adminCount} in 'admins' room`);
+  } catch (e) {}
+}
+
+function emitLive(event, data, room) {
+  const io = getIo();
+  if (!io) {
+    console.error('❌ [LiveEmitter] io is NULL — cannot emit', event);
+    return false;
+  }
+
+  try {
+    let sent = false;
+
+    // 1. Emit to specific room
     if (room) {
-      try {
-        io.to(room).emit(event, payload);
-      } catch (e) {
-        console.warn(`[liveEmitter] room emit failed: ${e.message}`);
+      const roomSockets = io.sockets.adapter.rooms.get(room);
+      const roomCount = roomSockets ? roomSockets.size : 0;
+      console.log(`📡 [LiveEmitter] Emitting "${event}" to room "${room}" (${roomCount} sockets)`);
+
+      if (roomCount > 0) {
+        io.to(room).emit(event, data);
+        sent = true;
+      } else {
+        console.warn(`⚠️ [LiveEmitter] Room "${room}" is EMPTY`);
       }
     }
 
-    // Strategy 2: ALSO broadcast globally (safety net — guarantees delivery)
-    // This is safe because only authenticated admin sockets should be connected
-    try {
-      io.emit(event, payload);
-    } catch (e) {
-      console.warn(`[liveEmitter] global emit failed: ${e.message}`);
+    // 2. ALWAYS emit globally as safety net
+    const totalSockets = io.engine.clientsCount || 0;
+    console.log(`📡 [LiveEmitter] Emitting "${event}" GLOBALLY (${totalSockets} total sockets)`);
+    if (totalSockets > 0) {
+      io.emit(event, data);
+      sent = true;
+    } else {
+      console.warn(`⚠️ [LiveEmitter] No sockets connected at all`);
     }
 
-    // Log how many sockets are connected (for debugging)
-    try {
-      const sockets = io.sockets?.sockets;
-      const count = sockets?.size || 0;
-      console.log(`[liveEmitter] 📡 Emitted "${event}" to ${count} connected socket(s)`);
-    } catch {}
-
-    return true;
-  } catch (e) {
-    console.error('❌ emitLive error:', e.message);
+    return sent;
+  } catch (err) {
+    console.error('❌ [LiveEmitter] emitLive error:', err.message);
     return false;
   }
 }
 
-function emitToAdmin(adminId, event, data = {}) {
+function emitToAdmin(event, adminId, data) {
+  const io = getIo();
+  if (!io) return false;
   try {
-    if (!io || !adminId) return false;
-    io.to(`admin:${adminId}`).emit(event, { ...data, timestamp: new Date().toISOString() });
+    io.to(`admin:${adminId}`).emit(event, data);
     return true;
   } catch (e) {
-    console.error('❌ emitToAdmin error:', e.message);
     return false;
   }
 }
 
-function broadcastLive(event, data = {}) {
-  try {
-    if (!io) return false;
-    io.emit(event, { ...data, timestamp: new Date().toISOString() });
-    return true;
-  } catch (e) {
-    console.error('❌ broadcastLive error:', e.message);
-    return false;
-  }
-}
-
-/**
- * emitToAdmins — alias used by bookingPoller
- * Also broadcasts globally for safety
- */
-function emitToAdmins(event, data = {}) {
+function emitToAdmins(event, data) {
   return emitLive(event, data, 'admins');
 }
 
-function getIo() { return io; }
+function broadcastLive(event, data) {
+  const io = getIo();
+  if (!io) return false;
+  try {
+    io.emit(event, data);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
 
 module.exports = {
   setLiveIo,
+  getIo,
   emitLive,
   emitToAdmin,
   emitToAdmins,
   broadcastLive,
-  getIo,
 };

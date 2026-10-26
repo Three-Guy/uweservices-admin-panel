@@ -1,211 +1,193 @@
-// backend/src/services/adminAlertService.js
-const liveEmitter = require('./liveEmitter');
+// src/services/adminAlertService.js
+const AdminNotification = require('../models/AdminNotification');
 const logger = require('../utils/logger');
 
-let AdminNotification = null;
-let AdminFcmToken = null;
+let _io = null;
 
-function getModels() {
-  if (!AdminNotification) {
-    try {
-      AdminNotification = require('../models/AdminNotification');
-      if (AdminNotification.getAdminNotificationModel) {
-        AdminNotification = AdminNotification.getAdminNotificationModel();
-      }
-    } catch (e) {
-      logger.error('Failed to load AdminNotification model: ' + e.message);
-    }
-  }
-  if (!AdminFcmToken) {
-    try {
-      AdminFcmToken = require('../models/AdminFcmToken');
-      AdminFcmToken = AdminFcmToken?.default || AdminFcmToken?.AdminFcmToken || AdminFcmToken;
-    } catch (e) {
-      logger.error('Failed to load AdminFcmToken model: ' + e.message);
-    }
-  }
-  return { AdminNotification, AdminFcmToken };
-}
-
-let ioRef = null;
 function setIo(io) {
-  ioRef = io;
-  liveEmitter.setLiveIo(io);
-  logger.info('✅ Socket.IO attached to adminAlertService');
+  _io = io;
+  console.log('✅ [AdminAlert] io instance set');
 }
 
-/* ─── BACKEND DEDUPE CACHE — blocks same alert within 10s ─── */
+function getIo() {
+  return _io;
+}
+
+// Dedupe: prevent same alert within 10 seconds
 const recentAlerts = new Map();
-function isDuplicateAlert(key) {
+
+function isDuplicateAlert(type, bookingId) {
+  const key = `${type}:${bookingId || 'none'}`;
   const now = Date.now();
   const last = recentAlerts.get(key);
-
-  // Clean old entries
+  if (last && (now - last) < 10000) {
+    return true;
+  }
+  recentAlerts.set(key, now);
+  // Cleanup old entries
   if (recentAlerts.size > 200) {
-    for (const [k, t] of recentAlerts.entries()) {
-      if (now - t > 60_000) recentAlerts.delete(k);
+    for (const [k, t] of recentAlerts) {
+      if (now - t > 30000) recentAlerts.delete(k);
     }
   }
-
-  if (last && now - last < 10_000) return true;
-  recentAlerts.set(key, now);
   return false;
 }
 
-/**
- * createAdminAlert — accepts BOTH signatures:
- *   createAdminAlert('type_string', { ... })
- *   createAdminAlert({ type, title, message, ... })
- */
-async function createAdminAlert(typeOrObject, dataArg = {}, options = {}) {
+async function createAdminAlert(optionsOrType, titleOrUndefined, messageOrUndefined, severityOrUndefined) {
   try {
-    let type, data;
-    if (typeof typeOrObject === 'object' && typeOrObject !== null) {
-      type = typeOrObject.type || 'admin_alert';
-      data = { ...typeOrObject };
-      delete data.type;
+    let type, title, message, severity, bookingId, providerId, data;
+
+    // Support both call signatures
+    if (typeof optionsOrType === 'object' && optionsOrType !== null) {
+      type = optionsOrType.type || 'info';
+      title = optionsOrType.title || 'Notification';
+      message = optionsOrType.message || '';
+      severity = optionsOrType.severity || 'info';
+      bookingId = optionsOrType.bookingId || null;
+      providerId = optionsOrType.providerId || null;
+      data = optionsOrType.data || optionsOrType;
     } else {
-      type = String(typeOrObject || 'admin_alert');
-      data = dataArg || {};
-    }
-    type = String(type);
-
-    const title = data.title || 'Admin Alert';
-    const message = data.message || '';
-    const severity = data.severity || 'info';
-    const bookingId = data.bookingId || null;
-    const providerId = data.providerId || null;
-    const actionUrl = data.actionUrl || null;
-    const extraData = data.data || {};
-
-    // 🛡️ DEDUPE at backend level
-    const dedupeKey = `${type}::${bookingId || title}::${message}`;
-    if (isDuplicateAlert(dedupeKey)) {
-      logger.info(`🚫 Duplicate admin alert blocked: ${type} / ${bookingId || title}`);
-      return { success: true, type, deduped: true };
+      type = optionsOrType;
+      title = titleOrUndefined || 'Notification';
+      message = messageOrUndefined || '';
+      severity = severityOrUndefined || 'info';
+      bookingId = null;
+      providerId = null;
+      data = {};
     }
 
-    const { AdminNotification, AdminFcmToken } = getModels();
+    // Skip "no_provider_found" — user explicitly asked to remove these
+    if (type === 'no_provider_found' || type === 'no_provider') {
+      return null;
+    }
 
-    // Save to DB
-    let savedDoc = null;
-    if (AdminNotification) {
+    // Dedupe check
+    if (isDuplicateAlert(type, bookingId)) {
+      console.log(`⏭️ [AdminAlert] Duplicate skipped: ${type} / ${bookingId}`);
+      return null;
+    }
+
+    console.log(`\n📝 [AdminAlert] Creating alert: ${type} — ${title}`);
+
+    // Save to database
+    const notification = new AdminNotification({
+      type,
+      title,
+      message,
+      severity,
+      bookingId,
+      providerId,
+      data,
+      isRead: false,
+    });
+
+    await notification.save();
+    console.log(`✅ [AdminAlert] Saved to DB: ${notification._id}`);
+
+    // Build socket payload
+    const payload = {
+      _id: String(notification._id),
+      id: String(notification._id),
+      type,
+      title,
+      message,
+      severity,
+      bookingId: bookingId ? String(bookingId) : null,
+      timestamp: new Date().toISOString(),
+      createdAt: notification.createdAt || new Date().toISOString(),
+      data,
+    };
+
+    // Emit via socket
+    const io = getIo();
+    if (io) {
       try {
-        savedDoc = await AdminNotification.create({
-          type,
-          title,
-          message,
-          severity,
-          bookingId,
-          providerId,
-          actionUrl,
-          data: extraData,
-          read: false,
-          createdAt: new Date(),
-        });
-        logger.info(`📝 Admin alert saved: ${type} — ${title}`);
+        const adminRoom = io.sockets.adapter.rooms.get('admins');
+        const roomCount = adminRoom ? adminRoom.size : 0;
+        const totalCount = io.engine.clientsCount || 0;
+
+        console.log(`📡 [AdminAlert] Emitting to 'admins' room (${roomCount} sockets, ${totalCount} total)`);
+
+        io.to('admins').emit('admin:notification', payload);
+        io.emit('admin:notification', payload); // Global fallback
+
+        console.log(`✅ [AdminAlert] Socket emit complete`);
       } catch (e) {
-        logger.error(`Failed to save admin alert: ${e.message}`);
+        console.error('❌ [AdminAlert] Socket emit error:', e.message);
+      }
+    } else {
+      console.error('❌ [AdminAlert] io is NULL — trying liveEmitter fallback');
+      try {
+        const liveEmitter = require('./liveEmitter');
+        if (typeof liveEmitter.emitLive === 'function') {
+          liveEmitter.emitLive('admin:notification', payload, 'admins');
+        }
+      } catch (e) {
+        console.error('❌ [AdminAlert] liveEmitter fallback also failed:', e.message);
       }
     }
 
-    // ✅ EMIT ONLY ONCE — single canonical event
+    // Send FCM push
     try {
-      const payload = {
-        _id: savedDoc?._id,
-        type,
-        title,
-        message,
-        severity,
-        bookingId,
-        providerId,
-        actionUrl,
-        data: extraData,
-        createdAt: savedDoc?.createdAt || new Date(),
-      };
-      liveEmitter.emitLive('admin:notification', payload);
-      logger.info(`🔔 Socket.IO emitted: admin:notification (${type})`);
-    } catch (e) {
-      logger.error(`Socket emit failed: ${e.message}`);
-    }
+      const AdminFcmToken = require('../models/AdminFcmToken');
+      const activeTokens = await AdminFcmToken.find({ isActive: true }).lean();
+      console.log(`📱 [AdminAlert] Found ${activeTokens.length} active FCM tokens`);
 
-    // FCM push
-    try {
-      const { isAdminWebFirebaseReady, sendAdminFcmNotification } = require('../config/firebase');
-      if (!isAdminWebFirebaseReady()) {
-        logger.warn('⚠️  FCM disabled — push skipped (Socket.IO only)');
-      } else if (AdminFcmToken) {
-        const tokens = await AdminFcmToken.find({ isActive: true }).lean();
-        logger.info(`[FCM] Found ${tokens.length} active admin token(s)`);
-
-        if (tokens.length > 0) {
-          await Promise.all(
-            tokens.map(async (t) => {
-              if (!t.fcmToken) {
-                logger.warn(`[FCM] Token doc ${t._id} has no fcmToken field — skipping`);
-                return;
-              }
-
-              const res = await sendAdminFcmNotification(
-                t.fcmToken,
+      if (activeTokens.length > 0) {
+        const { sendAdminFcmNotification } = require('../config/firebase');
+        if (typeof sendAdminFcmNotification === 'function') {
+          for (const t of activeTokens) {
+            try {
+              const token = t.fcmToken || t.token;
+              if (!token) continue;
+              await sendAdminFcmNotification(token, {
                 title,
-                message,
-                {
-                  type,
-                  bookingId: bookingId || '',
-                  providerId: providerId || '',
-                  actionUrl: actionUrl || '',
-                }
-              );
-
-              if (!res.success) {
-                await AdminFcmToken.findByIdAndUpdate(t._id, {
-                  $inc: { failureCount: 1 },
-                  $set: { lastError: res.error, lastErrorAt: new Date() },
-                }).catch(() => {});
-
-                const updated = await AdminFcmToken.findById(t._id).lean();
-                if (updated && updated.failureCount >= 5) {
-                  await AdminFcmToken.findByIdAndUpdate(t._id, {
-                    $set: { isActive: false },
-                  }).catch(() => {});
-                  logger.warn(`[FCM] Deactivated token after 5 failures: ${t.fcmToken.substring(0, 20)}...`);
-                }
-              } else {
-                await AdminFcmToken.findByIdAndUpdate(t._id, {
-                  $set: {
-                    failureCount: 0,
-                    lastSuccessAt: new Date(),
-                    lastError: null,
-                    lastErrorAt: null,
-                  },
-                }).catch(() => {});
-              }
-            })
-          );
-          logger.info(`📬 FCM push attempted for ${tokens.length} admin device(s)`);
+                body: message,
+                data: { type, bookingId: bookingId || '' },
+              });
+              console.log(`✅ [AdminAlert] FCM sent to ${token.substring(0, 20)}...`);
+            } catch (fcmErr) {
+              console.error(`❌ [AdminAlert] FCM error:`, fcmErr.message);
+            }
+          }
         }
       }
     } catch (e) {
-      logger.error(`FCM push failed: ${e.message}`);
-      logger.error(e.stack);
+      console.error('❌ [AdminAlert] FCM error:', e.message);
     }
 
-    return { success: true, type };
-  } catch (e) {
-    logger.error(`createAdminAlert fatal error: ${e.message}`);
-    return { success: false, error: e.message };
+    return notification;
+  } catch (err) {
+    console.error('❌ [AdminAlert] createAdminAlert error:', err.message);
+    console.error(err.stack);
+    return null;
   }
 }
 
-// Backward compat
-function emitLive(event, data = {}, room = 'admins') {
-  return liveEmitter.emitLive(event, data, room);
+async function getUnreadCount(adminId) {
+  try {
+    return await AdminNotification.countDocuments({ isRead: false });
+  } catch (e) {
+    return 0;
+  }
+}
+
+async function markAsRead(notificationId) {
+  try {
+    return await AdminNotification.findByIdAndUpdate(
+      notificationId,
+      { isRead: true, readAt: new Date() },
+      { new: true }
+    );
+  } catch (e) {
+    return null;
+  }
 }
 
 module.exports = {
-  createAdminAlert,
   setIo,
-  emitLive,
-  getIo: () => ioRef,
+  getIo,
+  createAdminAlert,
+  getUnreadCount,
+  markAsRead,
 };
