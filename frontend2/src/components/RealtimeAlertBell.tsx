@@ -159,6 +159,75 @@ function playAlertSound() {
   } catch {}
 }
 
+/* ══════════════════════════════════════════════════════════════════
+   ✅ SHOW SYSTEM NOTIFICATION (PC + Mobile notification bar)
+   Uses Service Worker so it appears even when tab is minimized/closed
+   ══════════════════════════════════════════════════════════════════ */
+async function showSystemNotification(n: AdminNotification): Promise<void> {
+  console.log('[Bell] 🔔 Attempting system notification:', n.title);
+
+  // 1. Check support
+  if (typeof window === 'undefined' || !('Notification' in window)) {
+    console.warn('[Bell] ❌ Notifications not supported');
+    return;
+  }
+
+  // 2. Check permission
+  if (Notification.permission !== 'granted') {
+    console.warn('[Bell] ❌ Permission not granted:', Notification.permission);
+    return;
+  }
+
+  const title = `${typeIcon(n.type)} ${n.title}`;
+  const options: NotificationOptions = {
+    body: n.message || 'New notification',
+    icon: '/favicon.ico',
+    badge: '/favicon.ico',
+    tag: `${n.type}-${n.bookingId || n._id}`,
+    requireInteraction: true, // ✅ Stays until user clicks
+    silent: false,
+    data: {
+      bookingId: n.bookingId,
+      type: n.type,
+      url: n.bookingId ? `/bookings?open=${n.bookingId}` : '/',
+    },
+  };
+
+  // Add vibration (mobile)
+  (options as any).vibrate = [200, 100, 200];
+  (options as any).renotify = true;
+
+  // 3. Try Service Worker first (works when tab hidden/minimized)
+  try {
+    if ('serviceWorker' in navigator) {
+      const reg = await navigator.serviceWorker.getRegistration('/firebase-messaging-sw.js') ||
+                  await navigator.serviceWorker.ready;
+      if (reg) {
+        await reg.showNotification(title, options);
+        console.log('[Bell] ✅ System notification shown via SW');
+        return;
+      }
+    }
+  } catch (err: any) {
+    console.warn('[Bell] ⚠️ SW notification failed, trying direct:', err?.message);
+  }
+
+  // 4. Fallback: direct Notification constructor (only works when tab visible)
+  try {
+    const notif = new Notification(title, options);
+    notif.onclick = () => {
+      window.focus();
+      if (n.bookingId) {
+        window.location.href = `/bookings?open=${n.bookingId}`;
+      }
+      notif.close();
+    };
+    console.log('[Bell] ✅ System notification shown directly');
+  } catch (err: any) {
+    console.error('[Bell] ❌ Direct notification failed:', err?.message);
+  }
+}
+
 const RealtimeAlertBell: React.FC = () => {
   const [notifications, setNotifications] = useState<AdminNotification[]>([]);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -278,10 +347,15 @@ const RealtimeAlertBell: React.FC = () => {
       setPermStatus(result);
 
       if (result === 'granted') {
+        // ✅ Show test system notification
         try {
-          new Notification('🔔 UWE Admin Panel', {
-            body: 'Notifications enabled! You will get alerts for new bookings.',
-            icon: '/favicon.ico',
+          await showSystemNotification({
+            _id: 'test-' + Date.now(),
+            title: 'Notifications Enabled!',
+            message: 'You will now get alerts for new bookings.',
+            type: 'new_booking',
+            isRead: false,
+            createdAt: new Date().toISOString(),
           });
         } catch {}
         await registerFcmWithBackend();
@@ -358,6 +432,7 @@ const RealtimeAlertBell: React.FC = () => {
 
       console.log('[Bell] ✅ Showing notification:', n.title);
 
+      // In-app updates
       setNotifications((prev) => {
         if (prev.some((p) => p._id === n._id)) return prev;
         return [n, ...prev].slice(0, 50);
@@ -366,20 +441,10 @@ const RealtimeAlertBell: React.FC = () => {
       addToast(n);
       playAlertSound();
 
-      if (
-        typeof Notification !== 'undefined' &&
-        Notification.permission === 'granted' &&
-        document.visibilityState === 'visible'
-      ) {
-        try {
-          new Notification(`${typeIcon(n.type)} ${n.title}`, {
-            body: n.message,
-            icon: '/favicon.ico',
-            tag: `${n.type}-${n.bookingId || n._id}`,
-            requireInteraction: false,
-          });
-        } catch {}
-      }
+      // ✅ ALWAYS show system notification (regardless of tab visibility)
+      showSystemNotification(n).catch((err) => {
+        console.error('[Bell] System notification error:', err);
+      });
     },
     [addToast]
   );

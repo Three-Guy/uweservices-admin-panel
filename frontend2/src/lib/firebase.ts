@@ -61,6 +61,8 @@ async function registerServiceWorker(): Promise<ServiceWorkerRegistration | null
     const existing = await navigator.serviceWorker.getRegistration('/firebase-messaging-sw.js');
     if (existing) {
       console.log('[Firebase] ✅ SW already registered');
+      // Force update to pick up new SW code
+      try { await existing.update(); } catch {}
       return existing;
     }
     const reg = await navigator.serviceWorker.register('/firebase-messaging-sw.js', {

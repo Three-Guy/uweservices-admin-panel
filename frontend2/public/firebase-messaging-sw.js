@@ -1,5 +1,5 @@
 // frontend2/public/firebase-messaging-sw.js
-// ✅ Firebase Cloud Messaging Service Worker
+// ✅ Firebase Cloud Messaging Service Worker — SHOWS SYSTEM NOTIFICATIONS
 
 /* eslint-disable no-undef */
 
@@ -18,33 +18,97 @@ firebase.initializeApp({
 const messaging = firebase.messaging();
 
 /**
- * Background message handler.
- * If payload has `notification` field → browser auto-displays, we skip.
- * If data-only → we display manually.
+ * ✅ Background message handler — ALWAYS show system notification
+ * Does NOT skip when `notification` field is present (Chrome doesn't auto-show reliably)
  */
 messaging.onBackgroundMessage((payload) => {
-  console.log('[SW] 📩 Background message:', payload);
+  console.log('[SW] 📩 Background message received:', payload);
 
-  if (payload.notification) {
-    // Browser auto-displays — do nothing to avoid duplicate
+  const notif = payload.notification || {};
+  const data = payload.data || {};
+
+  const title = notif.title || data.title || '🔔 UWE Admin — New Booking';
+  const body = notif.body || data.body || data.message || 'You have a new notification';
+
+  const options = {
+    body: body,
+    icon: '/favicon.ico',
+    badge: '/favicon.ico',
+    image: notif.image || data.image || undefined,
+    tag: data.bookingId || data.type || `admin-alert-${Date.now()}`,
+    requireInteraction: true,     // ✅ Stays until user clicks
+    renotify: true,               // ✅ Alert even if same tag
+    silent: false,                // ✅ Play sound
+    vibrate: [200, 100, 200],     // ✅ Vibrate on mobile
+    timestamp: Date.now(),
+    data: {
+      ...data,
+      click_action: data.click_action || data.actionUrl || '/',
+    },
+    actions: [
+      { action: 'view', title: 'View Booking' },
+      { action: 'dismiss', title: 'Dismiss' },
+    ],
+  };
+
+  console.log('[SW] 🔔 Showing notification:', title, options);
+  return self.registration.showNotification(title, options);
+});
+
+/**
+ * ✅ Push event — fallback for raw web push (not FCM-wrapped)
+ */
+self.addEventListener('push', (event) => {
+  console.log('[SW] 📬 Raw push event received');
+
+  if (!event.data) {
+    console.log('[SW] No data in push event');
     return;
   }
 
-  const title = (payload.data && payload.data.title) || '🔔 UWE Admin';
+  let payload = {};
+  try {
+    payload = event.data.json();
+  } catch (e) {
+    try {
+      payload = { notification: { title: 'Notification', body: event.data.text() } };
+    } catch (e2) {
+      payload = { notification: { title: 'Notification', body: 'New alert' } };
+    }
+  }
+
+  console.log('[SW] 📬 Push payload:', payload);
+
+  const notif = payload.notification || {};
+  const data = payload.data || {};
+
+  const title = notif.title || data.title || '🔔 UWE Admin';
   const options = {
-    body: (payload.data && payload.data.body) || '',
+    body: notif.body || data.body || data.message || 'New notification',
     icon: '/favicon.ico',
     badge: '/favicon.ico',
-    tag: (payload.data && (payload.data.bookingId || payload.data.type)) || 'admin-alert',
-    requireInteraction: (payload.data && payload.data.type) === 'no_provider_found',
-    data: payload.data || {},
+    tag: data.bookingId || data.type || `admin-${Date.now()}`,
+    requireInteraction: true,
+    renotify: true,
+    vibrate: [200, 100, 200],
+    data: data,
+    actions: [
+      { action: 'view', title: 'View' },
+      { action: 'dismiss', title: 'Dismiss' },
+    ],
   };
 
-  self.registration.showNotification(title, options);
+  event.waitUntil(self.registration.showNotification(title, options));
 });
 
+/**
+ * ✅ Notification click handler
+ */
 self.addEventListener('notificationclick', (event) => {
+  console.log('[SW] 🖱️ Notification clicked:', event.notification.tag, 'action:', event.action);
   event.notification.close();
+
+  if (event.action === 'dismiss') return;
 
   const data = event.notification.data || {};
   let urlToOpen = '/';
@@ -85,11 +149,11 @@ self.addEventListener('notificationclick', (event) => {
 });
 
 self.addEventListener('install', () => {
-  console.log('[SW] 🔧 Installing');
+  console.log('[SW] 🔧 Installing v2');
   self.skipWaiting();
 });
 
 self.addEventListener('activate', (event) => {
-  console.log('[SW] ✅ Activated');
+  console.log('[SW] ✅ Activated v2');
   event.waitUntil(clients.claim());
 });
