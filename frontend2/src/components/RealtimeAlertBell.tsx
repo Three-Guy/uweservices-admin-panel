@@ -9,7 +9,7 @@ const ALLOWED_NOTIFICATION_TYPES = new Set([
   'new_booking',
   'booking:created',
   'new:booking',
-  'booking_assigned', // optional — remove this line if you don't want "Provider Assigned" either
+  'booking_assigned',
 ]);
 
 function isAllowedNotification(type: string): boolean {
@@ -182,8 +182,10 @@ const RealtimeAlertBell: React.FC = () => {
     if (window.__UWE_BELL_PRIMARY_ID__ === undefined || window.__UWE_BELL_PRIMARY_ID__ === null) {
       window.__UWE_BELL_PRIMARY_ID__ = myId;
       setIsPrimary(true);
+      console.log('[Bell] 👑 I am PRIMARY instance (id:', myId, ')');
     } else {
       setIsPrimary(false);
+      console.log('[Bell] 👥 I am SECONDARY instance (id:', myId, ')');
       setTimeout(() => {
         if (window.__UWE_BELL_PRIMARY_ID__ === undefined) {
           window.__UWE_BELL_PRIMARY_ID__ = myId;
@@ -298,7 +300,7 @@ const RealtimeAlertBell: React.FC = () => {
       const list = await notificationsApi.getRecent(25);
       const mapped = (Array.isArray(list) ? list : [])
         .map(normalize)
-        .filter((n) => isAllowedNotification(n.type)); // ✅ FILTER on fetch too
+        .filter((n) => isAllowedNotification(n.type));
       setNotifications(mapped);
       setUnreadCount(mapped.filter((n) => !n.isRead).length);
     } catch (err) {
@@ -341,7 +343,9 @@ const RealtimeAlertBell: React.FC = () => {
     (raw: any) => {
       const n = normalize(raw);
 
-      // ✅ WHITELIST FILTER — block everything except new_booking
+      console.log('[Bell] 📨 pushNotification called:', { type: n.type, bookingId: n.bookingId, title: n.title });
+
+      // WHITELIST FILTER
       if (!isAllowedNotification(n.type)) {
         console.log('[Bell] 🔕 Filtered out (not whitelisted):', n.type);
         return;
@@ -351,6 +355,8 @@ const RealtimeAlertBell: React.FC = () => {
         console.log('[Bell] 🚫 Duplicate blocked:', n.type, n.bookingId || n.title);
         return;
       }
+
+      console.log('[Bell] ✅ Showing notification:', n.title);
 
       setNotifications((prev) => {
         if (prev.some((p) => p._id === n._id)) return prev;
@@ -384,16 +390,21 @@ const RealtimeAlertBell: React.FC = () => {
     let socket: any;
     try {
       socket = getSocket();
+      console.log('[Bell] 🔌 Socket obtained. Connected:', socket.connected, 'ID:', socket.id);
     } catch (err) {
       console.warn('⚠️ Socket unavailable:', err);
       return;
     }
 
-    // ✅ Single canonical listener — whitelist filter inside pushNotification
-    const onNotification = (data: any) => pushNotification(data);
+    // Primary admin notification listener
+    const onNotification = (data: any) => {
+      console.log('[Bell] 📬 admin:notification received:', data);
+      pushNotification(data);
+    };
 
-    // Separate listener for direct booking:created / new:booking events
+    // Direct booking event listeners
     const onNewBooking = (data: any) => {
+      console.log('[Bell] 🆕 new booking event received:', data);
       pushNotification({
         _id: `booking_${data?.bookingId || Date.now()}`,
         title: '🆕 New Booking Received',
@@ -410,6 +421,7 @@ const RealtimeAlertBell: React.FC = () => {
 
     const onFcmForeground = (e: any) => {
       const p = e?.detail || {};
+      console.log('[Bell] 📨 FCM foreground message:', p);
       pushNotification({
         title: p?.notification?.title || p?.data?.title || 'New Alert',
         message: p?.notification?.body || p?.data?.body || '',
@@ -418,6 +430,8 @@ const RealtimeAlertBell: React.FC = () => {
       });
     };
     window.addEventListener('fcm-foreground-message', onFcmForeground);
+
+    console.log('[Bell] ✅ All socket listeners attached');
 
     return () => {
       socket.off('admin:notification', onNotification);
