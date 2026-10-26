@@ -1,45 +1,38 @@
 // backend/src/services/dispatchService.js
+// ✅ FIXED: Single source of dispatch, cooldown 10 min
+// ✅ Supersedes old offers on redispatch
+// ✅ Full ProviderOffer tracking
+
 const mongoose = require('mongoose');
-const { getBookingModel, getProviderConnection } = require('../config/database');
-const { getProviderOfferModel } = require('../models/ProviderOffer');
-const { getDispatchJobModel } = require('../models/DispatchJob');
+const { getBookingModel } = require('../config/database');
+const ProviderOffer = require('../models/ProviderOffer');
+const DispatchJob = require('../models/DispatchJob');
 const { findEligibleProviders } = require('./eligibilityService');
 const { sendBookingOfferToProvider, sendCancellationToProvider } = require('./fcmService');
-const { createAdminAlert } = require('./adminAlertService');
-const logger = require('../utils/logger');
-
-// ✅ Centralized live emitter (Socket.IO)
 const liveEmitter = require('./liveEmitter');
+const { createAdminAlert } = require('./adminAlertService');
 
-// ─── Config ───
+// ─── CONFIG ───
 const CFG = {
   radiusProgression: (process.env.DISPATCH_RADIUS_PROGRESSION || '5,8,12')
-    .split(',')
-    .map((x) => Number(x.trim()))
-    .filter((x) => x > 0),
-  batchSize: Number(process.env.DISPATCH_BATCH_SIZE || 5),
-  maxBatchesPerCycle: Number(process.env.DISPATCH_MAX_BATCHES_PER_CYCLE || 3),
-  requestTimeoutMs: Number(process.env.DISPATCH_REQUEST_TIMEOUT_MS || 15000),
-  scheduledTimeoutMs: Number(process.env.DISPATCH_SCHEDULED_TIMEOUT_MS || 30000),
-  scheduleThresholdMin: Number(process.env.DISPATCH_SCHEDULE_THRESHOLD_MINUTES || 30),
-  maxGeoResults: Number(process.env.DISPATCH_MAX_GEO_RESULTS || 50),
-  cooldownAfterFailMs: Number(process.env.DISPATCH_COOLDOWN_AFTER_FAIL_MS || 180000), // 3 min
+    .split(',').map((x) => parseInt(x.trim(), 10)).filter(Boolean),
+  batchSize: parseInt(process.env.DISPATCH_BATCH_SIZE || '5', 10),
+  requestTimeoutMs: parseInt(process.env.DISPATCH_REQUEST_TIMEOUT_MS || '15000', 10),
+  cooldownAfterFailMs: parseInt(process.env.DISPATCH_COOLDOWN_AFTER_FAIL_MS || '600000', 10), // 10 min
+  retryAfterMs: parseInt(process.env.DISPATCH_RETRY_AFTER_MS || '600000', 10), // 10 min
 };
 
-// ─── Per-booking locks (event-driven, NOT polling) ───
-const activeDispatches = new Map();        // bookingId -> timestamp when started
-const recentlyFailed = new Map();          // bookingId -> timestamp when last failed (cooldown)
+console.log('[DispatchService] Config:', CFG);
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+// ─── IN-MEMORY STATE ───
+const activeDispatches = new Map(); // bookingId -> timestamp
+const recentlyFailed = new Map();   // bookingId -> timestamp of last no_provider_found
 
-// ─── Guard: has this booking been dispatched recently? ───
 function isInCooldown(bookingId) {
-  const last = recentlyFailed.get(String(bookingId));
-  if (!last) return false;
-  const age = Date.now() - last;
-  if (age > CFG.cooldownAfterFailMs) {
+  const t = recentlyFailed.get(String(bookingId));
+  if (!t) return false;
+  const elapsed = Date.now() - t;
+  if (elapsed > CFG.cooldownAfterFailMs) {
     recentlyFailed.delete(String(bookingId));
     return false;
   }
@@ -48,445 +41,628 @@ function isInCooldown(bookingId) {
 
 function markFailed(bookingId) {
   recentlyFailed.set(String(bookingId), Date.now());
-  // Auto-cleanup after 10 min
-  setTimeout(() => recentlyFailed.delete(String(bookingId)), 10 * 60 * 1000);
 }
 
-function isBookingScheduled(booking) {
+function clearCooldown(bookingId) {
+  recentlyFailed.delete(String(bookingId));
+}
+
+function isActive(bookingId) {
+  return activeDispatches.has(String(bookingId));
+}
+
+function markActive(bookingId) {
+  activeDispatches.set(String(bookingId), Date.now());
+}
+
+function markInactive(bookingId) {
+  activeDispatches.delete(String(bookingId));
+}
+
+// ─── EMIT HELPER ───
+function safeEmit(event, payload) {
   try {
-    if (booking.bookingType === 'scheduled') return true;
-    if (!booking.scheduledDate || !booking.scheduledTime) return false;
-    const scheduled = new Date(`${booking.scheduledDate} ${booking.scheduledTime}`);
-    if (isNaN(scheduled.getTime())) return false;
-    const diffMin = (scheduled.getTime() - Date.now()) / 60000;
-    return diffMin > CFG.scheduleThresholdMin;
-  } catch {
-    return false;
+    if (liveEmitter && typeof liveEmitter.emitLive === 'function') {
+      liveEmitter.emitLive(event, payload);
+    } else if (global.emitLive) {
+      global.emitLive(event, payload);
+    }
+  } catch (e) {
+    console.warn('[DispatchService] emit error:', e.message);
   }
 }
 
-async function acquireBookingLock(bookingObjectId) {
-  const Booking = getBookingModel();
-  return Booking.findOneAndUpdate(
-    {
-      _id: bookingObjectId,
-      $and: [
-        { $or: [{ providerId: null }, { providerId: { $exists: false } }, { providerId: '' }] },
-        { status: { $in: ['confirmed', 'pending', 'searching', 'no_provider_found'] } },
-      ],
-    },
-    {
-      $set: { status: 'searching', assignmentMethod: 'admin-dispatch' },
-      $push: {
-        statusHistory: {
-          status: 'searching',
-          changedAt: new Date(),
-          changedBy: 'admin-dispatch',
-          reason: 'Dispatch started by admin backend',
-        },
+// ─── SUPERSEDE OLD OFFERS ───
+async function supersedeOldOffers(bookingId) {
+  try {
+    const result = await ProviderOffer.updateMany(
+      {
+        bookingId,
+        status: { $in: ['sent', 'delivered', 'viewed'] },
       },
-    },
-    { new: true }
-  );
-}
-
-async function checkIfAssigned(bookingObjectId) {
-  const Booking = getBookingModel();
-  const b = await Booking.findById(bookingObjectId).lean();
-  if (!b) return { assigned: false, cancelled: true, booking: null };
-  const terminal = ['assigned', 'accepted', 'en-route', 'arrived', 'in-progress', 'completed', 'cancelled'];
-  if (b.providerId && terminal.includes(b.status)) return { assigned: true, cancelled: false, booking: b };
-  if (b.status === 'cancelled') return { assigned: false, cancelled: true, booking: b };
-  return { assigned: false, cancelled: false, booking: b };
-}
-
-async function supersedeOldOffers(bookingObjectId) {
-  const Offer = getProviderOfferModel();
-  await Offer.updateMany(
-    { bookingObjectId, isCurrentOffer: true, status: { $in: ['sent', 'delivered', 'viewed'] } },
-    { $set: { isCurrentOffer: false } }
-  );
-}
-
-async function dispatchBatch({ booking, providers, batchNumber, radiusKm, cycle, isScheduled, dispatchJob }) {
-  const Offer = getProviderOfferModel();
-  const timeoutMs = isScheduled ? CFG.scheduledTimeoutMs : CFG.requestTimeoutMs;
-  const expiresAt = new Date(Date.now() + timeoutMs);
-
-  await Promise.all(
-    providers.map(async (p) => {
-      const providerIdStr = String(p.providerId || p._id);
-      const offer = await Offer.create({
-        bookingId: booking.bookingId || String(booking._id),
-        bookingObjectId: booking._id,
-        providerId: providerIdStr,
-        providerObjectId: p._id,
-        providerName: p.name || '',
-        providerPhone: p.phone || '',
-        providerCategory: p.categoryName || p.profession || '',
-        providerCity: p.city || '',
-        status: 'sent',
-        offeredAt: new Date(),
-        expiresAt,
-        dispatchCycle: cycle,
-        batchNumber,
-        radiusKm,
-        distanceKm: Number(p._distanceKm) || 0,
-        isCurrentOffer: true,
-        isScheduled,
-        fcmToken: p.fcmToken ? String(p.fcmToken).slice(0, 20) + '...' : null,
-        bookingSnapshot: {
-          serviceName: booking.serviceName,
-          totalAmount: booking.totalAmount,
-          address: booking.address,
-          scheduledDate: booking.scheduledDate,
-          scheduledTime: booking.scheduledTime,
-        },
-      });
-
-      const fcmRes = await sendBookingOfferToProvider({
-        fcmToken: p.fcmToken,
-        booking,
-        distanceKm: Number(p._distanceKm) || 0,
-        batchNumber,
-        isScheduled,
-        timeoutMs,
-      });
-
-      await Offer.findByIdAndUpdate(offer._id, {
+      {
         $set: {
-          fcmSent: fcmRes.success,
-          fcmMessageId: fcmRes.messageId || null,
-          fcmError: fcmRes.error || null,
-          status: fcmRes.success ? 'delivered' : 'failed',
-          deliveredAt: fcmRes.success ? new Date() : null,
+          status: 'superseded',
+          isCurrentOffer: false,
+          respondedAt: new Date(),
+          reason: 'Superseded by new dispatch cycle',
         },
-      });
-
-      liveEmitter.emitLive('dispatch:offer_sent', {
-        bookingId: booking.bookingId || String(booking._id),
-        providerId: providerIdStr,
-        providerName: p.name,
-        batchNumber,
-        radiusKm,
-        distanceKm: p._distanceKm,
-        fcmSuccess: fcmRes.success,
-        timestamp: new Date().toISOString(),
-      });
-    })
-  );
-
-  await getDispatchJobModel().findByIdAndUpdate(dispatchJob._id, {
-    $inc: { totalOffersSent: providers.length },
-    $push: { triedProviderIds: { $each: providers.map((p) => String(p.providerId || p._id)) } },
-    $set: { batchNumber, currentRadiusKm: radiusKm },
-  });
-
-  // Poll ONLY for the duration of this one batch (acceptance check)
-  const pollInterval = 2000;
-  const iterations = Math.ceil(timeoutMs / pollInterval);
-  for (let i = 0; i < iterations; i++) {
-    await sleep(pollInterval);
-    const { assigned, cancelled, booking: fresh } = await checkIfAssigned(booking._id);
-    if (cancelled) return { accepted: false, cancelled: true };
-    if (assigned && fresh?.providerId) {
-      await Offer.updateMany(
-        { bookingObjectId: booking._id, providerId: String(fresh.providerId), isCurrentOffer: true },
-        { $set: { status: 'accepted', respondedAt: new Date() } }
-      );
-      await Offer.updateMany(
-        {
-          bookingObjectId: booking._id,
-          isCurrentOffer: true,
-          providerId: { $ne: String(fresh.providerId) },
-          status: { $in: ['sent', 'delivered', 'viewed'] },
-        },
-        { $set: { status: 'superseded', respondedAt: new Date() } }
-      );
-      providers.forEach((p) => {
-        if (String(p.providerId || p._id) !== String(fresh.providerId) && p.fcmToken) {
-          sendCancellationToProvider({
-            fcmToken: p.fcmToken,
-            bookingId: booking.bookingId || String(booking._id),
-            reason: 'assigned_to_another',
-          }).catch(() => {});
-        }
-      });
-      return { accepted: true, providerId: fresh.providerId, booking: fresh };
+      }
+    );
+    if (result.modifiedCount > 0) {
+      console.log(`[Dispatch] Superseded ${result.modifiedCount} old offers for ${bookingId}`);
     }
+    return result.modifiedCount;
+  } catch (e) {
+    console.error('[Dispatch] supersedeOldOffers error:', e.message);
+    return 0;
   }
-
-  await Offer.updateMany(
-    { bookingObjectId: booking._id, isCurrentOffer: true, status: { $in: ['sent', 'delivered', 'viewed'] } },
-    { $set: { status: 'timeout', respondedAt: new Date() } }
-  );
-  await getDispatchJobModel().findByIdAndUpdate(dispatchJob._id, {
-    $inc: { totalTimeouts: providers.length },
-  });
-  return { accepted: false };
 }
 
-/**
- * Main dispatch — event-driven, no polling, cooldown-protected
- */
-async function dispatchBooking(booking) {
-  const bookingIdKey = String(booking._id);
-
-  // GUARD 1: Already running
-  if (activeDispatches.has(bookingIdKey)) {
-    logger.debug(`⏭️  Dispatch already running for ${bookingIdKey}`);
-    return { ok: false, reason: 'already_running' };
-  }
-
-  // GUARD 2: Recently failed (cooldown)
-  if (isInCooldown(bookingIdKey)) {
-    logger.debug(`⏭️  Booking ${bookingIdKey} in cooldown, skip`);
-    return { ok: false, reason: 'cooldown' };
-  }
-
-  activeDispatches.set(bookingIdKey, Date.now());
-
-  const DispatchJob = getDispatchJobModel();
+// ─── UPDATE BOOKING STATUS ───
+async function updateBookingStatus(bookingObjectId, status, reason = '', changedBy = 'dispatch_system') {
   const Booking = getBookingModel();
-  let dispatchJob = null;
+  const update = {
+    status,
+    updatedAt: new Date(),
+  };
+  const push = {
+    statusHistory: {
+      status,
+      changedAt: new Date(),
+      changedBy,
+      reason,
+    },
+  };
+  await Booking.updateOne({ _id: bookingObjectId }, { $set: update, $push: push });
+}
 
+// ─── MAIN DISPATCH FUNCTION ───
+async function dispatchBooking(bookingId, { manual = false, forceCycle = false } = {}) {
+  const Booking = getBookingModel();
+
+  // Get booking
+  let booking;
   try {
-    const locked = await acquireBookingLock(booking._id);
-    if (!locked) {
-      logger.info(`🔒 Lock failed for ${bookingIdKey} — already assigned/cancelled`);
-      return { ok: false, reason: 'lock_failed' };
+    booking = await Booking.findOne({
+      $or: [
+        { _id: mongoose.Types.ObjectId.isValid(bookingId) ? new mongoose.Types.ObjectId(bookingId) : null },
+        { bookingId: bookingId },
+      ],
+    }).lean();
+  } catch (e) {
+    console.error('[Dispatch] Booking lookup error:', e.message);
+    return { success: false, error: 'Booking lookup failed' };
+  }
+
+  if (!booking) {
+    return { success: false, error: 'Booking not found' };
+  }
+
+  const bId = booking.bookingId;
+  const bOid = booking._id;
+
+  console.log(`\n[Dispatch] 🚀 Starting dispatch for ${bId} (manual=${manual})`);
+
+  // Guard: already in active dispatch
+  if (isActive(bId) && !manual) {
+    console.log(`[Dispatch] ${bId} already in-flight, skipping`);
+    return { success: false, error: 'Already dispatching', skipped: true };
+  }
+
+  // Guard: cooldown
+  if (isInCooldown(bId) && !manual) {
+    console.log(`[Dispatch] ${bId} in cooldown, skipping`);
+    return { success: false, error: 'In cooldown', skipped: true };
+  }
+
+  // Guard: already assigned
+  if (booking.providerId && !manual && !forceCycle) {
+    console.log(`[Dispatch] ${bId} already has provider ${booking.providerId}, skipping`);
+    return { success: false, error: 'Already assigned', skipped: true };
+  }
+
+  // Guard: terminal status
+  if (['completed', 'cancelled', 'refunded'].includes(booking.status)) {
+    console.log(`[Dispatch] ${bId} in terminal status ${booking.status}, skipping`);
+    return { success: false, error: `Terminal status: ${booking.status}` };
+  }
+
+  markActive(bId);
+
+  // Supersede old offers if this is a fresh retry
+  await supersedeOldOffers(bId);
+
+  // Create DispatchJob
+  let dispatchJob;
+  try {
+    dispatchJob = await DispatchJob.create({
+      bookingId: bId,
+      bookingObjectId: bOid,
+      status: 'running',
+      cycle: 1,
+      startedAt: new Date(),
+      isScheduled: booking.bookingType === 'scheduled',
+    });
+  } catch (e) {
+    console.error('[Dispatch] DispatchJob create error:', e.message);
+    markInactive(bId);
+    return { success: false, error: 'Failed to create dispatch job' };
+  }
+
+  // Update booking status → searching
+  await updateBookingStatus(bOid, 'searching', 'Dispatch started');
+  safeEmit('dispatch:started', { bookingId: bId, dispatchJobId: dispatchJob._id });
+  safeEmit('booking:status_changed', { bookingId: bId, status: 'searching' });
+
+  const triedProviderIds = [];
+  const triedProviderObjectIds = [];
+  let assignedProvider = null;
+  let totalOffersSent = 0;
+
+  // Loop through radii
+  for (let radiusIdx = 0; radiusIdx < CFG.radiusProgression.length; radiusIdx++) {
+    const radiusKm = CFG.radiusProgression[radiusIdx];
+    console.log(`[Dispatch] ${bId} radius ${radiusKm}km`);
+
+    // Re-check booking in case it got cancelled/assigned by other means
+    const freshBooking = await Booking.findById(bOid).lean();
+    if (!freshBooking) break;
+    if (['completed', 'cancelled', 'refunded', 'accepted', 'assigned'].includes(freshBooking.status) && !manual) {
+      console.log(`[Dispatch] ${bId} status changed to ${freshBooking.status}, aborting`);
+      break;
     }
-    booking = locked.toObject ? locked.toObject() : locked;
+    if (freshBooking.providerId && !manual) {
+      console.log(`[Dispatch] ${bId} got provider ${freshBooking.providerId}, aborting`);
+      assignedProvider = { providerId: freshBooking.providerId, name: freshBooking.providerName };
+      break;
+    }
 
-    const isScheduled = isBookingScheduled(booking);
-
-    const existingJob = await DispatchJob.findOne({
-      bookingObjectId: booking._id,
-      status: { $in: ['queued', 'running'] },
+    // Find eligible providers
+    const providers = await findEligibleProviders(booking, {
+      radiusKm,
+      excludeProviderIds: triedProviderObjectIds,
+      strict: true,
+      debug: true,
     });
 
-    if (existingJob) {
-      dispatchJob = existingJob;
-      dispatchJob.status = 'running';
-      dispatchJob.cycle += 1;
-      await dispatchJob.save();
-    } else {
-      dispatchJob = await DispatchJob.create({
-        bookingId: booking.bookingId || bookingIdKey,
-        bookingObjectId: booking._id,
-        status: 'running',
-        cycle: 1,
-        isScheduled,
-        startedAt: new Date(),
-      });
+    if (providers.length === 0) {
+      console.log(`[Dispatch] ${bId} no providers at ${radiusKm}km`);
+      continue;
     }
 
-    await supersedeOldOffers(booking._id);
+    // Take batch
+    const batch = providers.slice(0, CFG.batchSize);
+    console.log(`[Dispatch] ${bId} sending to ${batch.length} providers at ${radiusKm}km`);
 
-    liveEmitter.emitLive('dispatch:started', {
-      bookingId: booking.bookingId || bookingIdKey,
-      cycle: dispatchJob.cycle,
-      isScheduled,
-    });
+    // Create ProviderOffer docs + send FCM in parallel
+    const offerPromises = batch.map(async (provider, idx) => {
+      try {
+        const providerIdStr = provider.providerId || String(provider._id);
+        triedProviderIds.push(providerIdStr);
+        triedProviderObjectIds.push(provider._id);
 
-    const triedThisDispatch = new Set((dispatchJob.triedProviderIds || []).map(String));
-    let totalBatches = 0;
-
-    // SEQUENTIAL radius expansion — stops at first provider found
-    for (const radiusKm of CFG.radiusProgression) {
-      if (totalBatches >= CFG.maxBatchesPerCycle) break;
-
-      logger.info(`🔍 Searching providers for ${bookingIdKey} within ${radiusKm}km`);
-      const eligible = await findEligibleProviders({
-        booking,
-        radiusKm,
-        excludeProviderIds: Array.from(triedThisDispatch),
-        limit: CFG.maxGeoResults,
-      });
-
-      if (eligible.length === 0) {
-        logger.info(`No eligible providers at ${radiusKm}km`);
-        continue;
-      }
-
-      await DispatchJob.findByIdAndUpdate(dispatchJob._id, {
-        $inc: { totalProvidersConsidered: eligible.length },
-      });
-
-      for (let i = 0; i < eligible.length && totalBatches < CFG.maxBatchesPerCycle; i += CFG.batchSize) {
-        const batch = eligible.slice(i, i + CFG.batchSize);
-        totalBatches += 1;
-        batch.forEach((p) => triedThisDispatch.add(String(p.providerId || p._id)));
-
-        logger.info(`📤 Batch ${totalBatches}: sending to ${batch.length} providers (radius=${radiusKm}km)`);
-
-        const result = await dispatchBatch({
-          booking,
-          providers: batch,
-          batchNumber: totalBatches,
+        const offerDoc = await ProviderOffer.create({
+          bookingId: bId,
+          bookingObjectId: bOid,
+          providerId: providerIdStr,
+          providerObjectId: provider._id,
+          providerName: provider.name || 'Unknown',
+          providerPhone: provider.phone || '',
+          providerCategory: provider.profession || provider.categoryName || '',
+          providerCity: provider.city || '',
+          status: 'sent',
+          offeredAt: new Date(),
+          expiresAt: new Date(Date.now() + CFG.requestTimeoutMs),
+          dispatchCycle: dispatchJob.cycle,
+          batchNumber: radiusIdx + 1,
           radiusKm,
-          cycle: dispatchJob.cycle,
-          isScheduled,
-          dispatchJob,
+          distanceKm: provider._distanceKm || 0,
+          isCurrentOffer: true,
+          isScheduled: booking.bookingType === 'scheduled',
+          bookingSnapshot: {
+            serviceName: booking.serviceName,
+            totalAmount: booking.totalAmount,
+            address: booking.address,
+            scheduledDate: booking.scheduledDate,
+            scheduledTime: booking.scheduledTime,
+          },
+          fcmSent: false,
         });
 
-        if (result.cancelled) {
-          dispatchJob.status = 'cancelled';
-          dispatchJob.completedAt = new Date();
-          await dispatchJob.save();
-          liveEmitter.emitLive('dispatch:cancelled', { bookingId: booking.bookingId || bookingIdKey });
-          return { ok: true, result: 'cancelled' };
+        totalOffersSent++;
+
+        // Send FCM
+        try {
+          const fcmResult = await sendBookingOfferToProvider(provider, booking, {
+            offerId: String(offerDoc._id),
+            expiresAt: offerDoc.expiresAt,
+            distanceKm: provider._distanceKm,
+          });
+          offerDoc.fcmSent = fcmResult.success;
+          offerDoc.fcmMessageId = fcmResult.messageId || null;
+          offerDoc.fcmError = fcmResult.error || null;
+          if (fcmResult.success) {
+            offerDoc.status = 'delivered';
+            offerDoc.deliveredAt = new Date();
+          }
+          await offerDoc.save();
+        } catch (fcmErr) {
+          console.error(`[Dispatch] FCM error for provider ${providerIdStr}:`, fcmErr.message);
+          offerDoc.fcmSent = false;
+          offerDoc.fcmError = fcmErr.message;
+          await offerDoc.save();
         }
 
-        if (result.accepted) {
-          dispatchJob.status = 'completed';
-          dispatchJob.completedAt = new Date();
-          dispatchJob.assignedProviderId = String(result.providerId);
-          await dispatchJob.save();
+        safeEmit('dispatch:offer_sent', {
+          bookingId: bId,
+          providerId: providerIdStr,
+          providerName: provider.name,
+          distanceKm: provider._distanceKm,
+        });
 
-          liveEmitter.emitLive('dispatch:assigned', {
-            bookingId: booking.bookingId || bookingIdKey,
-            providerId: result.providerId,
-          });
+        return offerDoc;
+      } catch (e) {
+        console.error(`[Dispatch] Offer creation error:`, e.message);
+        return null;
+      }
+    });
 
-          await createAdminAlert({
-            type: 'booking_assigned',
-            title: '✅ Booking Assigned',
-            message: `Booking ${booking.bookingId || bookingIdKey} assigned to provider ${result.providerId}`,
-            severity: 'success',
-            bookingId: booking.bookingId || bookingIdKey,
-            providerId: String(result.providerId),
-            data: { cycle: dispatchJob.cycle, batchNumber: totalBatches },
-            actionUrl: `/bookings?open=${booking.bookingId || bookingIdKey}`,
-          });
-          return { ok: true, result: 'assigned', providerId: result.providerId };
-        }
+    await Promise.all(offerPromises);
+
+    // Update DispatchJob stats
+    await DispatchJob.updateOne(
+      { _id: dispatchJob._id },
+      {
+        $set: {
+          currentRadiusKm: radiusKm,
+          batchNumber: radiusIdx + 1,
+          totalProvidersConsidered: triedProviderIds.length,
+          totalOffersSent,
+          triedProviderIds,
+        },
+      }
+    );
+
+    // Wait for timeout or until acceptance
+    const waitStart = Date.now();
+    while (Date.now() - waitStart < CFG.requestTimeoutMs) {
+      await new Promise((r) => setTimeout(r, 1500));
+
+      const acceptedOffer = await ProviderOffer.findOne({
+        bookingId: bId,
+        dispatchCycle: dispatchJob.cycle,
+        batchNumber: radiusIdx + 1,
+        status: 'accepted',
+      }).lean();
+
+      if (acceptedOffer) {
+        console.log(`[Dispatch] ✅ ${bId} accepted by ${acceptedOffer.providerId}`);
+        assignedProvider = {
+          providerId: acceptedOffer.providerId,
+          providerObjectId: acceptedOffer.providerObjectId,
+          name: acceptedOffer.providerName,
+          phone: acceptedOffer.providerPhone,
+        };
+        break;
+      }
+
+      // Re-check if booking was externally updated
+      const chk = await Booking.findById(bOid).lean();
+      if (chk && chk.providerId && !assignedProvider) {
+        assignedProvider = {
+          providerId: chk.providerId,
+          name: chk.providerName,
+          phone: chk.providerPhone,
+        };
+        break;
       }
     }
 
-    logger.warn(`❌ No provider accepted ${bookingIdKey} after ${totalBatches} batches`);
+    if (assignedProvider) break;
 
-    await Booking.findByIdAndUpdate(booking._id, {
-      $set: { status: 'no_provider_found' },
+    // Timeout — mark unresponded offers as timeout
+    await ProviderOffer.updateMany(
+      {
+        bookingId: bId,
+        dispatchCycle: dispatchJob.cycle,
+        batchNumber: radiusIdx + 1,
+        status: { $in: ['sent', 'delivered', 'viewed'] },
+      },
+      {
+        $set: {
+          status: 'timeout',
+          respondedAt: new Date(),
+          reason: 'No response within window',
+          isCurrentOffer: false,
+        },
+      }
+    );
+  }
+
+  // ─── FINAL ───
+  if (assignedProvider) {
+    // Booking should already be updated by provider-app accept flow,
+    // but ensure booking has providerId set
+    await Booking.updateOne(
+      { _id: bOid },
+      {
+        $set: {
+          providerId: assignedProvider.providerId,
+          providerName: assignedProvider.name || null,
+          providerPhone: assignedProvider.phone || null,
+          assignedAt: new Date(),
+          dispatchCompletedAt: new Date(),
+          status: 'accepted',
+        },
+        $push: {
+          statusHistory: {
+            status: 'accepted',
+            changedAt: new Date(),
+            changedBy: 'dispatch_system',
+            reason: `Accepted by ${assignedProvider.name}`,
+          },
+        },
+      }
+    );
+
+    await DispatchJob.updateOne(
+      { _id: dispatchJob._id },
+      {
+        $set: {
+          status: 'completed',
+          completedAt: new Date(),
+          assignedProviderId: assignedProvider.providerId,
+        },
+      }
+    );
+
+    clearCooldown(bId);
+    markInactive(bId);
+
+    safeEmit('dispatch:assigned', {
+      bookingId: bId,
+      providerId: assignedProvider.providerId,
+      providerName: assignedProvider.name,
+    });
+    safeEmit('booking:status_changed', { bookingId: bId, status: 'accepted' });
+
+    try {
+      await createAdminAlert('booking_assigned', {
+        title: '✅ Provider Assigned',
+        message: `${assignedProvider.name} accepted booking ${bId}`,
+        severity: 'success',
+        bookingId: bId,
+        providerId: assignedProvider.providerId,
+        actionUrl: `/bookings?open=${bId}`,
+        actionLabel: 'View Booking',
+      });
+    } catch (e) {
+      console.warn('[Dispatch] admin alert error:', e.message);
+    }
+
+    return { success: true, assignedProvider };
+  }
+
+  // No provider found
+  console.log(`[Dispatch] ❌ ${bId} no provider found after ${totalOffersSent} offers`);
+
+  await updateBookingStatus(bOid, 'no_provider_found', `Tried ${totalOffersSent} providers, none accepted`);
+
+  await DispatchJob.updateOne(
+    { _id: dispatchJob._id },
+    {
+      $set: {
+        status: 'no_provider_found',
+        completedAt: new Date(),
+        totalOffersSent,
+        totalProvidersConsidered: triedProviderIds.length,
+      },
+    }
+  );
+
+  markFailed(bId);
+  markInactive(bId);
+
+  safeEmit('dispatch:no_provider_found', {
+    bookingId: bId,
+    totalOffersSent,
+  });
+  safeEmit('booking:status_changed', { bookingId: bId, status: 'no_provider_found' });
+
+  try {
+    await createAdminAlert('no_provider_found', {
+      title: '⚠️ No Provider Found',
+      message: `Booking ${bId} — ${totalOffersSent} providers notified, none accepted`,
+      severity: 'warning',
+      bookingId: bId,
+      actionUrl: `/dispatch`,
+      actionLabel: 'View Dispatch',
+    });
+  } catch (e) {
+    console.warn('[Dispatch] admin alert error:', e.message);
+  }
+
+  return { success: false, error: 'No provider accepted', totalOffersSent };
+}
+
+// ─── MANUAL REASSIGN ───
+async function manualReassign(bookingId, reason = 'Admin reassignment') {
+  const Booking = getBookingModel();
+
+  const booking = await Booking.findOne({
+    $or: [
+      { _id: mongoose.Types.ObjectId.isValid(bookingId) ? new mongoose.Types.ObjectId(bookingId) : null },
+      { bookingId: bookingId },
+    ],
+  }).lean();
+
+  if (!booking) return { success: false, error: 'Booking not found' };
+
+  // Supersede all old offers
+  await supersedeOldOffers(booking.bookingId);
+
+  // Clear previous provider assignment
+  await Booking.updateOne(
+    { _id: booking._id },
+    {
+      $set: {
+        providerId: null,
+        providerName: null,
+        providerPhone: null,
+        assignedAt: null,
+        status: 'confirmed',
+      },
       $push: {
         statusHistory: {
-          status: 'no_provider_found',
+          status: 'confirmed',
           changedAt: new Date(),
-          changedBy: 'admin-dispatch',
-          reason: `Tried ${triedThisDispatch.size} providers across ${CFG.radiusProgression.join('/')} km`,
+          changedBy: 'admin',
+          reason: `Reassignment: ${reason}`,
         },
       },
-    });
-
-    dispatchJob.status = 'no_provider_found';
-    dispatchJob.completedAt = new Date();
-    dispatchJob.nextRunAt = new Date(Date.now() + CFG.cooldownAfterFailMs);
-    await dispatchJob.save();
-
-    // Mark cooldown so safety-net doesn't instantly retry
-    markFailed(bookingIdKey);
-
-    liveEmitter.emitLive('dispatch:no_provider_found', {
-      bookingId: booking.bookingId || bookingIdKey,
-      triedCount: triedThisDispatch.size,
-    });
-
-    await createAdminAlert({
-      type: 'no_provider_found',
-      title: '⚠️ No Provider Found',
-      message: `Booking ${booking.bookingId || bookingIdKey} — ${triedThisDispatch.size} providers tried`,
-      severity: 'warning',
-      bookingId: booking.bookingId || bookingIdKey,
-      data: { triedCount: triedThisDispatch.size, batches: totalBatches },
-      actionUrl: `/bookings?open=${booking.bookingId || bookingIdKey}`,
-    });
-
-    return { ok: true, result: 'no_provider_found' };
-  } catch (err) {
-    logger.error(`Dispatch error for ${bookingIdKey}: ${err.message}`);
-    logger.error(err.stack);
-    markFailed(bookingIdKey); // cooldown on error too
-    if (dispatchJob) {
-      dispatchJob.status = 'failed';
-      dispatchJob.lastError = err.message;
-      dispatchJob.completedAt = new Date();
-      await dispatchJob.save().catch(() => {});
     }
-    await createAdminAlert({
-      type: 'dispatch_failed',
-      title: '🚨 Dispatch Failed',
-      message: `Dispatch error for ${bookingIdKey}: ${err.message}`,
-      severity: 'error',
-      bookingId: booking.bookingId || bookingIdKey,
-    }).catch(() => {});
-    return { ok: false, error: err.message };
-  } finally {
-    activeDispatches.delete(bookingIdKey);
-  }
-}
-
-/**
- * Trigger dispatch by booking ID (event entry point)
- */
-async function triggerDispatchById(bookingId) {
-  const Booking = getBookingModel();
-  let booking = null;
-  if (mongoose.Types.ObjectId.isValid(bookingId)) {
-    booking = await Booking.findById(bookingId).lean();
-  }
-  if (!booking) booking = await Booking.findOne({ bookingId }).lean();
-  if (!booking) {
-    logger.warn(`triggerDispatchById: booking not found: ${bookingId}`);
-    return { ok: false, reason: 'not_found' };
-  }
-  return dispatchBooking(booking);
-}
-
-async function manualReassign(bookingId, { reason, actorEmail } = {}) {
-  const Booking = getBookingModel();
-  let booking;
-  if (mongoose.Types.ObjectId.isValid(bookingId)) booking = await Booking.findById(bookingId);
-  if (!booking) booking = await Booking.findOne({ bookingId });
-  if (!booking) throw new Error('Booking not found');
-
-  const previousProviderId = booking.providerId;
-  booking.providerId = null;
-  booking.providerName = undefined;
-  booking.providerPhone = undefined;
-  booking.status = 'confirmed';
-  booking.statusHistory = booking.statusHistory || [];
-  booking.statusHistory.push({
-    status: 'confirmed',
-    changedAt: new Date(),
-    changedBy: actorEmail || 'admin',
-    reason: reason || `Manual reassignment (previous: ${previousProviderId || 'none'})`,
-  });
-  await booking.save();
-
-  // Clear cooldown since admin manually asked for retry
-  recentlyFailed.delete(String(booking._id));
-
-  await createAdminAlert({
-    type: 'reassignment',
-    title: '🔄 Manual Reassignment Triggered',
-    message: `Admin ${actorEmail || ''} triggered reassignment for ${booking.bookingId}`,
-    severity: 'info',
-    bookingId: booking.bookingId,
-    data: { previousProviderId, reason },
-  });
-
-  dispatchBooking(booking.toObject ? booking.toObject() : booking).catch((e) =>
-    logger.error(`Manual dispatch error: ${e.message}`)
   );
-  return booking;
+
+  clearCooldown(booking.bookingId);
+  markInactive(booking.bookingId);
+
+  // Notify previous provider via FCM (cancel)
+  if (booking.providerId) {
+    try {
+      await sendCancellationToProvider(booking.providerId, booking, reason);
+    } catch (e) {
+      console.warn('[Dispatch] cancel notify error:', e.message);
+    }
+  }
+
+  safeEmit('booking:status_changed', { bookingId: booking.bookingId, status: 'confirmed' });
+
+  // Trigger fresh dispatch
+  setImmediate(() => {
+    dispatchBooking(booking.bookingId, { manual: true, forceCycle: true }).catch((e) => {
+      console.error('[Dispatch] Reassign-triggered dispatch error:', e.message);
+    });
+  });
+
+  return { success: true, bookingId: booking.bookingId };
+}
+
+// ─── MANUAL ASSIGN TO SPECIFIC PROVIDER ───
+async function manualAssignProvider(bookingId, providerId) {
+  const Booking = getBookingModel();
+  const { getProviderConnection } = require('../config/database');
+  const providerColl = getProviderConnection().collection('providers');
+
+  const booking = await Booking.findOne({
+    $or: [
+      { _id: mongoose.Types.ObjectId.isValid(bookingId) ? new mongoose.Types.ObjectId(bookingId) : null },
+      { bookingId: bookingId },
+    ],
+  }).lean();
+  if (!booking) return { success: false, error: 'Booking not found' };
+
+  // Find provider by providerId string or _id
+  let provider = null;
+  try {
+    provider = await providerColl.findOne({
+      $or: [
+        { providerId: providerId },
+        ...(mongoose.Types.ObjectId.isValid(providerId)
+          ? [{ _id: new mongoose.Types.ObjectId(providerId) }]
+          : []),
+      ],
+    });
+  } catch (e) {}
+
+  if (!provider) return { success: false, error: 'Provider not found' };
+
+  // Supersede old offers
+  await supersedeOldOffers(booking.bookingId);
+
+  // Create ProviderOffer doc
+  const offer = await ProviderOffer.create({
+    bookingId: booking.bookingId,
+    bookingObjectId: booking._id,
+    providerId: provider.providerId || String(provider._id),
+    providerObjectId: provider._id,
+    providerName: provider.name,
+    providerPhone: provider.phone || '',
+    providerCategory: provider.profession || provider.categoryName || '',
+    providerCity: provider.city || '',
+    status: 'sent',
+    offeredAt: new Date(),
+    expiresAt: new Date(Date.now() + CFG.requestTimeoutMs),
+    dispatchCycle: 1,
+    batchNumber: 1,
+    radiusKm: 999,
+    distanceKm: 0,
+    isCurrentOffer: true,
+    isScheduled: booking.bookingType === 'scheduled',
+    fcmSent: false,
+  });
+
+  // Update booking
+  await Booking.updateOne(
+    { _id: booking._id },
+    {
+      $set: {
+        providerId: provider.providerId || String(provider._id),
+        providerName: provider.name,
+        providerPhone: provider.phone || null,
+        assignedAt: new Date(),
+        assignmentMethod: 'manual-admin',
+        status: 'assigned',
+      },
+      $push: {
+        statusHistory: {
+          status: 'assigned',
+          changedAt: new Date(),
+          changedBy: 'admin',
+          reason: `Manually assigned to ${provider.name}`,
+        },
+      },
+    }
+  );
+
+  // Send FCM to provider
+  try {
+    const fcmResult = await sendBookingOfferToProvider(provider, booking, {
+      offerId: String(offer._id),
+      expiresAt: offer.expiresAt,
+      distanceKm: 0,
+      isManual: true,
+    });
+    offer.fcmSent = fcmResult.success;
+    offer.fcmMessageId = fcmResult.messageId || null;
+    offer.fcmError = fcmResult.error || null;
+    if (fcmResult.success) {
+      offer.status = 'delivered';
+      offer.deliveredAt = new Date();
+    }
+    await offer.save();
+  } catch (e) {
+    console.error('[Dispatch] FCM error on manual assign:', e.message);
+  }
+
+  clearCooldown(booking.bookingId);
+
+  safeEmit('dispatch:assigned', {
+    bookingId: booking.bookingId,
+    providerId: provider.providerId || String(provider._id),
+    providerName: provider.name,
+    manual: true,
+  });
+
+  return { success: true, provider: { id: provider.providerId, name: provider.name } };
 }
 
 module.exports = {
   dispatchBooking,
-  triggerDispatchById,
   manualReassign,
-  isBookingScheduled,
-  activeDispatches,
-  recentlyFailed,
+  manualAssignProvider,
+  supersedeOldOffers,
+  isInCooldown,
+  clearCooldown,
   CFG,
 };

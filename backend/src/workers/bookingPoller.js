@@ -1,205 +1,154 @@
 // backend/src/workers/bookingPoller.js
-const mongoose = require('mongoose');
-const cron = require('node-cron');
+// ✅ FIXED: Only change stream + safety net for >30 min stuck bookings
+// ✅ No duplicate handlers
+
 const { getBookingModel } = require('../config/database');
-const { triggerDispatchById, activeDispatches, recentlyFailed, CFG } = require('../services/dispatchService');
-const logger = require('../utils/logger');
+const { dispatchBooking, isInCooldown } = require('../services/dispatchService');
 
 let changeStream = null;
-let safetyNetCron = null;
-let isShuttingDown = false;
-
-// Track bookings currently being considered (not just actively dispatching, but queued)
+let safetyNetInterval = null;
 const inFlight = new Set();
 
-// How long to wait before retrying a booking that got no_provider_found
-const RETRY_AFTER_NO_PROVIDER_MS = Number(process.env.DISPATCH_RETRY_AFTER_MS || 5 * 60 * 1000); // 5 min
+const SAFETY_NET_STUCK_MIN = parseInt(process.env.DISPATCH_SAFETY_NET_STUCK_MIN || '30', 10);
+const SAFETY_NET_INTERVAL_MS = parseInt(process.env.DISPATCH_SAFETY_NET_INTERVAL_MS || '120000', 10); // 2 min
 
-function safeTrigger(bookingId) {
-  const key = String(bookingId);
-  if (inFlight.has(key)) return;
-  if (activeDispatches.has(key)) return;
-  if (recentlyFailed.has(key)) {
-    const age = Date.now() - recentlyFailed.get(key);
-    if (age < CFG.cooldownAfterFailMs) return;
+async function safeDispatch(bookingId, reason) {
+  if (inFlight.has(bookingId)) {
+    console.log(`[Poller] ${bookingId} already in flight (${reason})`);
+    return;
   }
-  inFlight.add(key);
-  Promise.resolve()
-    .then(() => triggerDispatchById(bookingId))
-    .catch((e) => logger.error(`safeTrigger error for ${key}: ${e.message}`))
-    .finally(() => {
-      setTimeout(() => inFlight.delete(key), 2000);
-    });
+  if (isInCooldown(bookingId)) {
+    console.log(`[Poller] ${bookingId} in cooldown, skip (${reason})`);
+    return;
+  }
+
+  inFlight.add(bookingId);
+  try {
+    console.log(`[Poller] 🚀 Triggering dispatch for ${bookingId} (${reason})`);
+    await dispatchBooking(bookingId);
+  } catch (e) {
+    console.error(`[Poller] Dispatch error for ${bookingId}:`, e.message);
+  } finally {
+    setTimeout(() => inFlight.delete(bookingId), 5000);
+  }
 }
 
-// ─── 1. CHANGE STREAM (real-time) ───
 async function startChangeStream() {
+  const Booking = getBookingModel();
+
   try {
-    const Booking = getBookingModel();
-    const pipeline = [
-      {
-        $match: {
-          $or: [
-            { operationType: 'insert' },
-            {
-              operationType: 'update',
-              'updateDescription.updatedFields.status': { $exists: true },
-            },
-          ],
+    changeStream = Booking.watch(
+      [
+        {
+          $match: {
+            $or: [
+              { operationType: 'insert' },
+              {
+                operationType: 'update',
+                'updateDescription.updatedFields.status': { $exists: true },
+              },
+            ],
+          },
         },
-      },
-    ];
+      ],
+      { fullDocument: 'updateLookup' }
+    );
 
-    changeStream = Booking.watch(pipeline, { fullDocument: 'updateLookup' });
+    changeStream.on('change', async (change) => {
+      const doc = change.fullDocument;
+      if (!doc) return;
 
-    changeStream.on('change', (change) => {
-      try {
-        if (isShuttingDown) return;
-        const doc = change.fullDocument;
-        if (!doc) return;
+      const status = doc.status;
+      const bookingId = doc.bookingId || String(doc._id);
 
-        const needsDispatch =
-          !doc.providerId &&
-          ['pending', 'confirmed', 'searching', 'no_provider_found'].includes(doc.status);
-
-        if (!needsDispatch) return;
-
-        // If no_provider_found → only retry after cooldown
-        if (doc.status === 'no_provider_found') {
-          const lastHist = (doc.statusHistory || []).slice(-1)[0];
-          const lastChangedAt = lastHist?.changedAt ? new Date(lastHist.changedAt).getTime() : 0;
-          const age = Date.now() - lastChangedAt;
-          if (age < RETRY_AFTER_NO_PROVIDER_MS) {
-            return; // Skip — too soon
+      // Only trigger for 'confirmed' status with no provider assigned
+      if (status === 'confirmed' && !doc.providerId) {
+        // Instant bookings go NOW. Scheduled go only within 2 hrs of scheduled time.
+        if (doc.bookingType === 'instant' || !doc.scheduledDateTime) {
+          await safeDispatch(bookingId, 'change_stream:confirmed_instant');
+        } else if (doc.scheduledDateTime) {
+          const now = new Date();
+          const schedTime = new Date(doc.scheduledDateTime);
+          const diffMs = schedTime - now;
+          if (diffMs <= 2 * 60 * 60 * 1000 && diffMs > -5 * 60 * 1000) {
+            await safeDispatch(bookingId, 'change_stream:scheduled_near');
           }
         }
-
-        logger.info(`⚡ Change stream: dispatching booking ${doc._id} (status=${doc.status})`);
-        safeTrigger(doc._id);
-      } catch (e) {
-        logger.error(`Change stream handler error: ${e.message}`);
       }
     });
 
     changeStream.on('error', (err) => {
-      logger.error(`Change stream error: ${err.message}`);
+      console.error('[Poller] Change stream error:', err.message);
+      // Restart after 5s
       setTimeout(() => {
-        if (!isShuttingDown) {
-          logger.info('🔄 Restarting change stream...');
-          startChangeStream().catch((e) => logger.error('Restart failed: ' + e.message));
-        }
-      }, 10000);
+        try { changeStream.close(); } catch (e) {}
+        startChangeStream();
+      }, 5000);
     });
 
-    changeStream.on('close', () => {
-      logger.warn('Change stream closed');
-    });
-
-    logger.info('✅ Change Stream started on bookings collection');
+    console.log('[Poller] ✅ Change stream started');
   } catch (e) {
-    logger.error(`Failed to start change stream: ${e.message}`);
+    console.error('[Poller] Failed to start change stream:', e.message);
   }
 }
 
-// ─── 2. SAFETY NET CRON (every 2 min) ───
-function startSafetyNet() {
-  safetyNetCron = cron.schedule('*/2 * * * *', async () => {
-    try {
-      if (isShuttingDown) return;
-      const Booking = getBookingModel();
+// Safety net: Pick stuck bookings (>30 min in confirmed/searching/no_provider_found) and retry
+async function runSafetyNet() {
+  try {
+    const Booking = getBookingModel();
+    const cutoff = new Date(Date.now() - SAFETY_NET_STUCK_MIN * 60 * 1000);
 
-      const twoMinAgo = new Date(Date.now() - 2 * 60 * 1000);
-      const retryAgo = new Date(Date.now() - RETRY_AFTER_NO_PROVIDER_MS);
+    const stuck = await Booking.find({
+      status: { $in: ['confirmed', 'no_provider_found'] },
+      providerId: { $in: [null, undefined] },
+      isDeleted: { $ne: true },
+      updatedAt: { $lt: cutoff },
+    })
+      .sort({ updatedAt: 1 })
+      .limit(5)
+      .lean();
 
-      const query = {
-        $or: [
-          { providerId: null },
-          { providerId: { $exists: false } },
-          { providerId: '' },
-        ],
-        $and: [
-          {
-            $or: [
-              { status: { $in: ['pending', 'confirmed', 'searching'] }, createdAt: { $lt: twoMinAgo } },
-              { status: 'no_provider_found', updatedAt: { $lt: retryAgo } },
-            ],
-          },
-        ],
-      };
+    if (stuck.length === 0) return;
 
-      const bookings = await Booking.find(query).limit(20).lean();
-      if (bookings.length === 0) return;
-
-      const dispatchable = bookings.filter((b) => {
-        const key = String(b._id);
-        if (inFlight.has(key)) return false;
-        if (activeDispatches.has(key)) return false;
-        if (recentlyFailed.has(key)) {
-          const age = Date.now() - recentlyFailed.get(key);
-          if (age < CFG.cooldownAfterFailMs) return false;
-        }
-        return true;
-      });
-
-      if (dispatchable.length === 0) return;
-
-      logger.info(`🛡️  Safety-net: dispatching ${dispatchable.length}/${bookings.length} bookings`);
-      for (const b of dispatchable) {
-        safeTrigger(b._id);
-        await new Promise((r) => setTimeout(r, 300));
-      }
-    } catch (e) {
-      logger.error(`Safety-net error: ${e.message}`);
+    console.log(`[Poller] 🩺 Safety net: ${stuck.length} stuck bookings`);
+    for (const b of stuck) {
+      await safeDispatch(b.bookingId, `safety_net:stuck_${SAFETY_NET_STUCK_MIN}min`);
     }
-  });
-  logger.info('✅ Safety-net cron started (every 2 min)');
+  } catch (e) {
+    console.error('[Poller] Safety net error:', e.message);
+  }
 }
 
-// ─── 3. STARTUP SCAN (15s after boot) ───
-function startupScan() {
-  setTimeout(async () => {
-    try {
-      const Booking = getBookingModel();
-      const bookings = await Booking.find({
-        $or: [{ providerId: null }, { providerId: { $exists: false } }, { providerId: '' }],
-        status: { $in: ['pending', 'confirmed', 'searching'] },
-      }).limit(10).lean();
-
-      if (bookings.length === 0) return;
-      logger.info(`🚀 Startup scan: found ${bookings.length} unassigned bookings`);
-      for (const b of bookings) {
-        safeTrigger(b._id);
-        await new Promise((r) => setTimeout(r, 500));
-      }
-    } catch (e) {
-      logger.error(`Startup scan error: ${e.message}`);
-    }
-  }, 15000);
-}
-
-async function startPoller() {
+async function startBookingPoller() {
+  console.log('[Poller] Starting booking poller...');
   await startChangeStream();
-  startSafetyNet();
-  startupScan();
-  logger.info('✅ Booking poller started (change stream + safety-net + startup scan)');
+  safetyNetInterval = setInterval(runSafetyNet, SAFETY_NET_INTERVAL_MS);
+  console.log(`[Poller] ✅ Safety net every ${SAFETY_NET_INTERVAL_MS / 1000}s, stuck > ${SAFETY_NET_STUCK_MIN}min`);
 }
 
-async function stopPoller() {
-  isShuttingDown = true;
-  try {
-    if (changeStream) await changeStream.close();
-  } catch {}
-  try {
-    if (safetyNetCron) safetyNetCron.stop();
-  } catch {}
-  logger.info('🛑 Booking poller stopped');
+async function stopBookingPoller() {
+  if (changeStream) {
+    try { await changeStream.close(); } catch (e) {}
+    changeStream = null;
+  }
+  if (safetyNetInterval) {
+    clearInterval(safetyNetInterval);
+    safetyNetInterval = null;
+  }
+  console.log('[Poller] Stopped');
 }
+
+// Backward-compat aliases
+const startPoller = startBookingPoller;
+const stopPoller = stopBookingPoller;
+const startWatcher = startBookingPoller;
+const stopWatcher = stopBookingPoller;
 
 module.exports = {
+  startBookingPoller,
+  stopBookingPoller,
   startPoller,
   stopPoller,
-  start: startPoller,
-  stop: stopPoller,
-  startBookingPoller: startPoller,
-  stopBookingPoller: stopPoller,
+  startWatcher,
+  stopWatcher,
 };

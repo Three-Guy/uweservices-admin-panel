@@ -1,108 +1,114 @@
-// src/controllers/dispatch.controller.js
-const { getBookingModel } = require('../config/database');
-const { getDispatchJobModel } = require('../models/DispatchJob');
-const { getProviderOfferModel } = require('../models/ProviderOffer');
-const { dispatchBooking, manualReassign } = require('../services/dispatchService');
-const { findEligibleProviders } = require('../services/eligibilityService');
-const logger = require('../utils/logger');
-const mongoose = require('mongoose');
+// backend/src/controllers/dispatch.controller.js
+// ✅ All dispatch endpoints for admin panel
 
-exports.getDispatchStats = async (req, res) => {
+const mongoose = require('mongoose');
+const { getBookingModel } = require('../config/database');
+const DispatchJob = require('../models/DispatchJob');
+const ProviderOffer = require('../models/ProviderOffer');
+const {
+  dispatchBooking,
+  manualReassign,
+  manualAssignProvider,
+  clearCooldown,
+} = require('../services/dispatchService');
+const { findEligibleProviders, debugEligibility } = require('../services/eligibilityService');
+
+// ─── GET /admin/dispatch/stats ───
+exports.getStats = async (req, res) => {
   try {
     const Booking = getBookingModel();
-    const DispatchJob = getDispatchJobModel();
-    const Offer = getProviderOfferModel();
 
     const [
       searching,
-      noProvider,
-      confirmedNoProvider,
-      failed,
+      confirmedWaiting,
+      noProviderFound,
+      failedJobs,
       runningJobs,
-      totalOffers24h,
-      acceptedOffers24h,
-      rejectedOffers24h,
-      timeoutOffers24h,
     ] = await Promise.all([
       Booking.countDocuments({ status: 'searching', isDeleted: { $ne: true } }),
-      Booking.countDocuments({ status: 'no_provider_found', isDeleted: { $ne: true } }),
       Booking.countDocuments({
-        status: { $in: ['confirmed', 'pending'] },
-        $or: [{ providerId: null }, { providerId: { $exists: false } }, { providerId: '' }],
+        status: 'confirmed',
+        providerId: { $in: [null, undefined] },
         isDeleted: { $ne: true },
       }),
+      Booking.countDocuments({ status: 'no_provider_found', isDeleted: { $ne: true } }),
       DispatchJob.countDocuments({ status: 'failed' }),
       DispatchJob.countDocuments({ status: 'running' }),
-      Offer.countDocuments({ createdAt: { $gte: new Date(Date.now() - 86400000) } }),
-      Offer.countDocuments({
-        createdAt: { $gte: new Date(Date.now() - 86400000) },
-        status: 'accepted',
-      }),
-      Offer.countDocuments({
-        createdAt: { $gte: new Date(Date.now() - 86400000) },
-        status: 'rejected',
-      }),
-      Offer.countDocuments({
-        createdAt: { $gte: new Date(Date.now() - 86400000) },
-        status: 'timeout',
-      }),
     ]);
+
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const [totalOffers, accepted, rejected, timeout] = await Promise.all([
+      ProviderOffer.countDocuments({ createdAt: { $gte: since } }),
+      ProviderOffer.countDocuments({ createdAt: { $gte: since }, status: 'accepted' }),
+      ProviderOffer.countDocuments({ createdAt: { $gte: since }, status: 'rejected' }),
+      ProviderOffer.countDocuments({ createdAt: { $gte: since }, status: 'timeout' }),
+    ]);
+
+    const acceptanceRate = totalOffers > 0 ? Math.round((accepted / totalOffers) * 100) : 0;
 
     res.json({
       success: true,
       data: {
         liveState: {
           searching,
-          confirmedWaitingDispatch: confirmedNoProvider,
-          noProviderFound: noProvider,
-          failedJobs: failed,
+          confirmedWaitingDispatch: confirmedWaiting,
+          noProviderFound,
+          failedJobs,
           runningJobs,
         },
         last24h: {
-          totalOffers: totalOffers24h,
-          accepted: acceptedOffers24h,
-          rejected: rejectedOffers24h,
-          timeout: timeoutOffers24h,
-          acceptanceRate:
-            totalOffers24h > 0
-              ? Number(((acceptedOffers24h / totalOffers24h) * 100).toFixed(2))
-              : 0,
+          totalOffers,
+          accepted,
+          rejected,
+          timeout,
+          acceptanceRate,
         },
       },
     });
-  } catch (err) {
-    logger.error(`getDispatchStats: ${err.message}`);
-    res.status(500).json({ success: false, message: err.message });
+  } catch (e) {
+    console.error('[DispatchController] getStats error:', e.message);
+    res.status(500).json({ success: false, message: e.message });
   }
 };
 
+// ─── GET /admin/dispatch/active ───
 exports.getActiveDispatches = async (req, res) => {
   try {
-    const DispatchJob = getDispatchJobModel();
-    const jobs = await DispatchJob.find({ status: { $in: ['queued', 'running'] } })
+    const jobs = await DispatchJob.find({
+      status: { $in: ['running', 'queued'] },
+    })
       .sort({ startedAt: -1 })
-      .limit(100)
+      .limit(50)
       .lean();
+
     res.json({ success: true, data: { jobs } });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+  } catch (e) {
+    console.error('[DispatchController] getActiveDispatches error:', e.message);
+    res.status(500).json({ success: false, message: e.message });
   }
 };
 
+// ─── GET /admin/dispatch/no-provider-found ───
 exports.getNoProviderBookings = async (req, res) => {
   try {
     const Booking = getBookingModel();
-    const page = Number(req.query.page) || 1;
-    const limit = Math.min(Number(req.query.limit) || 20, 100);
+    const page = parseInt(req.query.page || '1', 10);
+    const limit = parseInt(req.query.limit || '20', 10);
     const skip = (page - 1) * limit;
 
     const [bookings, total] = await Promise.all([
-      Booking.find({ status: 'no_provider_found', isDeleted: { $ne: true } })
+      Booking.find({
+        status: 'no_provider_found',
+        isDeleted: { $ne: true },
+      })
         .sort({ updatedAt: -1 })
         .skip(skip)
         .limit(limit)
         .lean(),
-      Booking.countDocuments({ status: 'no_provider_found', isDeleted: { $ne: true } }),
+      Booking.countDocuments({
+        status: 'no_provider_found',
+        isDeleted: { $ne: true },
+      }),
     ]);
 
     res.json({
@@ -114,130 +120,203 @@ exports.getNoProviderBookings = async (req, res) => {
           limit,
           total,
           totalPages: Math.ceil(total / limit),
-          hasNext: skip + bookings.length < total,
+          hasNext: page * limit < total,
           hasPrev: page > 1,
         },
       },
     });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+  } catch (e) {
+    console.error('[DispatchController] getNoProviderBookings error:', e.message);
+    res.status(500).json({ success: false, message: e.message });
   }
 };
 
-exports.triggerDispatch = async (req, res) => {
+// ─── GET /admin/dispatch/unassigned ───
+// ALL bookings waiting for provider (confirmed + searching + no_provider_found)
+exports.getUnassignedBookings = async (req, res) => {
   try {
-    const { id } = req.params;
     const Booking = getBookingModel();
-    let booking;
-    if (mongoose.Types.ObjectId.isValid(id)) {
-      booking = await Booking.findById(id);
-    }
-    if (!booking) booking = await Booking.findOne({ bookingId: id });
-    if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
+    const page = parseInt(req.query.page || '1', 10);
+    const limit = parseInt(req.query.limit || '20', 10);
+    const skip = (page - 1) * limit;
 
-    dispatchBooking(booking.toObject ? booking.toObject() : booking).catch((e) =>
-      logger.error(`Trigger dispatch error: ${e.message}`)
-    );
+    const filter = {
+      status: { $in: ['confirmed', 'searching', 'no_provider_found'] },
+      providerId: { $in: [null, undefined] },
+      isDeleted: { $ne: true },
+    };
+
+    const [bookings, total] = await Promise.all([
+      Booking.find(filter)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Booking.countDocuments(filter),
+    ]);
 
     res.json({
       success: true,
-      message: 'Dispatch triggered',
-      data: { bookingId: booking.bookingId || String(booking._id) },
+      data: {
+        bookings,
+        pagination: {
+          page, limit, total,
+          totalPages: Math.ceil(total / limit),
+          hasNext: page * limit < total,
+          hasPrev: page > 1,
+        },
+      },
     });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+  } catch (e) {
+    console.error('[DispatchController] getUnassignedBookings error:', e.message);
+    res.status(500).json({ success: false, message: e.message });
   }
 };
 
-exports.reassignBooking = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { reason } = req.body;
-    const actorEmail = req.admin?.email || req.user?.email || 'admin';
-
-    const booking = await manualReassign(id, { reason, actorEmail });
-    res.json({
-      success: true,
-      message: 'Reassignment triggered',
-      data: { booking },
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-};
-
+// ─── GET /admin/dispatch/eligible-providers/:bookingId ───
 exports.getEligibleProviders = async (req, res) => {
   try {
-    const { id } = req.params;
-    const radiusKm = Number(req.query.radiusKm) || 12;
-    const Booking = getBookingModel();
-    let booking;
-    if (mongoose.Types.ObjectId.isValid(id)) booking = await Booking.findById(id).lean();
-    if (!booking) booking = await Booking.findOne({ bookingId: id }).lean();
-    if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
+    const { bookingId } = req.params;
+    const radiusKm = parseInt(req.query.radiusKm || '12', 10);
+    const strict = req.query.strict !== 'false';
 
-    const providers = await findEligibleProviders({ booking, radiusKm, limit: 50 });
-    // Sanitize
-    const sanitized = providers.map((p) => ({
-      _id: p._id,
-      providerId: p.providerId,
-      name: p.name,
-      phone: p.phone,
-      categoryName: p.categoryName || p.profession,
-      city: p.city,
+    const Booking = getBookingModel();
+    const booking = await Booking.findOne({
+      $or: [
+        { _id: mongoose.Types.ObjectId.isValid(bookingId) ? new mongoose.Types.ObjectId(bookingId) : null },
+        { bookingId: bookingId },
+      ],
+    }).lean();
+
+    if (!booking) {
+      return res.status(404).json({ success: false, message: 'Booking not found' });
+    }
+
+    const providers = await findEligibleProviders(booking, { radiusKm, strict, debug: false });
+
+    const bookingLat = booking.latitude ?? booking.customerLocation?.coordinates?.[1];
+    const bookingLng = booking.longitude ?? booking.customerLocation?.coordinates?.[0];
+
+    const formatted = providers.map((p) => ({
+      _id: String(p._id),
+      providerId: p.providerId || String(p._id),
+      name: p.name || 'Unknown',
+      phone: p.phone || '',
+      categoryName: p.categoryName || p.profession || '',
+      city: p.city || '',
       distanceKm: p._distanceKm,
-      rating: p.rating?.average || 0,
+      rating: typeof p.rating === 'object' ? (p.rating?.average || 0) : (p.rating || 0),
       completedJobs: p.completedJobs || 0,
-      isOnline: p.isOnline,
-      isAvailable: p.isAvailable,
+      isOnline: !!p.isOnline,
+      isAvailable: !!p.isAvailable,
+      isAcceptingJobs: !!p.isAcceptingJobs,
+      isBusy: !!p.isBusy,
       hasFcmToken: !!p.fcmToken,
     }));
-    res.json({ success: true, data: { providers: sanitized, count: sanitized.length } });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+
+    res.json({ success: true, data: { providers: formatted, count: formatted.length, bookingLat, bookingLng } });
+  } catch (e) {
+    console.error('[DispatchController] getEligibleProviders error:', e.message);
+    res.status(500).json({ success: false, message: e.message });
   }
 };
 
-exports.assignProviderManually = async (req, res) => {
+// ─── GET /admin/dispatch/eligible-providers-debug/:bookingId ───
+exports.getEligibleProvidersDebug = async (req, res) => {
   try {
-    const { id } = req.params;
-    const { providerId } = req.body;
-    if (!providerId) return res.status(400).json({ success: false, message: 'providerId required' });
-
+    const { bookingId } = req.params;
     const Booking = getBookingModel();
-    const { getProviderConnection } = require('../config/database');
-    const providersCol = getProviderConnection().collection('providers');
-
-    const providerFilter = { $or: [{ providerId: String(providerId) }] };
-    if (mongoose.Types.ObjectId.isValid(providerId)) {
-      providerFilter.$or.push({ _id: new mongoose.Types.ObjectId(String(providerId)) });
-    }
-    const provider = await providersCol.findOne(providerFilter);
-    if (!provider) return res.status(404).json({ success: false, message: 'Provider not found' });
-
-    let booking;
-    if (mongoose.Types.ObjectId.isValid(id)) booking = await Booking.findById(id);
-    if (!booking) booking = await Booking.findOne({ bookingId: id });
+    const booking = await Booking.findOne({
+      $or: [
+        { _id: mongoose.Types.ObjectId.isValid(bookingId) ? new mongoose.Types.ObjectId(bookingId) : null },
+        { bookingId: bookingId },
+      ],
+    }).lean();
     if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
 
-    const actorEmail = req.admin?.email || req.user?.email || 'admin';
-    booking.providerId = String(provider.providerId || provider._id);
-    booking.providerName = provider.name;
-    booking.providerPhone = provider.phone;
-    booking.status = 'assigned';
-    booking.assignedAt = new Date();
-    booking.assignmentMethod = 'admin-manual';
-    booking.statusHistory = booking.statusHistory || [];
-    booking.statusHistory.push({
-      status: 'assigned',
-      changedAt: new Date(),
-      changedBy: actorEmail,
-      reason: 'Manual admin assignment',
-    });
-    await booking.save();
+    const debug = await debugEligibility(booking);
+    res.json({ success: true, data: debug });
+  } catch (e) {
+    console.error('[DispatchController] debug error:', e.message);
+    res.status(500).json({ success: false, message: e.message });
+  }
+};
 
-    res.json({ success: true, message: 'Provider assigned manually', data: { booking } });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+// ─── POST /admin/dispatch/trigger/:bookingId ───
+exports.triggerDispatch = async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    clearCooldown(bookingId);
+    // Fire-and-forget
+    setImmediate(() => {
+      dispatchBooking(bookingId, { manual: true }).catch((e) => {
+        console.error('[Trigger] error:', e.message);
+      });
+    });
+    res.json({ success: true, message: 'Dispatch triggered' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+};
+
+// ─── POST /admin/dispatch/reassign/:bookingId ───
+exports.reassignBooking = async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const { reason } = req.body || {};
+    const result = await manualReassign(bookingId, reason);
+    if (!result.success) {
+      return res.status(400).json({ success: false, message: result.error });
+    }
+
+    // Fetch updated booking to return
+    const Booking = getBookingModel();
+    const booking = await Booking.findOne({ bookingId: result.bookingId }).lean();
+    res.json({ success: true, data: { booking }, message: 'Reassignment triggered' });
+  } catch (e) {
+    console.error('[DispatchController] reassign error:', e.message);
+    res.status(500).json({ success: false, message: e.message });
+  }
+};
+
+// ─── POST /admin/dispatch/auto-redispatch/:bookingId ───
+// Simpler alias for reassign — admin-friendly label
+exports.autoRedispatch = async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const result = await manualReassign(bookingId, 'Admin auto-redispatch');
+    if (!result.success) {
+      return res.status(400).json({ success: false, message: result.error });
+    }
+    const Booking = getBookingModel();
+    const booking = await Booking.findOne({ bookingId: result.bookingId }).lean();
+    res.json({ success: true, data: { booking }, message: 'Auto-redispatch triggered' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+};
+
+// ─── POST /admin/dispatch/assign-manual/:bookingId ───
+exports.assignProviderManually = async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const { providerId } = req.body || {};
+    if (!providerId) return res.status(400).json({ success: false, message: 'providerId required' });
+
+    const result = await manualAssignProvider(bookingId, providerId);
+    if (!result.success) return res.status(400).json({ success: false, message: result.error });
+
+    const Booking = getBookingModel();
+    const booking = await Booking.findOne({
+      $or: [
+        { _id: mongoose.Types.ObjectId.isValid(bookingId) ? new mongoose.Types.ObjectId(bookingId) : null },
+        { bookingId: bookingId },
+      ],
+    }).lean();
+
+    res.json({ success: true, data: { booking }, message: `Assigned to ${result.provider.name}` });
+  } catch (e) {
+    console.error('[DispatchController] assignManual error:', e.message);
+    res.status(500).json({ success: false, message: e.message });
   }
 };

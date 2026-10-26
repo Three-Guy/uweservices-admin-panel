@@ -1,17 +1,22 @@
-// src/routes/dispatch.routes.js
+// backend/src/routes/dispatch.routes.js
 const express = require('express');
 const router = express.Router();
-const authMiddleware = require('../middleware/authMiddleware');
 const ctrl = require('../controllers/dispatch.controller');
 
-router.use(authMiddleware);
-
-router.get('/stats', ctrl.getDispatchStats);
+// Stats + listing
+router.get('/stats', ctrl.getStats);
 router.get('/active', ctrl.getActiveDispatches);
 router.get('/no-provider-found', ctrl.getNoProviderBookings);
-router.get('/eligible-providers/:id', ctrl.getEligibleProviders);
-router.post('/trigger/:id', ctrl.triggerDispatch);
-router.post('/reassign/:id', ctrl.reassignBooking);
-router.post('/assign-manual/:id', ctrl.assignProviderManually);
+router.get('/unassigned', ctrl.getUnassignedBookings);
+
+// Eligibility
+router.get('/eligible-providers/:bookingId', ctrl.getEligibleProviders);
+router.get('/eligible-providers-debug/:bookingId', ctrl.getEligibleProvidersDebug);
+
+// Actions
+router.post('/trigger/:bookingId', ctrl.triggerDispatch);
+router.post('/reassign/:bookingId', ctrl.reassignBooking);
+router.post('/auto-redispatch/:bookingId', ctrl.autoRedispatch);
+router.post('/assign-manual/:bookingId', ctrl.assignProviderManually);
 
 module.exports = router;
