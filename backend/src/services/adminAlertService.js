@@ -139,13 +139,26 @@ async function createAdminAlert(optionsOrType, titleOrUndefined, messageOrUndefi
           for (const t of activeTokens) {
             try {
               const token = t.fcmToken || t.token;
-              if (!token) continue;
-              await sendAdminFcmNotification(token, {
+              if (!token || typeof token !== 'string') continue;
+
+              // ✅✅✅ FIXED: Pass title, body, data as SEPARATE arguments
+              // Function signature: sendAdminFcmNotification(token, title, body, data)
+              const result = await sendAdminFcmNotification(
+                token,
                 title,
-                body: message,
-                data: { type, bookingId: bookingId || '' },
-              });
-              console.log(`✅ [AdminAlert] FCM sent to ${token.substring(0, 20)}...`);
+                message,
+                {
+                  type: type,
+                  bookingId: bookingId ? String(bookingId) : '',
+                  actionUrl: bookingId ? `/bookings?open=${bookingId}` : '/',
+                }
+              );
+
+              if (result && result.success) {
+                console.log(`✅ [AdminAlert] FCM sent to ${token.substring(0, 20)}...`);
+              } else {
+                console.error(`❌ [AdminAlert] FCM failed: ${result ? result.error : 'unknown'}`);
+              }
             } catch (fcmErr) {
               console.error(`❌ [AdminAlert] FCM error:`, fcmErr.message);
             }

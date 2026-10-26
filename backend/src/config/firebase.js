@@ -179,7 +179,6 @@ function initializeFirebase() {
 function isAdminWebFirebaseReady() { return !!adminWebApp; }
 function isProviderFirebaseReady() { return !!providerApp; }
 
-// ✅ NEW: Helpers to get messaging instances (used by fcmService.js)
 function getAdminWebMessaging() {
   if (!adminWebApp) return null;
   try {
@@ -200,37 +199,147 @@ function getProviderMessaging() {
   }
 }
 
+/**
+ * ✅ Send FCM notification to admin web client
+ * 
+ * SIGNATURE: sendAdminFcmNotification(token, title, body, data)
+ * 
+ * Includes:
+ *   - notification: shows in system tray on mobile + desktop
+ *   - webpush: customizes browser notification appearance
+ *   - android: high priority for immediate delivery on Android
+ *   - apns: high priority for immediate delivery on iOS
+ *   - data: custom payload for SW handling
+ */
 async function sendAdminFcmNotification(token, title, body, data = {}) {
-  if (!adminWebApp) return { success: false, error: 'Admin Firebase not initialized' };
+  if (!adminWebApp) {
+    console.error('❌ [FCM] Admin Firebase not initialized');
+    return { success: false, error: 'Admin Firebase not initialized' };
+  }
   if (!token || typeof token !== 'string') {
+    console.error('❌ [FCM] Invalid token:', typeof token);
     return { success: false, error: 'Invalid token (must be string)' };
   }
+
+  // Ensure title and body are strings (NOT objects!)
+  const safeTitle = typeof title === 'string' ? title : String(title || 'UWE Admin');
+  const safeBody = typeof body === 'string' ? body : String(body || 'New notification');
+
+  // Ensure all data values are strings (FCM requirement)
+  const safeData = {};
+  if (data && typeof data === 'object') {
+    for (const [k, v] of Object.entries(data)) {
+      safeData[k] = String(v == null ? '' : v);
+    }
+  }
+
   try {
     const messaging = getAdminWebMessaging();
-    if (!messaging) return { success: false, error: 'Admin messaging unavailable' };
+    if (!messaging) {
+      console.error('❌ [FCM] Admin messaging unavailable');
+      return { success: false, error: 'Admin messaging unavailable' };
+    }
 
     const message = {
       token,
-      notification: { title, body },
-      data: Object.fromEntries(
-        Object.entries(data || {}).map(([k, v]) => [k, String(v == null ? '' : v)])
-      ),
+
+      // ✅ notification field — triggers system tray on mobile + desktop
+      notification: {
+        title: safeTitle,
+        body: safeBody,
+        icon: '/favicon.ico',
+      },
+
+      // ✅ data field — for custom handling in SW
+      data: safeData,
+
+      // ✅ webpush — browser-specific notification customization
       webpush: {
+        headers: {
+          Urgency: 'high',
+          TTL: '86400',
+        },
         notification: {
           icon: '/favicon.ico',
           badge: '/favicon.ico',
-          tag: (data && data.bookingId) || data.type || 'admin-alert',
+          tag: safeData.bookingId || safeData.type || 'admin-alert',
           requireInteraction: true,
+          renotify: true,
+          silent: false,
+          vibrate: [200, 100, 200],
+          actions: [
+            { action: 'view', title: 'View Booking' },
+            { action: 'dismiss', title: 'Dismiss' },
+          ],
         },
         fcmOptions: {
-          link: (data && data.actionUrl) || '/',
+          link: safeData.actionUrl || '/',
+        },
+      },
+
+      // ✅ android — high priority for immediate delivery
+      android: {
+        priority: 'high',
+        ttl: 86400,
+        notification: {
+          title: safeTitle,
+          body: safeBody,
+          icon: 'ic_notification',
+          color: '#1e40af',
+          sound: 'default',
+          clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+          channelId: 'admin_bookings',
+          priority: 'max',
+          defaultSound: true,
+          defaultVibrateTimings: true,
+        },
+      },
+
+      // ✅ apns — high priority for iOS
+      apns: {
+        headers: {
+          'apns-priority': '10',
+          'apns-push-type': 'alert',
+        },
+        payload: {
+          aps: {
+            alert: {
+              title: safeTitle,
+              body: safeBody,
+            },
+            sound: 'default',
+            badge: 1,
+            contentAvailable: true,
+            mutableContent: true,
+          },
         },
       },
     };
+
+    console.log(`📱 [FCM] Sending to ${token.substring(0, 20)}... title: "${safeTitle}"`);
     const response = await messaging.send(message);
+    console.log(`✅ [FCM] Sent successfully: ${response}`);
     return { success: true, messageId: response };
   } catch (e) {
-    console.error('❌ Admin FCM send failed:', e.message);
+    console.error(`❌ [FCM] Send failed for ${token.substring(0, 20)}...:`, e.message);
+    console.error(`   Error code: ${e.code || 'unknown'}`);
+
+    // If token is invalid, mark it for cleanup
+    if (e.code === 'messaging/invalid-registration-token' ||
+        e.code === 'messaging/registration-token-not-registered') {
+      console.warn(`⚠️ [FCM] Token is invalid, should be removed from DB`);
+      try {
+        const AdminFcmToken = require('../models/AdminFcmToken');
+        await AdminFcmToken.findOneAndUpdate(
+          { fcmToken: token },
+          { isActive: false, lastError: e.message, lastErrorAt: new Date() }
+        );
+        console.log(`✅ [FCM] Invalid token deactivated in DB`);
+      } catch (cleanupErr) {
+        console.error(`❌ [FCM] Token cleanup failed:`, cleanupErr.message);
+      }
+    }
+
     return { success: false, error: e.code || e.message };
   }
 }
@@ -240,17 +349,46 @@ async function sendProviderFcmNotification(token, title, body, data = {}) {
   if (!token || typeof token !== 'string') {
     return { success: false, error: 'Invalid token (must be string)' };
   }
+
+  const safeTitle = typeof title === 'string' ? title : String(title || 'UWE Provider');
+  const safeBody = typeof body === 'string' ? body : String(body || 'New notification');
+  const safeData = {};
+  if (data && typeof data === 'object') {
+    for (const [k, v] of Object.entries(data)) {
+      safeData[k] = String(v == null ? '' : v);
+    }
+  }
+
   try {
     const messaging = getProviderMessaging();
     if (!messaging) return { success: false, error: 'Provider messaging unavailable' };
 
     const message = {
       token,
-      notification: { title, body },
-      data: Object.fromEntries(
-        Object.entries(data || {}).map(([k, v]) => [k, String(v == null ? '' : v)])
-      ),
+      notification: { title: safeTitle, body: safeBody },
+      data: safeData,
+      android: {
+        priority: 'high',
+        notification: {
+          title: safeTitle,
+          body: safeBody,
+          sound: 'default',
+          channelId: 'provider_bookings',
+          priority: 'max',
+        },
+      },
+      apns: {
+        headers: { 'apns-priority': '10' },
+        payload: {
+          aps: {
+            alert: { title: safeTitle, body: safeBody },
+            sound: 'default',
+            badge: 1,
+          },
+        },
+      },
     };
+
     const response = await messaging.send(message);
     return { success: true, messageId: response };
   } catch (e) {
@@ -267,7 +405,6 @@ module.exports = {
   sendProviderFcmNotification,
   getAdminApp: () => adminWebApp,
   getProviderApp: () => providerApp,
-  // ✅ NEW exports — now fcmService.js can import these
   getAdminWebMessaging,
   getProviderMessaging,
 };
