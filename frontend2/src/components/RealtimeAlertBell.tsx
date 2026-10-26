@@ -160,19 +160,17 @@ function playAlertSound() {
 }
 
 /* ══════════════════════════════════════════════════════════════════
-   ✅ SHOW SYSTEM NOTIFICATION (PC + Mobile notification bar)
-   Uses Service Worker so it appears even when tab is minimized/closed
+   ✅ SHOW SYSTEM NOTIFICATION (PC notification bar + Mobile)
+   Uses Service Worker so it works even when tab is hidden/minimized
    ══════════════════════════════════════════════════════════════════ */
 async function showSystemNotification(n: AdminNotification): Promise<void> {
   console.log('[Bell] 🔔 Attempting system notification:', n.title);
 
-  // 1. Check support
   if (typeof window === 'undefined' || !('Notification' in window)) {
     console.warn('[Bell] ❌ Notifications not supported');
     return;
   }
 
-  // 2. Check permission
   if (Notification.permission !== 'granted') {
     console.warn('[Bell] ❌ Permission not granted:', Notification.permission);
     return;
@@ -184,7 +182,7 @@ async function showSystemNotification(n: AdminNotification): Promise<void> {
     icon: '/favicon.ico',
     badge: '/favicon.ico',
     tag: `${n.type}-${n.bookingId || n._id}`,
-    requireInteraction: true, // ✅ Stays until user clicks
+    requireInteraction: true,
     silent: false,
     data: {
       bookingId: n.bookingId,
@@ -193,11 +191,10 @@ async function showSystemNotification(n: AdminNotification): Promise<void> {
     },
   };
 
-  // Add vibration (mobile)
   (options as any).vibrate = [200, 100, 200];
   (options as any).renotify = true;
 
-  // 3. Try Service Worker first (works when tab hidden/minimized)
+  // Try Service Worker first (works when tab hidden)
   try {
     if ('serviceWorker' in navigator) {
       const reg = await navigator.serviceWorker.getRegistration('/firebase-messaging-sw.js') ||
@@ -212,7 +209,7 @@ async function showSystemNotification(n: AdminNotification): Promise<void> {
     console.warn('[Bell] ⚠️ SW notification failed, trying direct:', err?.message);
   }
 
-  // 4. Fallback: direct Notification constructor (only works when tab visible)
+  // Fallback: direct Notification constructor
   try {
     const notif = new Notification(title, options);
     notif.onclick = () => {
@@ -347,12 +344,11 @@ const RealtimeAlertBell: React.FC = () => {
       setPermStatus(result);
 
       if (result === 'granted') {
-        // ✅ Show test system notification
         try {
           await showSystemNotification({
             _id: 'test-' + Date.now(),
             title: 'Notifications Enabled!',
-            message: 'You will now get alerts for new bookings.',
+            message: 'You will now receive alerts in your notification bar.',
             type: 'new_booking',
             isRead: false,
             createdAt: new Date().toISOString(),
@@ -441,7 +437,7 @@ const RealtimeAlertBell: React.FC = () => {
       addToast(n);
       playAlertSound();
 
-      // ✅ ALWAYS show system notification (regardless of tab visibility)
+      // ✅ ALWAYS show system notification (works even when tab hidden/minimized)
       showSystemNotification(n).catch((err) => {
         console.error('[Bell] System notification error:', err);
       });
@@ -461,13 +457,11 @@ const RealtimeAlertBell: React.FC = () => {
       return;
     }
 
-    // Primary admin notification listener
     const onNotification = (data: any) => {
       console.log('[Bell] 📬 admin:notification received:', data);
       pushNotification(data);
     };
 
-    // Direct booking event listeners
     const onNewBooking = (data: any) => {
       console.log('[Bell] 🆕 new booking event received:', data);
       pushNotification({

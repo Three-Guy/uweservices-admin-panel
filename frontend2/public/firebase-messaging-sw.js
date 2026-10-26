@@ -1,5 +1,5 @@
 // frontend2/public/firebase-messaging-sw.js
-// ✅ Firebase Cloud Messaging Service Worker — SHOWS SYSTEM NOTIFICATIONS
+// ✅ Firebase Cloud Messaging Service Worker — SHOWS SYSTEM NOTIFICATION BAR
 
 /* eslint-disable no-undef */
 
@@ -19,7 +19,6 @@ const messaging = firebase.messaging();
 
 /**
  * ✅ Background message handler — ALWAYS show system notification
- * Does NOT skip when `notification` field is present (Chrome doesn't auto-show reliably)
  */
 messaging.onBackgroundMessage((payload) => {
   console.log('[SW] 📩 Background message received:', payload);
@@ -36,10 +35,10 @@ messaging.onBackgroundMessage((payload) => {
     badge: '/favicon.ico',
     image: notif.image || data.image || undefined,
     tag: data.bookingId || data.type || `admin-alert-${Date.now()}`,
-    requireInteraction: true,     // ✅ Stays until user clicks
-    renotify: true,               // ✅ Alert even if same tag
-    silent: false,                // ✅ Play sound
-    vibrate: [200, 100, 200],     // ✅ Vibrate on mobile
+    requireInteraction: true,
+    renotify: true,
+    silent: false,
+    vibrate: [200, 100, 200],
     timestamp: Date.now(),
     data: {
       ...data,
@@ -51,12 +50,12 @@ messaging.onBackgroundMessage((payload) => {
     ],
   };
 
-  console.log('[SW] 🔔 Showing notification:', title, options);
+  console.log('[SW] 🔔 Showing notification:', title);
   return self.registration.showNotification(title, options);
 });
 
 /**
- * ✅ Push event — fallback for raw web push (not FCM-wrapped)
+ * ✅ Raw push event — fallback for web push not wrapped by FCM
  */
 self.addEventListener('push', (event) => {
   console.log('[SW] 📬 Raw push event received');
@@ -71,9 +70,9 @@ self.addEventListener('push', (event) => {
     payload = event.data.json();
   } catch (e) {
     try {
-      payload = { notification: { title: 'Notification', body: event.data.text() } };
+      payload = { notification: { title: 'UWE Admin', body: event.data.text() } };
     } catch (e2) {
-      payload = { notification: { title: 'Notification', body: 'New alert' } };
+      payload = { notification: { title: 'UWE Admin', body: 'New alert' } };
     }
   }
 
@@ -149,11 +148,11 @@ self.addEventListener('notificationclick', (event) => {
 });
 
 self.addEventListener('install', () => {
-  console.log('[SW] 🔧 Installing v2');
+  console.log('[SW] 🔧 Installing v3');
   self.skipWaiting();
 });
 
 self.addEventListener('activate', (event) => {
-  console.log('[SW] ✅ Activated v2');
+  console.log('[SW] ✅ Activated v3');
   event.waitUntil(clients.claim());
 });
