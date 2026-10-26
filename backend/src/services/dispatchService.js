@@ -5,10 +5,12 @@ const { getProviderOfferModel } = require('../models/ProviderOffer');
 const { getDispatchJobModel } = require('../models/DispatchJob');
 const { findEligibleProviders } = require('./eligibilityService');
 const { sendBookingOfferToProvider, sendCancellationToProvider } = require('./fcmService');
-const { createAdminAlert, emitLive } = require('./adminAlertService');
+const { createAdminAlert } = require('./adminAlertService');
 const logger = require('../utils/logger');
-// ✅ ADD THIS AT TOP (with other requires)
-const { emitLive } = require('./liveEmitter');
+
+// ✅ Centralized live emitter (Socket.IO)
+const liveEmitter = require('./liveEmitter');
+
 // ─── Config ───
 const CFG = {
   radiusProgression: (process.env.DISPATCH_RADIUS_PROGRESSION || '5,8,12')
@@ -161,7 +163,7 @@ async function dispatchBatch({ booking, providers, batchNumber, radiusKm, cycle,
         },
       });
 
-      emitLive('dispatch:offer_sent', {
+      liveEmitter.emitLive('dispatch:offer_sent', {
         bookingId: booking.bookingId || String(booking._id),
         providerId: providerIdStr,
         providerName: p.name,
@@ -281,7 +283,7 @@ async function dispatchBooking(booking) {
 
     await supersedeOldOffers(booking._id);
 
-    emitLive('dispatch:started', {
+    liveEmitter.emitLive('dispatch:started', {
       bookingId: booking.bookingId || bookingIdKey,
       cycle: dispatchJob.cycle,
       isScheduled,
@@ -332,7 +334,7 @@ async function dispatchBooking(booking) {
           dispatchJob.status = 'cancelled';
           dispatchJob.completedAt = new Date();
           await dispatchJob.save();
-          emitLive('dispatch:cancelled', { bookingId: booking.bookingId || bookingIdKey });
+          liveEmitter.emitLive('dispatch:cancelled', { bookingId: booking.bookingId || bookingIdKey });
           return { ok: true, result: 'cancelled' };
         }
 
@@ -342,7 +344,7 @@ async function dispatchBooking(booking) {
           dispatchJob.assignedProviderId = String(result.providerId);
           await dispatchJob.save();
 
-          emitLive('dispatch:assigned', {
+          liveEmitter.emitLive('dispatch:assigned', {
             bookingId: booking.bookingId || bookingIdKey,
             providerId: result.providerId,
           });
@@ -384,7 +386,7 @@ async function dispatchBooking(booking) {
     // Mark cooldown so safety-net doesn't instantly retry
     markFailed(bookingIdKey);
 
-    emitLive('dispatch:no_provider_found', {
+    liveEmitter.emitLive('dispatch:no_provider_found', {
       bookingId: booking.bookingId || bookingIdKey,
       triedCount: triedThisDispatch.size,
     });

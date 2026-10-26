@@ -1,259 +1,193 @@
 // backend/src/config/firebase.js
 const admin = require('firebase-admin');
-const path = require('path');
-const fs = require('fs');
-const logger = require('../utils/logger');
 
-let providerFirebaseApp = null;
-let adminWebFirebaseApp = null;
+let adminWebApp = null;
+let providerApp = null;
 
-/**
- * Load service account credentials
- * Priority: Base64 env > Raw JSON env > File path
- */
-function loadServiceAccount(type) {
-  const prefix = type === 'provider' ? 'PROVIDER_FIREBASE' : 'ADMIN_FIREBASE';
-  const fileName = type === 'provider'
-    ? 'serviceproviderapp-firebase-adminsdk.json'
-    : 'uwe-services-web-firebase-adminsdk.json';
-
-  // ── Method 1: Base64 encoded env var (RECOMMENDED for Render) ──
-  const base64Env = process.env[`${prefix}_SERVICE_ACCOUNT_BASE64`];
-  if (base64Env) {
-    try {
-      const decoded = Buffer.from(base64Env, 'base64').toString('utf-8');
-      const parsed = JSON.parse(decoded);
-      logger.info(`✅ ${type} Firebase credentials loaded from ${prefix}_SERVICE_ACCOUNT_BASE64`);
-      return parsed;
-    } catch (err) {
-      logger.error(`❌ Failed to parse ${prefix}_SERVICE_ACCOUNT_BASE64: ${err.message}`);
-    }
-  }
-
-  // ── Method 2: Raw JSON string env var ──
-  const jsonEnv = process.env[`${prefix}_SERVICE_ACCOUNT`];
-  if (jsonEnv) {
-    try {
-      const parsed = JSON.parse(jsonEnv);
-      logger.info(`✅ ${type} Firebase credentials loaded from ${prefix}_SERVICE_ACCOUNT`);
-      return parsed;
-    } catch (err) {
-      logger.error(`❌ Failed to parse ${prefix}_SERVICE_ACCOUNT: ${err.message}`);
-    }
-  }
-
-  // ── Method 3: File path (local development only) ──
-  const filePath = path.join(__dirname, fileName);
-  if (fs.existsSync(filePath)) {
-    try {
-      const content = fs.readFileSync(filePath, 'utf-8');
-      const parsed = JSON.parse(content);
-      logger.info(`✅ ${type} Firebase credentials loaded from file: ${fileName}`);
-      return parsed;
-    } catch (err) {
-      logger.error(`❌ Failed to read ${fileName}: ${err.message}`);
-    }
-  }
-
-  return null;
-}
-
-/**
- * Initialize both Firebase apps
- */
-function initializeFirebase() {
-  // ── Initialize Admin Web Firebase (for admin panel push) ──
-  if (!adminWebFirebaseApp) {
-    const adminServiceAccount = loadServiceAccount('admin');
-
-    if (adminServiceAccount) {
-      try {
-        adminWebFirebaseApp = admin.initializeApp(
-          { credential: admin.credential.cert(adminServiceAccount) },
-          'admin-web'
-        );
-        logger.info(`🔥 Admin Web Firebase initialized: ${adminServiceAccount.project_id}`);
-      } catch (err) {
-        if (err.code === 'app/duplicate-app') {
-          adminWebFirebaseApp = admin.app('admin-web');
-          logger.info('🔥 Admin Web Firebase (reusing existing app)');
-        } else {
-          logger.error(`❌ Admin Web Firebase init failed: ${err.message}`);
-        }
-      }
-    } else {
-      logger.warn('⚠️  No Admin Web Firebase credentials found (file or env). Admin FCM disabled.');
-      logger.warn('   Set ADMIN_FIREBASE_SERVICE_ACCOUNT_BASE64 env var on Render to enable.');
-    }
-  }
-
-  // ── Initialize Provider Firebase (for sending to providers — optional) ──
-  if (!providerFirebaseApp) {
-    const providerServiceAccount = loadServiceAccount('provider');
-
-    if (providerServiceAccount) {
-      try {
-        providerFirebaseApp = admin.initializeApp(
-          { credential: admin.credential.cert(providerServiceAccount) },
-          'provider'
-        );
-        logger.info(`🔥 Provider Firebase initialized: ${providerServiceAccount.project_id}`);
-      } catch (err) {
-        if (err.code === 'app/duplicate-app') {
-          providerFirebaseApp = admin.app('provider');
-          logger.info('🔥 Provider Firebase (reusing existing app)');
-        } else {
-          logger.error(`❌ Provider Firebase init failed: ${err.message}`);
-        }
-      }
-    } else {
-      logger.warn('⚠️  No Provider Firebase credentials found (file or env). Provider FCM disabled.');
-    }
-  }
-
-  return { adminWebFirebaseApp, providerFirebaseApp };
-}
-
-/**
- * Check if Admin Web Firebase is ready
- */
-function isAdminWebFirebaseReady() {
-  return adminWebFirebaseApp !== null;
-}
-
-/**
- * Check if Provider Firebase is ready
- */
-function isProviderFirebaseReady() {
-  return providerFirebaseApp !== null;
-}
-
-/**
- * Get Admin Web Firebase app
- */
-function getAdminWebFirebase() {
-  if (!adminWebFirebaseApp) {
-    initializeFirebase();
-  }
-  return adminWebFirebaseApp;
-}
-
-/**
- * Get Provider Firebase app
- */
-function getProviderFirebase() {
-  if (!providerFirebaseApp) {
-    initializeFirebase();
-  }
-  return providerFirebaseApp;
-}
-
-/**
- * Send FCM push notification to admin browsers
- * 
- * @param {string[]} tokens - Array of FCM tokens
- * @param {string} title - Notification title
- * @param {string} body - Notification body
- * @param {object} data - Custom data payload
- * @returns {Promise<{success: number, failed: number, invalidTokens: string[]}>}
- */
-async function sendAdminFcmNotification(tokens, title, body, data = {}) {
-  if (!adminWebFirebaseApp) {
-    logger.warn('⚠️  Admin Web Firebase not initialized — skipping push');
-    return { success: 0, failed: 0, invalidTokens: [], reason: 'not_initialized' };
-  }
-
-  if (!tokens || tokens.length === 0) {
-    return { success: 0, failed: 0, invalidTokens: [], reason: 'no_tokens' };
-  }
-
-  const results = { success: 0, failed: 0, invalidTokens: [] };
-
-  // Convert data values to strings (FCM requirement)
-  const stringData = {};
-  for (const [key, value] of Object.entries(data)) {
-    stringData[key] = String(value || '');
-  }
-
-  // Send to each token individually for better error tracking
-  for (const token of tokens) {
-    try {
-      const message = {
-        token,
-        notification: { title, body },
-        data: {
-          ...stringData,
-          click_action: '/dispatch',
-          timestamp: new Date().toISOString(),
-        },
-        webpush: {
-          notification: {
-            icon: '/vite.svg',
-            badge: '/vite.svg',
-            tag: stringData.type || 'admin-alert',
-            requireInteraction: true,
-            vibrate: [200, 100, 200],
-          },
-          fcmOptions: {
-            link: '/dispatch',
-          },
-        },
-      };
-
-      await adminWebFirebaseApp.messaging().send(message);
-      results.success++;
-    } catch (err) {
-      results.failed++;
-
-      // Mark invalid tokens for cleanup
-      if (
-        err.code === 'messaging/registration-token-not-registered' ||
-        err.code === 'messaging/invalid-argument' ||
-        err.code === 'messaging/invalid-registration-token'
-      ) {
-        results.invalidTokens.push(token);
-      }
-
-      logger.warn(`FCM send failed [${token.substring(0, 15)}...]: ${err.code || err.message}`);
-    }
-  }
-
-  logger.info(`📤 FCM Push Result: ${results.success} sent, ${results.failed} failed, ${results.invalidTokens.length} invalid`);
-  return results;
-}
-
-/**
- * Send FCM to provider (uses provider Firebase project)
- */
-async function sendProviderFcmNotification(token, title, body, data = {}) {
-  if (!providerFirebaseApp) {
-    return { success: false, reason: 'not_initialized' };
-  }
-
+function parseServiceAccount(raw) {
+  if (!raw) return null;
   try {
-    const stringData = {};
-    for (const [key, value] of Object.entries(data)) {
-      stringData[key] = String(value || '');
-    }
+    // If already an object, return it
+    if (typeof raw === 'object') return raw;
+    // Try parsing as JSON string
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.type === 'service_account') return parsed;
+    // Maybe it's a JSON string wrapped in quotes
+    if (typeof parsed === 'string') return JSON.parse(parsed);
+    return parsed;
+  } catch (e) {
+    console.error('❌ Failed to parse service account JSON:', e.message);
+    return null;
+  }
+}
 
+function decodeBase64ServiceAccount(base64Str) {
+  if (!base64Str) return null;
+  try {
+    const cleaned = base64Str.replace(/\s+/g, '').trim();
+    const jsonStr = Buffer.from(cleaned, 'base64').toString('utf8');
+    return parseServiceAccount(jsonStr);
+  } catch (e) {
+    console.error('❌ Failed to decode base64 service account:', e.message);
+    return null;
+  }
+}
+
+function loadServiceAccountFromEnv(envKey) {
+  const raw = process.env[envKey];
+  if (!raw) return null;
+
+  // Check if it looks like base64 (no curly braces)
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith('{')) {
+    console.info(`✅ Loading Firebase credentials from ${envKey} (base64)`);
+    return decodeBase64ServiceAccount(trimmed);
+  }
+
+  // Otherwise treat as raw JSON
+  console.info(`✅ Loading Firebase credentials from ${envKey} (raw JSON)`);
+  return parseServiceAccount(trimmed);
+}
+
+function loadServiceAccountFromFile(filePath) {
+  try {
+    const path = require('path');
+    const fs = require('fs');
+    const fullPath = path.resolve(__dirname, filePath);
+    if (!fs.existsSync(fullPath)) return null;
+    const raw = fs.readFileSync(fullPath, 'utf8');
+    console.info(`✅ Loading Firebase credentials from file: ${filePath}`);
+    return parseServiceAccount(raw);
+  } catch (e) {
+    console.error(`❌ Failed to load Firebase file ${filePath}:`, e.message);
+    return null;
+  }
+}
+
+function initializeFirebase() {
+  // ─── ADMIN WEB FIREBASE (uwe-services-web) ───
+  let adminServiceAccount =
+    loadServiceAccountFromEnv('ADMIN_FIREBASE_SERVICE_ACCOUNT_BASE64') ||
+    loadServiceAccountFromEnv('ADMIN_FIREBASE_SERVICE_ACCOUNT_JSON') ||
+    loadServiceAccountFromFile('../uwe-services-web-firebase-adminsdk.json') ||
+    loadServiceAccountFromFile('./uwe-services-web-firebase-adminsdk.json');
+
+  if (adminServiceAccount && adminServiceAccount.project_id) {
+    try {
+      // Make sure firebase-admin credential module is available
+      if (!admin.credential || typeof admin.credential.cert !== 'function') {
+        console.error('❌ firebase-admin credential.cert is not available. Check firebase-admin installation.');
+        console.error('   admin keys:', Object.keys(admin));
+      } else {
+        adminWebApp = admin.initializeApp(
+          {
+            credential: admin.credential.cert(adminServiceAccount),
+          },
+          'adminWeb'
+        );
+        console.info(`✅ Admin Web Firebase initialized (project: ${adminServiceAccount.project_id})`);
+      }
+    } catch (e) {
+      if (e.code === 'app/duplicate-app') {
+        adminWebApp = admin.app('adminWeb');
+        console.info('✅ Admin Web Firebase already initialized');
+      } else {
+        console.error('❌ Admin Web Firebase init failed:', e.message);
+      }
+    }
+  } else {
+    console.warn('⚠️  No Admin Web Firebase credentials found. Admin FCM disabled.');
+    if (adminServiceAccount) {
+      console.warn('   Credentials loaded but missing project_id. Keys:', Object.keys(adminServiceAccount));
+    }
+  }
+
+  // ─── PROVIDER FIREBASE (serviceproviderapp-b7767) ───
+  let providerServiceAccount =
+    loadServiceAccountFromEnv('PROVIDER_FIREBASE_SERVICE_ACCOUNT_BASE64') ||
+    loadServiceAccountFromEnv('PROVIDER_FIREBASE_SERVICE_ACCOUNT_JSON') ||
+    loadServiceAccountFromFile('../serviceproviderapp-firebase-adminsdk.json') ||
+    loadServiceAccountFromFile('./serviceproviderapp-firebase-adminsdk.json');
+
+  if (providerServiceAccount && providerServiceAccount.project_id) {
+    try {
+      if (admin.credential && typeof admin.credential.cert === 'function') {
+        providerApp = admin.initializeApp(
+          {
+            credential: admin.credential.cert(providerServiceAccount),
+          },
+          'providerApp'
+        );
+        console.info(`✅ Provider Firebase initialized (project: ${providerServiceAccount.project_id})`);
+      }
+    } catch (e) {
+      if (e.code === 'app/duplicate-app') {
+        providerApp = admin.app('providerApp');
+      } else {
+        console.error('❌ Provider Firebase init failed:', e.message);
+      }
+    }
+  } else {
+    console.warn('⚠️  No Provider Firebase credentials found. Provider FCM disabled.');
+  }
+}
+
+function isAdminWebFirebaseReady() {
+  return !!adminWebApp;
+}
+
+function isProviderFirebaseReady() {
+  return !!providerApp;
+}
+
+async function sendAdminFcmNotification(token, title, body, data = {}) {
+  if (!adminWebApp) {
+    console.warn('⚠️ Admin FCM not ready, skipping push');
+    return { success: false, error: 'Admin Firebase not initialized' };
+  }
+  try {
+    const messaging = admin.messaging(adminWebApp);
     const message = {
       token,
       notification: { title, body },
-      data: stringData,
-      android: {
-        priority: 'high',
-        notification: { sound: 'default', channelId: 'bookings' },
-      },
-      apns: {
-        payload: { aps: { sound: 'default', badge: 1 } },
+      data: Object.fromEntries(
+        Object.entries(data).map(([k, v]) => [k, String(v)])
+      ),
+      webpush: {
+        notification: {
+          icon: '/logo192.png',
+          badge: '/badge72.png',
+          tag: data.bookingId || 'admin-alert',
+        },
       },
     };
+    const response = await messaging.send(message);
+    return { success: true, messageId: response };
+  } catch (e) {
+    console.error('❌ Admin FCM send failed:', e.message);
+    return { success: false, error: e.message };
+  }
+}
 
-    await providerFirebaseApp.messaging().send(message);
-    return { success: true };
-  } catch (err) {
-    logger.warn(`Provider FCM failed: ${err.code || err.message}`);
-    return { success: false, error: err.message };
+async function sendProviderFcmNotification(token, title, body, data = {}) {
+  if (!providerApp) {
+    console.warn('⚠️ Provider FCM not ready, skipping push');
+    return { success: false, error: 'Provider Firebase not initialized' };
+  }
+  try {
+    const messaging = admin.messaging(providerApp);
+    const message = {
+      token,
+      notification: { title, body },
+      data: Object.fromEntries(
+        Object.entries(data).map(([k, v]) => [k, String(v)])
+      ),
+    };
+    const response = await messaging.send(message);
+    return { success: true, messageId: response };
+  } catch (e) {
+    console.error('❌ Provider FCM send failed:', e.message);
+    return { success: false, error: e.message };
   }
 }
 
@@ -261,8 +195,8 @@ module.exports = {
   initializeFirebase,
   isAdminWebFirebaseReady,
   isProviderFirebaseReady,
-  getAdminWebFirebase,
-  getProviderFirebase,
   sendAdminFcmNotification,
   sendProviderFcmNotification,
+  getAdminApp: () => adminWebApp,
+  getProviderApp: () => providerApp,
 };
