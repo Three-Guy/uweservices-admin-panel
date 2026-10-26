@@ -1,6 +1,8 @@
 // frontend2/src/pages/BookingsManager.tsx
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { bookingsApi, Booking, BookingFilters, BookingStats } from '../lib/api';
+import OfferTrailPanel from '../components/OfferTrailPanel';
+import DispatchActionButtons from '../components/DispatchActionButtons';
 
 /* ─── constants ─── */
 const ALL_STATUSES = [
@@ -71,7 +73,7 @@ const BookingsManager: React.FC = () => {
   const [reasonDraft, setReasonDraft] = useState('');
   const [paymentStatusDraft, setPaymentStatusDraft] = useState('');
   const [saving, setSaving] = useState(false);
-  const [activeTab, setActiveTab] = useState<'details' | 'timeline' | 'financial' | 'raw'>('details');
+  const [activeTab, setActiveTab] = useState<'details' | 'timeline' | 'financial' | 'dispatch' | 'raw'>('details');
   const [viewMode, setViewMode] = useState<'table' | 'cards'>('table');
   const modalRef = useRef<HTMLDivElement>(null);
 
@@ -128,6 +130,23 @@ const BookingsManager: React.FC = () => {
     if (!window.confirm(`Are you sure you want to delete booking ${b.bookingId}?`)) return;
     try { await bookingsApi.delete(b._id, false); await fetchBookings(); if (selected?._id === b._id) setSelected(null); }
     catch (e: any) { alert('Error: ' + (e?.response?.data?.message || e?.message)); }
+  };
+
+  /* ── dispatch action callback ── */
+  const handleDispatchActionDone = async () => {
+    // Refresh the selected booking + list after dispatch/reassign/manual-assign
+    if (selected) {
+      try {
+        const r = await bookingsApi.getById(selected._id);
+        if (r.success) {
+          setSelected(r.data.booking);
+          setStatusDraft(r.data.booking.status);
+          setPaymentStatusDraft(r.data.booking.paymentStatus || '');
+        }
+      } catch { /* silent */ }
+    }
+    await fetchBookings();
+    await fetchStats();
   };
 
   /* ══════════════════════════════ RENDER ══════════════════════════════ */
@@ -566,12 +585,12 @@ const BookingsManager: React.FC = () => {
                     </div>
                   </div>
                 )}
-                {/* tabs */}
+                {/* tabs — added 'dispatch' tab */}
                 <div className="flex gap-1 mt-4 bg-gray-100 rounded-xl p-1">
-                  {(['details', 'timeline', 'financial', 'raw'] as const).map(tab => (
+                  {(['details', 'timeline', 'financial', 'dispatch', 'raw'] as const).map(tab => (
                     <button key={tab} onClick={() => setActiveTab(tab)}
                       className={`flex-1 px-4 py-2 rounded-lg text-xs font-semibold transition-all ${activeTab === tab ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>
-                      {{ details: '📋 Details', timeline: '⏱ Timeline', financial: '💰 Financial', raw: '{ } Raw Data' }[tab]}
+                      {{ details: '📋 Details', timeline: '⏱ Timeline', financial: '💰 Financial', dispatch: '🚀 Dispatch', raw: '{ } Raw Data' }[tab]}
                     </button>
                   ))}
                 </div>
@@ -892,6 +911,46 @@ const BookingsManager: React.FC = () => {
                       <InfoRow label="Transaction ID" value={selected.paymentDetails?.transactionId} mono />
                       <InfoRow label="Paid At" value={fmtDate(selected.paymentDetails?.paidAt)} />
                     </DetailCard>
+                  </div>
+                )}
+
+                {/* ── TAB: DISPATCH ── ✅ NEW TAB */}
+                {activeTab === 'dispatch' && (
+                  <div className="space-y-6">
+                    {/* Dispatch Action Buttons */}
+                    <div className="bg-white rounded-2xl border border-gray-200/80 shadow-sm overflow-hidden border-l-4 border-l-indigo-400">
+                      <div className="px-5 py-4 border-b border-gray-100 bg-gray-50/50">
+                        <div className="flex items-center gap-2.5">
+                          <span className="text-gray-500">
+                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                          </span>
+                          <h3 className="text-sm font-bold text-gray-800">Dispatch Actions</h3>
+                        </div>
+                      </div>
+                      <div className="px-5 py-4">
+                        <DispatchActionButtons
+                          bookingId={selected._id}
+                          currentStatus={selected.status}
+                          currentProviderId={selected.providerId}
+                          onActionDone={handleDispatchActionDone}
+                        />
+                      </div>
+                    </div>
+
+                    {/* Offer Trail Panel */}
+                    <div className="bg-white rounded-2xl border border-gray-200/80 shadow-sm overflow-hidden border-l-4 border-l-violet-400">
+                      <div className="px-5 py-4 border-b border-gray-100 bg-gray-50/50">
+                        <div className="flex items-center gap-2.5">
+                          <span className="text-gray-500">
+                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" /></svg>
+                          </span>
+                          <h3 className="text-sm font-bold text-gray-800">Provider Offer Trail</h3>
+                        </div>
+                      </div>
+                      <div className="px-5 py-4">
+                        <OfferTrailPanel bookingId={selected.bookingId || selected._id} />
+                      </div>
+                    </div>
                   </div>
                 )}
 

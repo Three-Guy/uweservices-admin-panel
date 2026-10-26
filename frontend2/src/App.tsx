@@ -1,5 +1,5 @@
 // src/App.tsx
-import React from 'react';
+import React, { useEffect, useRef } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { StoreProvider } from './store/StoreContext';
 import { AuthProvider, useAuth } from './store/AuthContext';
@@ -38,14 +38,47 @@ import FeatureFlagsPage from './pages/SDUI/FeatureFlagsPage';
 import ASAPSectionManager from './pages/SDUI/ASAPSectionManager';
 import BookingsManager from './pages/BookingsManager';
 
-// ==================== LIVE TRACKING ==================== ✅ NEW
+// ==================== LIVE TRACKING ====================
 import LiveTracking from './pages/LiveTracking';
+
+// ==================== DISPATCH & ALERTS ====================
+import DispatchMonitor from './pages/DispatchMonitor';
+import ProviderOfferHistory from './pages/ProviderOfferHistory';
+import NotificationCenter from './pages/NotificationCenter';
+
+// ==================== REALTIME BELL (CRITICAL FIX) ====================
+import RealtimeAlertBell from './components/RealtimeAlertBell';
+
+import { Toaster } from 'react-hot-toast';
+import { getSocket, disconnectSocket } from './lib/socket';
 
 import LoginPage from './pages/LoginPage';
 import './index.css';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated, loading } = useAuth();
+  const initialized = useRef(false);
+
+  // ── Initialize Socket.IO on login (Firebase handled by RealtimeAlertBell) ──
+  useEffect(() => {
+    if (!isAuthenticated || initialized.current) return;
+    initialized.current = true;
+
+    try {
+      // Connect Socket.IO (auto-registers admin with email from localStorage)
+      getSocket();
+
+      // Firebase/FCM initialization happens inside RealtimeAlertBell
+      // when user clicks "Allow Notifications" button
+    } catch (err) {
+      console.warn('[Init] Non-critical initialization error:', err);
+    }
+
+    return () => {
+      disconnectSocket();
+      initialized.current = false;
+    };
+  }, [isAuthenticated]);
 
   if (loading) {
     return (
@@ -60,9 +93,10 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
 
 function AppLayout({ children }: { children: React.ReactNode }) {
   return (
-    <div className="flex h-screen bg-gray-50">
+    <div className="flex h-screen bg-gray-50 overflow-hidden">
       <Sidebar />
       <div className="flex-1 flex flex-col overflow-hidden">
+        {/* Header already renders <RealtimeAlertBell /> internally */}
         <Header />
         <main className="flex-1 overflow-x-hidden overflow-y-auto">
           {children}
@@ -77,6 +111,23 @@ function App() {
     <AuthProvider>
       <StoreProvider>
         <Router>
+          {/* ── Global Toast Notifications ── */}
+          <Toaster
+            position="top-right"
+            toastOptions={{
+              duration: 5000,
+              style: {
+                borderRadius: '12px',
+                background: '#1f2937',
+                color: '#f9fafb',
+                fontSize: '13px',
+                padding: '12px 16px',
+              },
+              success: { iconTheme: { primary: '#10b981', secondary: '#f9fafb' } },
+              error: { iconTheme: { primary: '#ef4444', secondary: '#f9fafb' } },
+            }}
+          />
+
           <Routes>
             {/* ==================== AUTH ROUTES ==================== */}
             <Route path="/login" element={<LoginPage />} />
@@ -157,13 +208,45 @@ function App() {
               }
             />
 
-            {/* ==================== LIVE TRACKING ==================== ✅ NEW */}
+            {/* ==================== LIVE TRACKING ==================== */}
             <Route
               path="/tracking"
               element={
                 <ProtectedRoute>
                   <AppLayout>
                     <LiveTracking />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+
+            {/* ==================== DISPATCH SYSTEM ==================== */}
+            <Route
+              path="/dispatch"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <DispatchMonitor />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/provider-offers"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <ProviderOfferHistory />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/notifications"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <NotificationCenter />
                   </AppLayout>
                 </ProtectedRoute>
               }
@@ -284,8 +367,6 @@ function App() {
                 </ProtectedRoute>
               }
             />
-
-            {/* ✅ ASAP SECTIONS ROUTE */}
             <Route
               path="/sdui/asap-sections"
               element={
@@ -297,7 +378,7 @@ function App() {
               }
             />
 
-            {/* ✅ NOTIFICATIONS ROUTES */}
+            {/* ==================== NOTIFICATIONS ROUTES ==================== */}
             <Route
               path="/sdui/notifications"
               element={

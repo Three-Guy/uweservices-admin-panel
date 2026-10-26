@@ -1,8 +1,8 @@
 import React, { useState } from 'react';
-import { 
-  Search, 
-  Bell, 
-  Moon, 
+import {
+  Search,
+  Bell,
+  Moon,
   Sun,
   Menu,
   X,
@@ -11,6 +11,7 @@ import {
 import { cn } from '../../lib/utils';
 import { useStore } from '../../store/StoreContext';
 import { motion, AnimatePresence } from 'motion/react';
+import RealtimeAlertBell from '../../components/RealtimeAlertBell';
 
 export default function Header() {
   const { isDark, setIsDark, notifications, markNotificationsRead } = useStore();
@@ -28,24 +29,24 @@ export default function Header() {
         </button>
         <div className="relative max-w-md w-full group">
           <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-text-secondary group-focus-within:text-primary transition-colors" size={18} />
-          <input 
+          <input
             className={cn(
               "w-full border rounded-2xl py-2.5 pl-12 pr-4 focus:ring-4 focus:ring-primary/10 transition-all text-sm outline-none",
               "bg-bg-secondary border-border-base text-text-primary focus:bg-card-bg focus:border-primary/20"
             )}
-            placeholder="Search bookings, providers, or analytics..." 
+            placeholder="Search bookings, providers, or analytics..."
             type="text"
           />
         </div>
       </div>
-      
+
       <div className="flex items-center gap-4">
         <div className="hidden lg:flex items-center gap-1 mr-4">
           <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
           <span className="text-[10px] font-bold text-text-secondary uppercase tracking-widest">System Online</span>
         </div>
-        
-        <button 
+
+        <button
           onClick={() => setIsDark(!isDark)}
           className={cn(
             "p-2.5 rounded-xl transition-colors",
@@ -55,8 +56,12 @@ export default function Header() {
           {isDark ? <Sun size={20} /> : <Moon size={20} />}
         </button>
 
+        {/* ✅ NEW: Real-time Dispatch Alert Bell (Socket.IO + FCM) */}
+        <RealtimeAlertBell />
+
+        {/* EXISTING: Store notification bell */}
         <div className="relative">
-          <button 
+          <button
             onClick={() => {
               setShowNotifications(!showNotifications);
               if (!showNotifications) markNotificationsRead();
@@ -78,7 +83,7 @@ export default function Header() {
             {showNotifications && (
               <>
                 <div className="fixed inset-0 z-40" onClick={() => setShowNotifications(false)} />
-                <motion.div 
+                <motion.div
                   initial={{ opacity: 0, y: 10, scale: 0.95 }}
                   animate={{ opacity: 1, y: 0, scale: 1 }}
                   exit={{ opacity: 0, y: 10, scale: 0.95 }}
@@ -109,18 +114,18 @@ export default function Header() {
             )}
           </AnimatePresence>
         </div>
-        
+
         <div className={cn("h-8 w-[1px] mx-2", "bg-border-base")}></div>
-        
+
         <div className="flex items-center gap-3 pl-2">
           <div className="text-right hidden sm:block">
             <p className={cn("text-sm font-bold", "text-text-primary")}>THREE GUYZ</p>
             <p className="text-[10px] font-bold text-text-secondary uppercase tracking-widest">FOUNDERS OF STARTUP</p>
           </div>
           <div className={cn("w-10 h-10 rounded-xl border overflow-hidden shadow-sm", "bg-bg-secondary border-border-base")}>
-            <img 
-              src="https://static.vecteezy.com/system/resources/previews/013/221/623/non_2x/service-logo-template-illustration-design-free-vector.jpg" 
-              alt="Avatar" 
+            <img
+              src="https://static.vecteezy.com/system/resources/previews/013/221/623/non_2x/service-logo-template-illustration-design-free-vector.jpg"
+              alt="Avatar"
               className="w-full h-full object-cover"
               referrerPolicy="no-referrer"
             />

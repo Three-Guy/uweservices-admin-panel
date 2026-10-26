@@ -1851,5 +1851,207 @@ export const trackingApi = {
   },
 };
 
+
+
+
+// ==================== DISPATCH / OFFER TYPES ====================
+export interface ProviderOffer {
+  _id: string;
+  bookingId: string;
+  bookingObjectId: string;
+  providerId: string;
+  providerName: string;
+  providerPhone: string;
+  providerCategory: string;
+  providerCity: string;
+  status: 'sent' | 'delivered' | 'viewed' | 'accepted' | 'rejected' | 'cancelled' | 'timeout' | 'failed' | 'superseded';
+  offeredAt: string;
+  deliveredAt: string | null;
+  viewedAt: string | null;
+  respondedAt: string | null;
+  expiresAt: string | null;
+  dispatchCycle: number;
+  batchNumber: number;
+  radiusKm: number;
+  distanceKm: number;
+  fcmSent: boolean;
+  fcmMessageId: string | null;
+  fcmError: string | null;
+  reason: string | null;
+  isCurrentOffer: boolean;
+  isScheduled: boolean;
+  bookingSnapshot?: {
+    serviceName?: string;
+    totalAmount?: number;
+    address?: string;
+    scheduledDate?: string;
+    scheduledTime?: string;
+  };
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DispatchJob {
+  _id: string;
+  bookingId: string;
+  bookingObjectId: string;
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'no_provider_found' | 'cancelled';
+  cycle: number;
+  batchNumber: number;
+  currentRadiusKm: number;
+  totalProvidersConsidered: number;
+  totalOffersSent: number;
+  totalRejections: number;
+  totalTimeouts: number;
+  triedProviderIds: string[];
+  startedAt: string;
+  completedAt: string | null;
+  nextRunAt: string | null;
+  lastError: string | null;
+  isScheduled: boolean;
+  assignedProviderId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DispatchStats {
+  liveState: {
+    searching: number;
+    confirmedWaitingDispatch: number;
+    noProviderFound: number;
+    failedJobs: number;
+    runningJobs: number;
+  };
+  last24h: {
+    totalOffers: number;
+    accepted: number;
+    rejected: number;
+    timeout: number;
+    acceptanceRate: number;
+  };
+}
+
+export interface EligibleProvider {
+  _id: string;
+  providerId: string;
+  name: string;
+  phone: string;
+  categoryName: string;
+  city: string;
+  distanceKm: number | null;
+  rating: number;
+  completedJobs: number;
+  isOnline: boolean;
+  isAvailable: boolean;
+  hasFcmToken: boolean;
+}
+
+export interface AdminNotification {
+  _id: string;
+  type: string;
+  title: string;
+  message: string;
+  severity: 'info' | 'success' | 'warning' | 'error' | 'critical';
+  bookingId: string | null;
+  providerId: string | null;
+  userId: string | null;
+  data: any;
+  isRead: boolean;
+  readAt: string | null;
+  readBy: string | null;
+  socketDelivered: boolean;
+  fcmSent: boolean;
+  actionUrl: string | null;
+  actionLabel: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+
+export const dispatchApi = {
+  getStats: () =>
+    authApi.get('/dispatch/stats'),
+
+  getActiveDispatches: () =>
+    authApi.get('/dispatch/active'),
+
+  getNoProviderBookings: (params?: { page?: number; limit?: number }) =>
+    authApi.get('/dispatch/no-provider-found', { params }),
+
+  // ✅ NEW — Unassigned bookings (confirmed + searching + no_provider_found)
+  getUnassignedBookings: (params?: { page?: number; limit?: number; status?: string }) =>
+    authApi.get('/dispatch/unassigned', { params }),
+
+  triggerDispatch: (bookingId: string) =>
+    authApi.post(`/dispatch/trigger/${bookingId}`),
+
+  reassignBooking: (bookingId: string, data?: { reason?: string }) =>
+    authApi.post(`/dispatch/reassign/${bookingId}`, data || {}),
+
+  // ✅ NEW — Alias for reassign (frontend button uses this)
+  autoRedispatch: (bookingId: string, data?: { reason?: string }) =>
+    authApi.post(`/dispatch/auto-redispatch/${bookingId}`, data || {}),
+
+  getEligibleProviders: (bookingId: string, params?: { radiusKm?: number; strict?: boolean }) =>
+    authApi.get(`/dispatch/eligible-providers/${bookingId}`, { params }),
+
+  // ✅ NEW — Debug breakdown (category match, city match, etc.)
+  getEligibleProvidersDebug: (bookingId: string) =>
+    authApi.get(`/dispatch/eligible-providers-debug/${bookingId}`),
+
+  assignProviderManually: (bookingId: string, data: { providerId: string }) =>
+    authApi.post(`/dispatch/assign-manual/${bookingId}`, data),
+};
+// ==================== PROVIDER OFFERS API ====================
+export const providerOffersApi = {
+  getAll: async (params?: { page?: number; limit?: number; status?: string; bookingId?: string; providerId?: string }): Promise<ApiResponse<{ offers: ProviderOffer[]; pagination: Pagination }>> => {
+    const response = await apiClient.get('/admin/provider-offers', { params });
+    return response.data;
+  },
+
+  getByBooking: async (bookingId: string): Promise<ApiResponse<{ offers: ProviderOffer[]; count: number }>> => {
+    const response = await apiClient.get(`/admin/provider-offers/booking/${bookingId}`);
+    return response.data;
+  },
+
+  getByProvider: async (providerId: string, params?: { page?: number; limit?: number }): Promise<ApiResponse<{ offers: ProviderOffer[]; pagination: Pagination }>> => {
+    const response = await apiClient.get(`/admin/provider-offers/provider/${providerId}`, { params });
+    return response.data;
+  },
+
+  getProviderPerformance: async (providerId: string): Promise<ApiResponse<any>> => {
+    const response = await apiClient.get(`/admin/provider-offers/provider/${providerId}/performance`);
+    return response.data;
+  },
+};
+
+// ==================== ADMIN NOTIFICATIONS API ====================
+export const adminNotificationsApi = {
+  list: async (params?: { page?: number; limit?: number; isRead?: string; type?: string; severity?: string }): Promise<ApiResponse<{ notifications: AdminNotification[]; unreadCount: number; pagination: Pagination }>> => {
+    const response = await apiClient.get('/admin/admin-notifications', { params });
+    return response.data;
+  },
+
+  getUnreadCount: async (): Promise<ApiResponse<{ count: number }>> => {
+    const response = await apiClient.get('/admin/admin-notifications/unread-count');
+    return response.data;
+  },
+
+  markRead: async (id: string): Promise<ApiResponse<{ notification: AdminNotification }>> => {
+    const response = await apiClient.patch(`/admin/admin-notifications/${id}/read`);
+    return response.data;
+  },
+
+  markAllRead: async (): Promise<ApiResponse<{ modified: number }>> => {
+    const response = await apiClient.patch('/admin/admin-notifications/mark-all-read');
+    return response.data;
+  },
+
+  delete: async (id: string): Promise<ApiResponse<any>> => {
+    const response = await apiClient.delete(`/admin/admin-notifications/${id}`);
+    return response.data;
+  },
+};
+
 // ==================== EXPORT ALL ====================
 export default apiClient;

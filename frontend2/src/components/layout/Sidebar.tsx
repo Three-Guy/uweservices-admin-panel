@@ -39,8 +39,8 @@ import {
   Activity,
   Clock,
   Zap,
-  Radar,        // ✅ NEW — Live Tracking icon
-  Radio,        // ✅ NEW — alternate pulse icon
+  Radar,
+  Radio,
 } from 'lucide-react';
 import { useAuth } from '../../store/AuthContext';
 import { usersApi, providersApi, bookingsApi } from '../../lib/api';
@@ -212,12 +212,14 @@ const themes = {
 type ThemeKey = keyof typeof themes;
 
 // ─── Navigation Structure ───
-// ✅ BOOKINGS placed at TOP #2 position, pinned & hot
-// ✅ LIVE TRACKING added right after Bookings — pinned, hot, badge-ready
 const navigation: NavItem[] = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
   { name: 'Bookings', href: '/bookings', icon: Calendar, hasBadge: true, badgeType: 'booking', isHot: true, isPinned: true },
-  { name: 'Live Tracking', href: '/tracking', icon: Radar, hasBadge: true, badgeType: 'tracking', isHot: true, isPinned: true },   // ✅ NEW
+  { name: 'Live Tracking', href: '/tracking', icon: Radar, hasBadge: true, badgeType: 'tracking', isHot: true, isPinned: true },
+  // ✅ NEW — Dispatch System (3 items)
+  { name: 'Dispatch Monitor', href: '/dispatch', icon: Zap, isHot: true, isPinned: true },
+  { name: 'Offer History', href: '/provider-offers', icon: Send },
+  { name: 'Alerts Center', href: '/notifications', icon: Radio },
   { name: 'Providers', href: '/providers', icon: Briefcase, hasBadge: true, badgeType: 'provider' },
   { name: 'Verifications', href: '/verifications', icon: ClipboardCheck },
   { name: 'Users', href: '/users', icon: UserPlus, hasBadge: true, badgeType: 'user' },
@@ -252,11 +254,10 @@ const otherNavigation: NavItem[] = [
   { name: 'Settings', href: '/settings', icon: Settings },
 ];
 
-// ✅ Mobile bottom nav — Bookings prominently in center, Tracking replaces SDUI slot
 const bottomNavItems: NavItem[] = [
   { name: 'Home', href: '/', icon: Home },
   { name: 'Bookings', href: '/bookings', icon: Calendar },
-  { name: 'Tracking', href: '/tracking', icon: Radar },   // ✅ NEW
+  { name: 'Tracking', href: '/tracking', icon: Radar },
   { name: 'Providers', href: '/providers', icon: Briefcase },
 ];
 
@@ -285,8 +286,6 @@ export default function Sidebar() {
   const [userStats, setUserStats] = useState<UserStats | null>(null);
   const [providerStats, setProviderStats] = useState<ProviderStatsSimple | null>(null);
   const [bookingStats, setBookingStats] = useState<BookingStatsSimple | null>(null);
-
-  // ✅ NEW — Tracking live count (active devices now)
   const [trackingActiveNow, setTrackingActiveNow] = useState<number>(0);
 
   const theme = themes[currentTheme];
@@ -384,7 +383,6 @@ export default function Sidebar() {
     } catch (e) { console.error('booking stats:', e); }
   };
 
-  // ✅ NEW — Fetch tracking active-now count (soft-fail if trackingApi not loaded yet)
   const fetchTrackingStats = async () => {
     try {
       const mod: any = await import('../../lib/api');
@@ -393,7 +391,6 @@ export default function Sidebar() {
         setTrackingActiveNow(data?.activeNow || 0);
       }
     } catch (e) {
-      // Silent fail — tracking API may not be available in all environments
       console.debug('tracking stats skipped:', e);
     }
   };
@@ -403,7 +400,7 @@ export default function Sidebar() {
       fetchUserStats(),
       fetchProviderStats(),
       fetchBookingStats(),
-      fetchTrackingStats(),   // ✅ NEW
+      fetchTrackingStats(),
     ]);
   }, []);
 
@@ -417,7 +414,7 @@ export default function Sidebar() {
     if (badgeType === 'user' && userStats?.todaySignups) return userStats.todaySignups;
     if (badgeType === 'provider' && providerStats?.pendingVerifications) return providerStats.pendingVerifications;
     if (badgeType === 'booking' && bookingStats?.pendingBookings) return bookingStats.pendingBookings;
-    if (badgeType === 'tracking' && trackingActiveNow) return trackingActiveNow;   // ✅ NEW
+    if (badgeType === 'tracking' && trackingActiveNow) return trackingActiveNow;
     return 0;
   };
 
@@ -460,21 +457,18 @@ export default function Sidebar() {
       >
         {({ isActive }) => (
           <>
-            {/* Active indicator pill on left */}
             {isActive && !isCollapsedView && (
               <span className={`absolute left-0 top-1/2 -translate-y-1/2 w-1 h-6 rounded-r-full ${theme.accent}`} />
             )}
 
             <div className={`transition-transform duration-200 flex-shrink-0 relative ${isActive ? 'scale-110' : 'group-hover:scale-105'}`}>
               <item.icon size={compact ? 17 : 18} strokeWidth={isActive ? 2.5 : 2} />
-              {/* Pulsing dot for hot items when collapsed */}
               {item.isHot && isCollapsedView && (
                 <span className="absolute -top-1 -right-1 flex h-2.5 w-2.5">
                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-pink-400 opacity-75" />
                   <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-pink-500" />
                 </span>
               )}
-              {/* Badge count on collapsed view */}
               {item.hasBadge && badgeCount > 0 && isCollapsedView && !item.isHot && (
                 <span className={`absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-1 rounded-full ${theme.accent} text-white text-[9px] font-bold flex items-center justify-center`}>
                   {badgeCount > 9 ? '9+' : badgeCount}
@@ -488,14 +482,12 @@ export default function Sidebar() {
                   {item.name}
                 </span>
 
-                {/* NEW badge for hot items (no count) */}
                 {item.isHot && !badgeCount && (
                   <span className={`px-1.5 py-0.5 rounded-md text-[9px] font-black ${theme.badgeHot} shadow-sm uppercase tracking-wider flex-shrink-0`}>
                     NEW
                   </span>
                 )}
 
-                {/* Live count badge */}
                 {item.hasBadge && badgeCount > 0 && (
                   <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold ${
                     item.isHot ? theme.badgeHot : theme.badge
@@ -507,7 +499,6 @@ export default function Sidebar() {
               </>
             )}
 
-            {/* Collapsed tooltip */}
             {isCollapsedView && !isMobile && (
               <div className={`absolute left-full ml-3 px-3 py-2 ${theme.cardBg} backdrop-blur-xl text-xs rounded-lg 
                 opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-150 
@@ -663,7 +654,6 @@ export default function Sidebar() {
         {bottomNavItems.map((item) => {
           const isActive = location.pathname === item.href ||
             (item.href !== '/' && location.pathname.startsWith(item.href));
-          // ✅ UPDATED — badge logic now covers Bookings AND Tracking
           const badgeCount =
             item.name === 'Bookings' ? (bookingStats?.pendingBookings || 0) :
             item.name === 'Tracking' ? trackingActiveNow :
@@ -778,7 +768,6 @@ export default function Sidebar() {
                 </div>
               )}
             </div>
-            {/* Mini stats row */}
             <div className={`mt-2 pt-2 border-t ${theme.border} flex items-center justify-between text-[10px]`}>
               <div className="flex items-center gap-1">
                 <Clock size={10} className={theme.textMuted} />
@@ -795,7 +784,7 @@ export default function Sidebar() {
         </div>
       )}
 
-      {/* ─── ✅ NEW — Live Tracking Mini Card ─── */}
+      {/* ─── Live Tracking Mini Card ─── */}
       {(!isCollapsed || isMobile) && (
         <div className="px-3 pt-1 pb-1 flex-shrink-0">
           <NavLink
@@ -865,7 +854,6 @@ export default function Sidebar() {
 
       {/* ─── Navigation (compact & scrollable) ─── */}
       <nav ref={navRef} className="flex-1 px-2 py-2 overflow-y-auto custom-scrollbar overscroll-contain" style={{ scrollBehavior: 'auto' }}>
-        {/* Primary nav */}
         <SectionDivider label="Main" />
         {navigation.map((item) => renderNavItem(item))}
 
