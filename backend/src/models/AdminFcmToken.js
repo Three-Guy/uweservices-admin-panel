@@ -1,3 +1,4 @@
+// backend/src/models/AdminFcmToken.js
 const mongoose = require('mongoose');
 
 function getAdminConn() {
@@ -32,25 +33,42 @@ function getAdminConn() {
 
 const conn = getAdminConn();
 
-const schema = new mongoose.Schema({
-  adminId: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin' },
-  adminEmail: String,
-  token: { type: String, required: true },
-  deviceInfo: String,
-  userAgent: String,
-  isActive: { type: Boolean, default: true },
-  lastUsed: { type: Date, default: Date.now },
-}, {
-  collection: 'adminfcmtokens',
-  timestamps: true
-});
+const schema = new mongoose.Schema(
+  {
+    adminId: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin' },
+    adminEmail: { type: String, lowercase: true, trim: true, index: true },
 
-schema.index({ token: 1 }, { unique: true });
+    // ✅ FIXED: Field renamed to fcmToken (matches controller & service)
+    fcmToken: { type: String, required: true },
+
+    deviceInfo: { type: String, default: 'web-browser' },
+    userAgent: { type: String, default: '' },
+
+    isActive: { type: Boolean, default: true, index: true },
+
+    // ✅ ADDED: Fields that controller & alert service write to
+    lastUsedAt: { type: Date, default: Date.now },
+    lastSuccessAt: { type: Date, default: null },
+    lastError: { type: String, default: null },
+    lastErrorAt: { type: Date, default: null },
+    failureCount: { type: Number, default: 0 },
+  },
+  {
+    collection: 'adminfcmtokens',
+    timestamps: true,
+    strict: true,
+  }
+);
+
+// ✅ FIXED: Index on fcmToken (not "token")
+schema.index({ fcmToken: 1 }, { unique: true });
 schema.index({ adminId: 1 });
+schema.index({ adminEmail: 1, isActive: 1 });
 
 let AdminFcmToken;
 try {
-  AdminFcmToken = conn.model('AdminFcmToken');
+  // Reuse if already compiled
+  AdminFcmToken = conn.models.AdminFcmToken || conn.model('AdminFcmToken', schema);
 } catch {
   AdminFcmToken = conn.model('AdminFcmToken', schema);
 }

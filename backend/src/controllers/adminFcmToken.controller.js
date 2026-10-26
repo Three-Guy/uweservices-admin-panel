@@ -5,6 +5,8 @@ const logger = require('../utils/logger');
 let AdminFcmToken = null;
 try {
   AdminFcmToken = require('../models/AdminFcmToken');
+  // Unwrap if default export
+  AdminFcmToken = AdminFcmToken?.default || AdminFcmToken?.AdminFcmToken || AdminFcmToken;
 } catch (err) {
   logger.error('AdminFcmToken model not available: ' + err.message);
 }
@@ -12,10 +14,6 @@ try {
 /**
  * Register admin FCM token
  * POST /api/v1/admin/fcm/register
- * 
- * Body: { fcmToken || token, adminEmail || email, deviceInfo, userAgent }
- * 
- * NOTE: No auth middleware — called right after login when token is ready
  */
 exports.register = async (req, res) => {
   try {
@@ -26,7 +24,6 @@ exports.register = async (req, res) => {
       });
     }
 
-    // Accept both field name variants (frontend compatibility)
     const fcmToken = req.body.fcmToken || req.body.token;
     const adminEmail = (
       req.body.adminEmail ||
@@ -44,7 +41,7 @@ exports.register = async (req, res) => {
       });
     }
 
-    // Upsert: if token exists, reactivate it; otherwise create new
+    // ✅ FIXED: Query by fcmToken field (now matches schema)
     const existing = await AdminFcmToken.findOne({ fcmToken });
 
     if (existing) {
@@ -54,9 +51,11 @@ exports.register = async (req, res) => {
       existing.isActive = true;
       existing.lastUsedAt = new Date();
       existing.failureCount = 0;
+      existing.lastError = null;
+      existing.lastErrorAt = null;
       await existing.save();
 
-      logger.info(`📱 FCM token reactivated for admin: ${adminEmail}`);
+      logger.info(`📱 FCM token reactivated for admin: ${adminEmail} (token: ${fcmToken.substring(0, 20)}...)`);
 
       return res.json({
         success: true,
@@ -71,9 +70,10 @@ exports.register = async (req, res) => {
       deviceInfo,
       userAgent,
       isActive: true,
+      lastUsedAt: new Date(),
     });
 
-    logger.info(`✅ FCM token registered for admin: ${adminEmail}`);
+    logger.info(`✅ FCM token registered for admin: ${adminEmail} (token: ${fcmToken.substring(0, 20)}...)`);
 
     return res.json({
       success: true,
@@ -82,6 +82,7 @@ exports.register = async (req, res) => {
     });
   } catch (err) {
     logger.error('FCM register failed: ' + err.message);
+    logger.error(err.stack);
     return res.status(500).json({
       success: false,
       message: err.message,
@@ -135,7 +136,7 @@ exports.listMyTokens = async (req, res) => {
     if (email) filter.adminEmail = email;
 
     const tokens = await AdminFcmToken.find(filter)
-      .select('-fcmToken')
+      .select('-fcmToken') // Don't send actual tokens back
       .sort({ lastUsedAt: -1 })
       .lean();
 
@@ -157,6 +158,13 @@ exports.testPush = async (req, res) => {
 
     const email = (req.body.email || req.admin?.email || '').toLowerCase().trim();
 
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email required (either in body or auth)',
+      });
+    }
+
     const tokens = await AdminFcmToken.find({
       adminEmail: email,
       isActive: true,
@@ -169,21 +177,31 @@ exports.testPush = async (req, res) => {
       });
     }
 
-    // Send test notification
     const { sendAdminFcmNotification } = require('../config/firebase');
-    const tokenStrings = tokens.map((t) => t.fcmToken);
 
-    const result = await sendAdminFcmNotification(
-      tokenStrings,
-      '🧪 Test Notification',
-      'This is a test push notification from admin panel',
-      { type: 'test', timestamp: new Date().toISOString() }
-    );
+    // ✅ FIXED: Send one at a time (sendAdminFcmNotification expects single token, not array)
+    const results = [];
+    for (const t of tokens) {
+      const r = await sendAdminFcmNotification(
+        t.fcmToken,
+        '🧪 Test Notification',
+        'This is a test push notification from admin panel. If you see this, FCM is working!',
+        { type: 'test', timestamp: new Date().toISOString() }
+      );
+      results.push({
+        tokenPreview: t.fcmToken.substring(0, 20) + '...',
+        success: r.success,
+        error: r.error || null,
+        messageId: r.messageId || null,
+      });
+    }
+
+    const successCount = results.filter((r) => r.success).length;
 
     return res.json({
-      success: true,
-      message: 'Test notification sent',
-      data: result,
+      success: successCount > 0,
+      message: `Test notification sent to ${successCount}/${tokens.length} device(s)`,
+      data: { results, totalTokens: tokens.length, successCount },
     });
   } catch (err) {
     logger.error('Test push failed: ' + err.message);

@@ -16,22 +16,52 @@ try {
 // ══════════════════════════════════════════════════════════════
 //  1. SEND BOOKING OFFER TO PROVIDER (via serviceproviderapp FCM)
 // ══════════════════════════════════════════════════════════════
-async function sendBookingOfferToProvider({
-  fcmToken,
-  bookingId,
-  serviceName,
-  totalAmount,
-  distance,
-  latitude,
-  longitude,
-  address,
-  scheduledDate,
-  customerName,
-  city,
-  batchNumber = 1,
-  timeoutMs = 15000,
-  bookingType = 'instant',
-}) {
+async function sendBookingOfferToProvider(providerOrOpts, bookingOrNull, extra = {}) {
+  // Backwards-compat: dispatchService calls as (provider, booking, extra)
+  //                   notification scripts may call as ({ fcmToken, bookingId, ... })
+  let fcmToken, bookingId, serviceName, totalAmount, distance,
+      latitude, longitude, address, scheduledDate, customerName, city,
+      batchNumber, timeoutMs, bookingType;
+
+  if (providerOrOpts && typeof providerOrOpts === 'object' && providerOrOpts.fcmToken && !bookingOrNull) {
+    // Old opts-object signature
+    const o = providerOrOpts;
+    fcmToken = o.fcmToken;
+    bookingId = o.bookingId;
+    serviceName = o.serviceName;
+    totalAmount = o.totalAmount;
+    distance = o.distance;
+    latitude = o.latitude;
+    longitude = o.longitude;
+    address = o.address;
+    scheduledDate = o.scheduledDate;
+    customerName = o.customerName;
+    city = o.city;
+    batchNumber = o.batchNumber || 1;
+    timeoutMs = o.timeoutMs || 15000;
+    bookingType = o.bookingType || 'instant';
+  } else {
+    // (provider, booking, extra) signature — the one dispatchService uses
+    const provider = providerOrOpts || {};
+    const booking = bookingOrNull || {};
+    fcmToken = provider.fcmToken;
+    bookingId = booking.bookingId || String(booking._id);
+    serviceName = booking.serviceName;
+    totalAmount = booking.totalAmount;
+    distance = extra.distanceKm != null ? extra.distanceKm : provider._distanceKm;
+    const loc = booking.customerLocation || {};
+    const coords = loc.coordinates || [];
+    longitude = coords[0];
+    latitude = coords[1];
+    address = booking.address;
+    scheduledDate = booking.scheduledDate;
+    customerName = booking.customerName;
+    city = booking.city?.cityName;
+    batchNumber = extra.batchNumber || 1;
+    timeoutMs = extra.timeoutMs || 15000;
+    bookingType = booking.bookingType || 'instant';
+  }
+
   if (!isProviderFirebaseReady()) {
     logger.warn('[FCM] Provider Firebase not ready — skipping provider push');
     return { success: false, error: 'Provider Firebase not initialized' };
@@ -49,7 +79,7 @@ async function sendBookingOfferToProvider({
     ? `📅 Scheduled Booking! ₹${totalAmount || 0}`
     : `🔔 New Booking! ₹${totalAmount || 0}`;
 
-  const body = `${serviceName} • ${distance ? distance.toFixed(1) + ' km' : 'Nearby'} • ${address || city || ''}`;
+  const body = `${serviceName || 'Service'} • ${distance ? Number(distance).toFixed(1) + ' km' : 'Nearby'} • ${address || city || ''}`;
 
   const message = {
     token: fcmToken,
@@ -58,7 +88,7 @@ async function sendBookingOfferToProvider({
       type: isScheduled ? 'booking_scheduled' : 'booking',
       bookingId: String(bookingId),
       serviceName: String(serviceName || ''),
-      distance: String(distance ? distance.toFixed(2) : '0'),
+      distance: String(distance ? Number(distance).toFixed(2) : '0'),
       latitude: String(latitude || ''),
       longitude: String(longitude || ''),
       address: String(address || ''),
@@ -85,7 +115,7 @@ async function sendBookingOfferToProvider({
     apns: {
       headers: {
         'apns-priority': '10',
-        'apns-push-type': 'background',
+        'apns-push-type': 'alert',
       },
       payload: {
         aps: {
@@ -132,24 +162,22 @@ async function sendAdminAlert({ tokens, title, body, data = {} }) {
       title: title || '🔔 Admin Alert',
       body: body || '',
     },
-    data: {
-      ...data,
-      click_action: '/bookings',
-      timestamp: String(Date.now()),
-    },
+    data: Object.fromEntries(
+      Object.entries({
+        ...data,
+        click_action: data.actionUrl || '/bookings',
+        timestamp: String(Date.now()),
+      }).map(([k, v]) => [k, String(v == null ? '' : v)])
+    ),
     webpush: {
       notification: {
         icon: '/favicon.ico',
         badge: '/favicon.ico',
         tag: data.type || 'admin-alert',
         requireInteraction: true,
-        actions: [
-          { action: 'view', title: 'View' },
-          { action: 'dismiss', title: 'Dismiss' },
-        ],
       },
       fcmOptions: {
-        link: data.link || '/bookings',
+        link: data.actionUrl || '/bookings',
       },
     },
   };
@@ -161,7 +189,6 @@ async function sendAdminAlert({ tokens, title, body, data = {} }) {
 
     if (failCount > 0) {
       logger.warn(`[FCM] Admin web push: ${successCount} sent, ${failCount} failed`);
-      // Log individual failures for token cleanup
       response.responses.forEach((resp, idx) => {
         if (!resp.success) {
           logger.debug(`[FCM] Failed token: ${validTokens[idx].substring(0, 20)}... → ${resp.error?.code}`);
@@ -186,7 +213,20 @@ async function sendAdminAlert({ tokens, title, body, data = {} }) {
 // ══════════════════════════════════════════════════════════════
 //  3. SEND CANCELLATION TO PROVIDER (silent data push)
 // ══════════════════════════════════════════════════════════════
-async function sendCancellationToProvider({ fcmToken, bookingId, reason }) {
+async function sendCancellationToProvider(providerOrToken, bookingOrId, reason) {
+  // Accept both (providerObj, booking, reason) and ({ fcmToken, bookingId, reason })
+  let fcmToken, bookingId;
+  if (providerOrToken && typeof providerOrToken === 'object' && providerOrToken.fcmToken) {
+    fcmToken = providerOrToken.fcmToken;
+    bookingId = (bookingOrId && (bookingOrId.bookingId || String(bookingOrId._id))) || '';
+  } else if (providerOrToken && typeof providerOrToken === 'object' && providerOrToken.providerId) {
+    // Legacy: just providerId passed — nothing to send to
+    return { success: false, error: 'Need provider.fcmToken, not providerId' };
+  } else {
+    fcmToken = String(providerOrToken || '');
+    bookingId = String(bookingOrId || '');
+  }
+
   if (!isProviderFirebaseReady() || !fcmToken) {
     return { success: false, error: 'Not available' };
   }
@@ -207,7 +247,7 @@ async function sendCancellationToProvider({ fcmToken, bookingId, reason }) {
       ttl: 10000,
     },
     apns: {
-      headers: { 'apns-priority': '10' },
+      headers: { 'apns-priority': '10', 'apns-push-type': 'background' },
       payload: { aps: { 'content-available': 1 } },
     },
   };

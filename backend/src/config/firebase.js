@@ -5,18 +5,15 @@ let adminWebApp = null;
 let providerApp = null;
 
 /**
- * Find cert() function — works for firebase-admin v10, v11, v12+
+ * Find cert() function — works for firebase-admin v10, v11, v12, v13, v14+
  */
 function getCertFunction() {
-  // v12+ style: admin.cert directly
   if (typeof admin.cert === 'function') {
     return admin.cert.bind(admin);
   }
-  // v11 and below: admin.credential.cert
   if (admin.credential && typeof admin.credential.cert === 'function') {
     return admin.credential.cert.bind(admin.credential);
   }
-  // Try named import
   try {
     const appModule = require('firebase-admin/app');
     if (typeof appModule.cert === 'function') return appModule.cert;
@@ -122,8 +119,11 @@ function initializeFirebase() {
   let adminServiceAccount =
     loadServiceAccountFromEnv('ADMIN_FIREBASE_SERVICE_ACCOUNT_BASE64') ||
     loadServiceAccountFromEnv('ADMIN_FIREBASE_SERVICE_ACCOUNT_JSON') ||
+    loadServiceAccountFromEnv('FIREBASE_SERVICE_ACCOUNT_BASE64') ||
+    loadServiceAccountFromEnv('FIREBASE_SERVICE_ACCOUNT') ||
     loadServiceAccountFromFile('../uwe-services-web-firebase-adminsdk.json') ||
-    loadServiceAccountFromFile('./uwe-services-web-firebase-adminsdk.json');
+    loadServiceAccountFromFile('./uwe-services-web-firebase-adminsdk.json') ||
+    loadServiceAccountFromFile('../../src/config/uwe-services-web-firebase-adminsdk.json');
 
   if (adminServiceAccount && adminServiceAccount.project_id) {
     try {
@@ -179,16 +179,36 @@ function initializeFirebase() {
 function isAdminWebFirebaseReady() { return !!adminWebApp; }
 function isProviderFirebaseReady() { return !!providerApp; }
 
+// ✅ NEW: Helpers to get messaging instances (used by fcmService.js)
+function getAdminWebMessaging() {
+  if (!adminWebApp) return null;
+  try {
+    const { getMessaging } = require('firebase-admin/messaging');
+    return getMessaging(adminWebApp);
+  } catch (e) {
+    return admin.messaging(adminWebApp);
+  }
+}
+
+function getProviderMessaging() {
+  if (!providerApp) return null;
+  try {
+    const { getMessaging } = require('firebase-admin/messaging');
+    return getMessaging(providerApp);
+  } catch (e) {
+    return admin.messaging(providerApp);
+  }
+}
+
 async function sendAdminFcmNotification(token, title, body, data = {}) {
   if (!adminWebApp) return { success: false, error: 'Admin Firebase not initialized' };
+  if (!token || typeof token !== 'string') {
+    return { success: false, error: 'Invalid token (must be string)' };
+  }
   try {
-    let messaging;
-    try {
-      const { getMessaging } = require('firebase-admin/messaging');
-      messaging = getMessaging(adminWebApp);
-    } catch (e) {
-      messaging = admin.messaging(adminWebApp);
-    }
+    const messaging = getAdminWebMessaging();
+    if (!messaging) return { success: false, error: 'Admin messaging unavailable' };
+
     const message = {
       token,
       notification: { title, body },
@@ -197,9 +217,13 @@ async function sendAdminFcmNotification(token, title, body, data = {}) {
       ),
       webpush: {
         notification: {
-          icon: '/logo192.png',
-          badge: '/badge72.png',
-          tag: (data && data.bookingId) || 'admin-alert',
+          icon: '/favicon.ico',
+          badge: '/favicon.ico',
+          tag: (data && data.bookingId) || data.type || 'admin-alert',
+          requireInteraction: true,
+        },
+        fcmOptions: {
+          link: (data && data.actionUrl) || '/',
         },
       },
     };
@@ -207,20 +231,19 @@ async function sendAdminFcmNotification(token, title, body, data = {}) {
     return { success: true, messageId: response };
   } catch (e) {
     console.error('❌ Admin FCM send failed:', e.message);
-    return { success: false, error: e.message };
+    return { success: false, error: e.code || e.message };
   }
 }
 
 async function sendProviderFcmNotification(token, title, body, data = {}) {
   if (!providerApp) return { success: false, error: 'Provider Firebase not initialized' };
+  if (!token || typeof token !== 'string') {
+    return { success: false, error: 'Invalid token (must be string)' };
+  }
   try {
-    let messaging;
-    try {
-      const { getMessaging } = require('firebase-admin/messaging');
-      messaging = getMessaging(providerApp);
-    } catch (e) {
-      messaging = admin.messaging(providerApp);
-    }
+    const messaging = getProviderMessaging();
+    if (!messaging) return { success: false, error: 'Provider messaging unavailable' };
+
     const message = {
       token,
       notification: { title, body },
@@ -232,7 +255,7 @@ async function sendProviderFcmNotification(token, title, body, data = {}) {
     return { success: true, messageId: response };
   } catch (e) {
     console.error('❌ Provider FCM send failed:', e.message);
-    return { success: false, error: e.message };
+    return { success: false, error: e.code || e.message };
   }
 }
 
@@ -244,4 +267,7 @@ module.exports = {
   sendProviderFcmNotification,
   getAdminApp: () => adminWebApp,
   getProviderApp: () => providerApp,
+  // ✅ NEW exports — now fcmService.js can import these
+  getAdminWebMessaging,
+  getProviderMessaging,
 };
