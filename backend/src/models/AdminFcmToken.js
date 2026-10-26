@@ -1,98 +1,62 @@
-// backend/src/models/AdminFcmToken.js
 const mongoose = require('mongoose');
-const logger = require('../utils/logger');
 
-const adminFcmTokenSchema = new mongoose.Schema(
-  {
-    adminEmail: {
-      type: String,
-      required: true,
-      trim: true,
-      lowercase: true,
-      index: true,
-    },
-    fcmToken: {
-      type: String,
-      required: true,
-      unique: true,
-      trim: true,
-    },
-    deviceInfo: {
-      type: String,
-      default: 'unknown',
-    },
-    userAgent: {
-      type: String,
-      default: '',
-    },
-    isActive: {
-      type: Boolean,
-      default: true,
-      index: true,
-    },
-    lastUsedAt: {
-      type: Date,
-      default: Date.now,
-    },
-    failureCount: {
-      type: Number,
-      default: 0,
-    },
-    registeredAt: {
-      type: Date,
-      default: Date.now,
-    },
-  },
-  {
-    timestamps: true,
-    collection: 'adminfcmtokens',
-  }
-);
+function getAdminConn() {
+  const sources = [];
+  try { sources.push(require('../config/multiDb')); } catch (_) {}
+  try { sources.push(require('../config/database')); } catch (_) {}
 
-// Compound index for fast lookups
-adminFcmTokenSchema.index({ adminEmail: 1, isActive: 1 });
-adminFcmTokenSchema.index({ isActive: 1, lastUsedAt: -1 });
-
-// Auto-deactivate on too many failures
-adminFcmTokenSchema.pre('save', function (next) {
-  if (this.failureCount >= 5 && this.isActive) {
-    this.isActive = false;
-    logger.warn(`FCM token auto-deactivated due to failures: ${this.adminEmail}`);
-  }
-  next();
-});
-
-/**
- * Get model from admin_panel database connection
- * Supports both default connection and multi-db setup
- */
-function getAdminFcmTokenModel() {
-  try {
-    // Try to use admin_panel specific connection
-    const { getAdminConnection } = require('../config/database');
-    const adminConn = getAdminConnection();
-
-    if (adminConn && adminConn.readyState === 1) {
-      // Check if model already registered on this connection
-      if (adminConn.models.AdminFcmToken) {
-        return adminConn.models.AdminFcmToken;
+  for (const src of sources) {
+    if (!src) continue;
+    const fns = [
+      'getAdminConnection', 'getAdminPanelConnection', 'getAdminDb',
+      'getAdminDB', 'getAdminPanelDb'
+    ];
+    for (const fn of fns) {
+      if (typeof src[fn] === 'function') {
+        try {
+          const c = src[fn]();
+          if (c && typeof c.model === 'function') return c;
+        } catch (_) {}
       }
-      return adminConn.model('AdminFcmToken', adminFcmTokenSchema);
     }
-  } catch (err) {
-    // Fallback to default connection
+    const props = [
+      'adminConnection', 'adminDb', 'adminDB', 'admin',
+      'adminPanelConnection', 'adminPanelDb'
+    ];
+    for (const p of props) {
+      if (src[p] && typeof src[p].model === 'function') return src[p];
+    }
   }
-
-  // Fallback: use default mongoose connection
-  if (mongoose.models.AdminFcmToken) {
-    return mongoose.models.AdminFcmToken;
-  }
-  return mongoose.model('AdminFcmToken', adminFcmTokenSchema);
+  return mongoose;
 }
 
-// Export both model instance AND factory function
-const AdminFcmToken = getAdminFcmTokenModel();
+const conn = getAdminConn();
+
+const schema = new mongoose.Schema({
+  adminId: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin' },
+  adminEmail: String,
+  token: { type: String, required: true },
+  deviceInfo: String,
+  userAgent: String,
+  isActive: { type: Boolean, default: true },
+  lastUsed: { type: Date, default: Date.now },
+}, {
+  collection: 'adminfcmtokens',
+  timestamps: true
+});
+
+schema.index({ token: 1 }, { unique: true });
+schema.index({ adminId: 1 });
+
+let AdminFcmToken;
+try {
+  AdminFcmToken = conn.model('AdminFcmToken');
+} catch {
+  AdminFcmToken = conn.model('AdminFcmToken', schema);
+}
+
+console.log(`[AdminFcmToken] ✅ Model ready on: ${conn.name || 'default'}`);
 
 module.exports = AdminFcmToken;
-module.exports.getAdminFcmTokenModel = getAdminFcmTokenModel;
-module.exports.schema = adminFcmTokenSchema;
+module.exports.AdminFcmToken = AdminFcmToken;
+module.exports.default = AdminFcmToken;

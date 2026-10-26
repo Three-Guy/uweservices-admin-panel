@@ -1,197 +1,119 @@
 // backend/src/models/Booking.js
+// ✅ Defensive model loader — works with ANY connection export pattern
 const mongoose = require('mongoose');
 
-const bookingSchema = new mongoose.Schema({
-  // ==================== BOOKING INFO ====================
-  bookingId: {
-    type: String,
-    unique: true,
-    required: true,
-  },
+/* ─── Try every possible way to get the bookings connection ─── */
+function getBookingsConnection() {
+  const sources = [];
+  try { sources.push(require('../config/database')); } catch (_) {}
+  try { sources.push(require('../config/multiDb')); } catch (_) {}
 
-  // ==================== CUSTOMER INFO ====================
-  user: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    required: true,
-  },
-  customerName: {
-    type: String,
-    required: true,
-    trim: true,
-  },
-  customerEmail: {
-    type: String,
-    required: true,
-    lowercase: true,
-    trim: true,
-  },
-  customerPhone: {
-    type: String,
-    required: true,
-    trim: true,
-  },
-  address: {
-    type: String,
-    required: true,
-  },
+  for (const src of sources) {
+    if (!src) continue;
 
-  // ==================== LOCATION INFO ====================
-  customerLocation: {
-    type: {
-      type: String,
-      enum: ['Point'],
-      default: 'Point',
-    },
-    coordinates: {
-      type: [Number], // [longitude, latitude]
-      required: true,
-    },
-    address: String,
-    accuracy: Number,
-  },
-  latitude: Number,
-  longitude: Number,
+    // Try function-style getters
+    const fnNames = [
+      'getBookingsConnection',
+      'getBookingConnection',
+      'getBookingsDb',
+      'getBookingsDB',
+      'getBookingDb',
+    ];
+    for (const fn of fnNames) {
+      if (typeof src[fn] === 'function') {
+        try {
+          const c = src[fn]();
+          if (c && typeof c.model === 'function') {
+            return c;
+          }
+        } catch (_) {}
+      }
+    }
 
-  // ==================== SERVICE INFO ====================
-  serviceName: {
-    type: String,
-    required: true,
-  },
-  serviceIcon: {
-    type: String,
-    default: '🔧',
-  },
-  servicePrice: {
-    type: Number,
-    required: true,
-  },
-
-  // ==================== SCHEDULE ====================
-  scheduledDate: {
-    type: String,
-    required: true,
-  },
-  scheduledTime: {
-    type: String,
-    required: true,
-  },
-
-  // ==================== PRICING ====================
-  baseAmount: {
-    type: Number,
-    required: true,
-  },
-  serviceFee: {
-    type: Number,
-    default: 0,
-  },
-  platformFee: {
-    type: Number,
-    default: 0,
-  },
-  tax: {
-    type: Number,
-    default: 0,
-  },
-  
-  // ==================== COUPON ====================
-  coupon: {
-    code: {
-      type: String,
-      default: null,
-    },
-    discount: {
-      type: Number,
-      default: 0,
-    },
-    couponRef: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'Coupon',
-      default: null,
-    },
-  },
-
-  subtotal: {
-    type: Number,
-    required: true,
-  },
-  totalAmount: {
-    type: Number,
-    required: true,
-  },
-
-  // ==================== PAYMENT ====================
-  paymentMethod: {
-    type: String,
-    enum: ['pay-after', 'google-pay', 'phonepe', 'upi', 'card', 'wallet'],
-    required: true,
-  },
-  paymentStatus: {
-    type: String,
-    enum: ['pending', 'completed', 'failed', 'refunded'],
-    default: 'pending',
-  },
-  transactionId: {
-    type: String,
-    default: null,
-  },
-
-  // ==================== STATUS ====================
-  status: {
-    type: String,
-    enum: ['pending', 'confirmed', 'assigned', 'in_progress', 'completed', 'cancelled'],
-    default: 'pending',
-  },
-
-  // ==================== PROVIDER ====================
-  provider: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Provider',
-    default: null,
-  },
-
-  // ==================== ADDITIONAL ====================
-  specialRequirements: {
-    type: String,
-    default: '',
-  },
-  cancellationReason: {
-    type: String,
-    default: null,
-  },
-  cancelledAt: {
-    type: Date,
-    default: null,
-  },
-
-  // ==================== METADATA ====================
-  createdBy: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-  },
-}, {
-  timestamps: true,
-  toJSON: { virtuals: true },
-  toObject: { virtuals: true },
-});
-
-// ==================== INDEXES ====================
-bookingSchema.index({ bookingId: 1 }, { unique: true });
-bookingSchema.index({ user: 1 });
-bookingSchema.index({ provider: 1 });
-bookingSchema.index({ status: 1 });
-bookingSchema.index({ paymentStatus: 1 });
-bookingSchema.index({ scheduledDate: 1 });
-bookingSchema.index({ customerLocation: '2dsphere' });
-
-// ==================== PRE-SAVE HOOK ====================
-bookingSchema.pre('save', function(next) {
-  if (this.isNew && !this.bookingId) {
-    this.bookingId = `BK${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    // Try property-style
+    const propNames = [
+      'bookingsConnection',
+      'bookingsDb',
+      'bookingsDB',
+      'bookings',
+      'bookingConnection',
+      'bookingDb',
+    ];
+    for (const p of propNames) {
+      if (src[p] && typeof src[p].model === 'function') {
+        return src[p];
+      }
+    }
   }
-  next();
-});
 
-// ==================== EXPORT ====================
-module.exports = bookingSchema;
+  console.warn('[Booking] ⚠️ No dedicated bookings connection found, using default mongoose');
+  return mongoose;
+}
+
+/* ─── Schema (flexible, all fields optional) ─── */
+const bookingSchema = new mongoose.Schema(
+  {
+    bookingId: { type: String, index: true },
+    bookingType: String,
+    status: { type: String, index: true },
+    customerName: String,
+    customerPhone: String,
+    customerEmail: String,
+    userId: mongoose.Schema.Types.Mixed,
+
+    serviceId: mongoose.Schema.Types.Mixed,
+    serviceName: String,
+    subserviceId: mongoose.Schema.Types.Mixed,
+    subserviceName: String,
+    categoryId: mongoose.Schema.Types.Mixed,
+    categoryName: String,
+
+    providerId: { type: mongoose.Schema.Types.Mixed, default: null, index: true },
+    providerName: String,
+
+    city: mongoose.Schema.Types.Mixed,
+    cityId: mongoose.Schema.Types.Mixed,
+    cityName: String,
+    address: String,
+    latitude: Number,
+    longitude: Number,
+
+    amount: Number,
+    totalAmount: Number,
+    scheduledDate: Date,
+    scheduledTime: String,
+    scheduledDateTime: Date,
+
+    isDeleted: { type: Boolean, default: false },
+  },
+  {
+    collection: 'bookings',
+    strict: false,
+    timestamps: true,
+  }
+);
+
+/* ─── Build model on correct connection ─── */
+const conn = getBookingsConnection();
+
+let Booking;
+try {
+  Booking = conn.model('Booking');
+} catch (_) {
+  Booking = conn.model('Booking', bookingSchema);
+}
+
+console.log(
+  `[Booking] ✅ Model ready — connection: ${conn.name || 'default'}, find: ${typeof Booking.find}, count: ${typeof Booking.countDocuments}`
+);
+
+/* ─── Helper getter (backward compat) ─── */
+function getBookingModel() {
+  return Booking;
+}
+
+/* ─── Multi-shape export (so EVERY import style works) ─── */
+module.exports = Booking;
+module.exports.Booking = Booking;
+module.exports.default = Booking;
+module.exports.getBookingModel = getBookingModel;

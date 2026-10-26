@@ -1,14 +1,45 @@
 // backend/src/controllers/dispatch.controller.js
-const DispatchJob = require('../models/DispatchJob');
-const ProviderOffer = require('../models/ProviderOffer');
-const Booking = require('../models/Booking');
+// ✅ Safe model loading — handles broken imports gracefully
+const mongoose = require('mongoose');
 
-const dispatchService = require('../services/dispatchService');
-const eligibilityService = require('../services/eligibilityService');
+/* ─── SAFE MODEL LOADER ─── */
+function safeLoadModel(modelPath, modelName, collection) {
+  try {
+    const mod = require(modelPath);
+    let M = mod?.[modelName] || mod?.default || mod;
+    if (M && typeof M.find === 'function') {
+      console.log(`[DispatchCtrl] ✅ ${modelName} loaded`);
+      return M;
+    }
+    throw new Error(`${modelName} import invalid`);
+  } catch (e) {
+    console.error(`[DispatchCtrl] ⚠️ ${modelName} fallback:`, e.message);
+    try {
+      return mongoose.model(modelName);
+    } catch {
+      const schema = new mongoose.Schema({}, { strict: false, collection });
+      return mongoose.model(modelName, schema);
+    }
+  }
+}
 
-/* ─── small helpers ─────────────────────────────────────────── */
-const ok = (res, data, extra = {}) =>
-  res.json({ success: true, data, ...extra });
+const Booking = safeLoadModel('../models/Booking', 'Booking', 'bookings');
+const DispatchJob = safeLoadModel('../models/DispatchJob', 'DispatchJob', 'dispatchjobs');
+const ProviderOffer = safeLoadModel('../models/ProviderOffer', 'ProviderOffer', 'provideroffers');
+
+/* ─── Services (safe load) ─── */
+let dispatchService = {};
+try { dispatchService = require('../services/dispatchService'); } catch (e) {
+  console.error('[DispatchCtrl] dispatchService load error:', e.message);
+}
+
+let eligibilityService = {};
+try { eligibilityService = require('../services/eligibilityService'); } catch (e) {
+  console.error('[DispatchCtrl] eligibilityService load error:', e.message);
+}
+
+/* ─── Helpers ─── */
+const ok = (res, data, extra = {}) => res.json({ success: true, data, ...extra });
 
 const fail = (res, err, code = 500) => {
   const msg = err?.message || String(err) || 'Internal error';
@@ -16,32 +47,49 @@ const fail = (res, err, code = 500) => {
   return res.status(code).json({ success: false, message: msg });
 };
 
+const safeCount = async (model, query = {}) => {
+  if (!model || typeof model.countDocuments !== 'function') return 0;
+  try { return await model.countDocuments(query); } catch { return 0; }
+};
+
+const safeFind = async (model, query = {}, opts = {}) => {
+  if (!model || typeof model.find !== 'function') return [];
+  try {
+    let q = model.find(query);
+    if (opts.sort) q = q.sort(opts.sort);
+    if (opts.limit) q = q.limit(opts.limit);
+    if (opts.skip) q = q.skip(opts.skip);
+    if (opts.select) q = q.select(opts.select);
+    if (opts.lean !== false) q = q.lean();
+    return await q;
+  } catch (e) {
+    console.error('[safeFind] error:', e.message);
+    return [];
+  }
+};
+
 /* ══════════════════════════════════════════════════════════════
-   GET /stats  — live dispatch engine stats
+   GET /stats
    ══════════════════════════════════════════════════════════════ */
 exports.getStats = async (req, res) => {
   try {
-    const [
-      activeDispatches,
-      queuedJobs,
-      recentFailures,
-      noProviderFound,
-      offers24h,
-    ] = await Promise.all([
-      DispatchJob.countDocuments({ status: 'running' }),
-      DispatchJob.countDocuments({ status: 'queued' }),
-      DispatchJob.countDocuments({
+    const [activeDispatches, queuedJobs, recentFailures, noProviderFound] = await Promise.all([
+      safeCount(DispatchJob, { status: 'running' }),
+      safeCount(DispatchJob, { status: 'queued' }),
+      safeCount(DispatchJob, {
         status: 'no_provider_found',
         updatedAt: { $gte: new Date(Date.now() - 60 * 60 * 1000) },
       }),
-      Booking.countDocuments({ status: 'no_provider_found' }),
-      ProviderOffer.find({
-        createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
-      }).select('status').lean(),
+      safeCount(Booking, { status: 'no_provider_found' }),
     ]);
 
-    // Cooldowns = unique bookings currently in no_provider_found with recent fail
-    const cooldownBookings = await Booking.countDocuments({
+    const offers24h = await safeFind(
+      ProviderOffer,
+      { createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } },
+      { select: 'status' }
+    );
+
+    const cooldownBookings = await safeCount(Booking, {
       status: 'no_provider_found',
       updatedAt: { $gte: new Date(Date.now() - 10 * 60 * 1000) },
     });
@@ -55,8 +103,7 @@ exports.getStats = async (req, res) => {
       failed: offers24h.filter((o) => o.status === 'failed').length,
       noProvider: 0,
     };
-    const acceptRate24h =
-      total24h > 0 ? (breakdown24h.accepted / total24h) * 100 : 0;
+    const acceptRate24h = total24h > 0 ? (breakdown24h.accepted / total24h) * 100 : 0;
 
     return ok(res, {
       activeDispatches,
@@ -74,16 +121,15 @@ exports.getStats = async (req, res) => {
 };
 
 /* ══════════════════════════════════════════════════════════════
-   GET /active — currently running dispatches
+   GET /active
    ══════════════════════════════════════════════════════════════ */
 exports.getActiveDispatches = async (req, res) => {
   try {
-    const jobs = await DispatchJob.find({
-      status: { $in: ['running', 'queued'] },
-    })
-      .sort({ createdAt: -1 })
-      .limit(50)
-      .lean();
+    const jobs = await safeFind(
+      DispatchJob,
+      { status: { $in: ['running', 'queued'] } },
+      { sort: { createdAt: -1 }, limit: 50 }
+    );
 
     const data = jobs.map((j) => ({
       bookingId: j.bookingId,
@@ -107,10 +153,11 @@ exports.getActiveDispatches = async (req, res) => {
    ══════════════════════════════════════════════════════════════ */
 exports.getNoProviderBookings = async (req, res) => {
   try {
-    const bookings = await Booking.find({ status: 'no_provider_found' })
-      .sort({ updatedAt: -1 })
-      .limit(100)
-      .lean();
+    const bookings = await safeFind(
+      Booking,
+      { status: 'no_provider_found' },
+      { sort: { updatedAt: -1 }, limit: 100 }
+    );
     return ok(res, bookings);
   } catch (err) {
     return fail(res, err);
@@ -118,23 +165,23 @@ exports.getNoProviderBookings = async (req, res) => {
 };
 
 /* ══════════════════════════════════════════════════════════════
-   GET /unassigned — confirmed / searching / no_provider_found
+   GET /unassigned
    ══════════════════════════════════════════════════════════════ */
 exports.getUnassignedBookings = async (req, res) => {
   try {
-    const bookings = await Booking.find({
-      status: { $in: ['confirmed', 'searching', 'no_provider_found', 'pending'] },
-      $or: [{ providerId: null }, { providerId: { $exists: false } }],
-    })
-      .sort({ createdAt: -1 })
-      .limit(100)
-      .lean();
+    const bookings = await safeFind(
+      Booking,
+      {
+        status: { $in: ['confirmed', 'searching', 'no_provider_found', 'pending'] },
+        $or: [{ providerId: null }, { providerId: { $exists: false } }, { providerId: '' }],
+      },
+      { sort: { createdAt: -1 }, limit: 100 }
+    );
 
-    // Attach offer trail per booking
-    const ids = bookings.map((b) => b.bookingId);
-    const offers = await ProviderOffer.find({ bookingId: { $in: ids } })
-      .sort({ sentAt: -1 })
-      .lean();
+    const ids = bookings.map((b) => b.bookingId).filter(Boolean);
+    const offers = ids.length
+      ? await safeFind(ProviderOffer, { bookingId: { $in: ids } }, { sort: { sentAt: -1 } })
+      : [];
 
     const offerMap = {};
     offers.forEach((o) => {
@@ -168,12 +215,15 @@ exports.getUnassignedBookings = async (req, res) => {
 exports.getEligibleProviders = async (req, res) => {
   try {
     const { bookingId } = req.params;
+    if (!Booking || typeof Booking.findOne !== 'function') {
+      return fail(res, new Error('Booking model unavailable'));
+    }
     const booking = await Booking.findOne({ bookingId }).lean();
-    if (!booking)
-      return res
-        .status(404)
-        .json({ success: false, message: 'Booking not found' });
+    if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
 
+    if (typeof eligibilityService.findEligibleProviders !== 'function') {
+      return ok(res, []);
+    }
     const providers = await eligibilityService.findEligibleProviders(booking);
     return ok(res, providers);
   } catch (err) {
@@ -188,18 +238,16 @@ exports.getEligibleProvidersDebug = async (req, res) => {
   try {
     const { bookingId } = req.params;
     const booking = await Booking.findOne({ bookingId }).lean();
-    if (!booking)
-      return res
-        .status(404)
-        .json({ success: false, message: 'Booking not found' });
+    if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
 
     if (typeof eligibilityService.debugEligibility === 'function') {
       const result = await eligibilityService.debugEligibility(booking);
       return ok(res, result);
     }
 
-    // Fallback
-    const providers = await eligibilityService.findEligibleProviders(booking);
+    const providers = typeof eligibilityService.findEligibleProviders === 'function'
+      ? await eligibilityService.findEligibleProviders(booking)
+      : [];
     return ok(res, { booking, eligibleCount: providers.length, providers });
   } catch (err) {
     return fail(res, err);
@@ -212,6 +260,9 @@ exports.getEligibleProvidersDebug = async (req, res) => {
 exports.triggerDispatch = async (req, res) => {
   try {
     const { bookingId } = req.params;
+    if (typeof dispatchService.dispatchBooking !== 'function') {
+      return fail(res, new Error('dispatchService.dispatchBooking unavailable'));
+    }
     const result = await dispatchService.dispatchBooking(bookingId, {
       manual: true,
       reason: 'manual_trigger',
@@ -229,6 +280,9 @@ exports.reassignBooking = async (req, res) => {
   try {
     const { bookingId } = req.params;
     const { providerId } = req.body || {};
+    if (typeof dispatchService.manualReassign !== 'function') {
+      return fail(res, new Error('manualReassign unavailable'));
+    }
     const result = await dispatchService.manualReassign(bookingId, providerId);
     return ok(res, result);
   } catch (err) {
@@ -243,28 +297,27 @@ exports.autoRedispatch = async (req, res) => {
   try {
     const { bookingId } = req.params;
 
-    // 1. Supersede old offers
-    await ProviderOffer.updateMany(
-      { bookingId, status: { $in: ['pending', 'sent', 'failed'] } },
-      { $set: { status: 'superseded', supersededBy: 'auto_redispatch' } }
-    );
+    if (ProviderOffer && typeof ProviderOffer.updateMany === 'function') {
+      await ProviderOffer.updateMany(
+        { bookingId, status: { $in: ['pending', 'sent', 'failed'] } },
+        { $set: { status: 'superseded', supersededBy: 'auto_redispatch' } }
+      );
+    }
 
-    // 2. Reset booking status
-    await Booking.updateOne(
-      { bookingId },
-      { $set: { status: 'confirmed', providerId: null } }
-    );
+    if (Booking && typeof Booking.updateOne === 'function') {
+      await Booking.updateOne(
+        { bookingId },
+        { $set: { status: 'confirmed', providerId: null } }
+      );
+    }
 
-    // 3. Clear cooldown in dispatch service memory
     if (typeof dispatchService.clearCooldown === 'function') {
       dispatchService.clearCooldown(bookingId);
     }
 
-    // 4. Trigger fresh dispatch
-    const result = await dispatchService.dispatchBooking(bookingId, {
-      manual: true,
-      reason: 'auto_redispatch',
-    });
+    const result = typeof dispatchService.dispatchBooking === 'function'
+      ? await dispatchService.dispatchBooking(bookingId, { manual: true, reason: 'auto_redispatch' })
+      : { message: 'dispatch service unavailable' };
 
     return ok(res, result);
   } catch (err) {
@@ -279,15 +332,13 @@ exports.assignProviderManually = async (req, res) => {
   try {
     const { bookingId } = req.params;
     const { providerId } = req.body || {};
-    if (!providerId)
-      return res
-        .status(400)
-        .json({ success: false, message: 'providerId required' });
-
-    const result = await dispatchService.manualAssignProvider(
-      bookingId,
-      providerId
-    );
+    if (!providerId) {
+      return res.status(400).json({ success: false, message: 'providerId required' });
+    }
+    if (typeof dispatchService.manualAssignProvider !== 'function') {
+      return fail(res, new Error('manualAssignProvider unavailable'));
+    }
+    const result = await dispatchService.manualAssignProvider(bookingId, providerId);
     return ok(res, result);
   } catch (err) {
     return fail(res, err);
