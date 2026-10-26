@@ -61,17 +61,31 @@ const buildAllowedOrigins = () => {
 const ALLOWED_ORIGINS = buildAllowedOrigins();
 console.log('📋 Allowed Origins:', ALLOWED_ORIGINS);
 
+// ============================================================
+// 🔧 CRITICAL FIX: Socket.IO CORS
+// origin: '*' + credentials: true = BROWSER BLOCKS CONNECTION
+// We MUST reflect the actual request origin when using credentials
+// ============================================================
 const io = new Server(server, {
   cors: {
-    origin: '*',
+    origin: (origin, callback) => {
+      // Reflect the actual request origin (fixes the * + credentials bug)
+      callback(null, origin || '*');
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: [
+      'Content-Type', 'Authorization', 'X-Requested-With',
+      'X-App-Version', 'X-Platform', 'X-Device-Id'
+    ],
   },
   pingTimeout: 60000,
   pingInterval: 25000,
   transports: ['websocket', 'polling'],
   allowUpgrades: true,
   allowEIO3: true,
+  maxHttpBufferSize: 1e8,
+  connectTimeout: 45000,
 });
 
 app.set('io', io);
@@ -85,15 +99,19 @@ app.use(helmet({
 }));
 app.use(compression());
 
+// ============================================================
+// 🔧 CORS MIDDLEWARE — also fixed to reflect origin in production
+// ============================================================
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (process.env.NODE_ENV !== 'production') {
-    res.setHeader('Access-Control-Allow-Origin', origin || '*');
-  } else if (origin && ALLOWED_ORIGINS.includes(origin)) {
+
+  // ALWAYS reflect the actual origin (never use '*' with credentials)
+  if (origin) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   } else {
     res.setHeader('Access-Control-Allow-Origin', '*');
   }
+
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
   res.setHeader('Access-Control-Allow-Headers',
@@ -104,6 +122,7 @@ app.use((req, res, next) => {
     'X-Total-Count, X-Page, X-Per-Page, X-Total-Pages, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, Content-Disposition'
   );
   res.setHeader('Access-Control-Max-Age', '86400');
+
   if (req.method === 'OPTIONS') return res.status(204).end();
   next();
 });
@@ -142,7 +161,7 @@ app.get('/health', (req, res) => {
     redisStatus = isRedisConnected() ? 'connected' : 'disconnected';
   } catch (e) {}
 
-  // Count connected sockets
+  // ✅ Count connected sockets
   let socketCount = 0;
   let adminRoomCount = 0;
   try {
@@ -171,8 +190,35 @@ app.get('/health', (req, res) => {
       overall: isDbConnected() ? 'connected' : 'disconnected',
     },
     environment: process.env.NODE_ENV || 'development',
-    version: '2.2.1',
+    version: '2.2.2',
     serverIP: LOCAL_IP,
+  });
+});
+
+// ===== SOCKET.IO TEST ENDPOINT =====
+app.get('/api/v1/admin/socket-test', (req, res) => {
+  let socketCount = 0;
+  let adminRoomCount = 0;
+  let adminRoomSockets = [];
+  try {
+    socketCount = io.engine.clientsCount || 0;
+    const adminRoom = io.sockets.adapter.rooms.get('admins');
+    adminRoomCount = adminRoom ? adminRoom.size : 0;
+    if (adminRoom) {
+      adminRoomSockets = Array.from(adminRoom);
+    }
+  } catch (e) {}
+
+  res.json({
+    success: true,
+    sockets: {
+      totalConnected: socketCount,
+      inAdminRoom: adminRoomCount,
+      adminSocketIds: adminRoomSockets,
+    },
+    message: socketCount > 0
+      ? `✅ ${socketCount} socket(s) connected, ${adminRoomCount} in admin room`
+      : '⚠️ No sockets connected. Frontend socket is NOT reaching the server.',
   });
 });
 
@@ -184,25 +230,29 @@ app.post('/api/v1/mobile/register-device', (req, res) => {
   res.json({ success: true, message: 'Device registered', data: { registered: true } });
 });
 
-// ===== SOCKET.IO =====
+// ===== SOCKET.IO CONNECTION HANDLER =====
 io.on('connection', (socket) => {
-  logger.info(`🔌 Client connected: ${socket.id}`);
+  // ✅ Use console.log (NOT logger.info) — guaranteed to show in Render logs
+  console.log(`\n🔌🔌🔌 SOCKET CONNECTED: ${socket.id} 🔌🔌🔌`);
+  console.log(`   Origin: ${socket.handshake.headers.origin || 'unknown'}`);
+  console.log(`   Transport: ${socket.conn.transport.name}`);
+  console.log(`   Auth: ${JSON.stringify(socket.handshake.auth || {})}`);
 
-  // ✅ ALWAYS auto-join 'admins' room on connect (safety net)
+  // ✅ ALWAYS auto-join 'admins' room
   socket.join('admins');
   console.log(`✅ Socket ${socket.id} auto-joined 'admins' room`);
 
-  // Log current connected count
+  // Log room count
   try {
     const adminRoom = io.sockets.adapter.rooms.get('admins');
     const count = adminRoom ? adminRoom.size : 0;
-    console.log(`👥 Total sockets in 'admins' room: ${count}`);
+    console.log(`👥 Total in 'admins' room: ${count}`);
   } catch (e) {}
 
-  // ===== ADMIN REGISTRATION (multiple event names for compatibility) =====
-  const handleAdminRegister = (data) => {
+  // ===== ADMIN REGISTRATION (all event names) =====
+  const handleAdminRegister = (eventName) => (data) => {
     try {
-      logger.info(`👑 Admin registered: ${socket.id}`, data?.email || 'no-email');
+      console.log(`👑 Admin event "${eventName}" from ${socket.id}:`, JSON.stringify(data || {}));
       socket.join('admins');
       if (data?.email) {
         socket.join(`admin:${data.email}`);
@@ -213,19 +263,20 @@ io.on('connection', (socket) => {
       socket.data.email = data?.email || '';
       socket.data.role = data?.role || 'admin';
 
+      // Send ack back to frontend
       socket.emit('admin:registered', { success: true, socketId: socket.id });
     } catch (e) {
-      console.error('admin:register error:', e.message);
+      console.error(`admin register error (${eventName}):`, e.message);
     }
   };
 
-  socket.on('admin:register', handleAdminRegister);
-  socket.on('admin:join', handleAdminRegister);
-  socket.on('register:admin', handleAdminRegister);
-  socket.on('join:admins', handleAdminRegister);
+  socket.on('admin:register', handleAdminRegister('admin:register'));
+  socket.on('admin:join', handleAdminRegister('admin:join'));
+  socket.on('register:admin', handleAdminRegister('register:admin'));
+  socket.on('join:admins', handleAdminRegister('join:admins'));
   socket.on('join', (data) => {
     if (data?.room === 'admins' || data?.role === 'admin') {
-      handleAdminRegister(data);
+      handleAdminRegister('join')(data);
     }
   });
 
@@ -240,7 +291,7 @@ io.on('connection', (socket) => {
 
   // ===== DISCONNECT =====
   socket.on('disconnect', (reason) => {
-    logger.info(`🔌 Client disconnected: ${socket.id}, reason: ${reason}`);
+    console.log(`🔌 SOCKET DISCONNECTED: ${socket.id}, reason: ${reason}`);
   });
 
   // ===== LAYOUT PREVIEW =====
@@ -248,9 +299,9 @@ io.on('connection', (socket) => {
     socket.broadcast.to('admins').emit('layout:preview', data);
   });
 
-  // ===== PING (for debugging) =====
+  // ===== PING TEST =====
   socket.on('ping:test', (data) => {
-    console.log('🏓 Ping received from', socket.id);
+    console.log('🏓 Ping from', socket.id);
     socket.emit('pong:test', { ...data, serverTime: Date.now() });
   });
 });
@@ -260,7 +311,7 @@ const HOST = '0.0.0.0';
 
 async function startServer() {
   try {
-    logger.info('Starting Admin Panel Backend Server v2.2.1 ...');
+    logger.info('Starting Admin Panel Backend Server v2.2.2 ...');
     console.log('\n🔌 Connecting to databases...');
     await connectDB();
     console.log('✅ All databases connected successfully\n');
@@ -376,7 +427,6 @@ async function startServer() {
       const { setIo } = require('./services/adminAlertService');
       setIo(io);
 
-      // Also attach to liveEmitter directly
       try {
         const liveEmitter = require('./services/liveEmitter');
         if (typeof liveEmitter.setLiveIo === 'function') {
@@ -387,7 +437,6 @@ async function startServer() {
         console.warn('liveEmitter attach warning:', e.message);
       }
 
-      // ✅ Start booking poller
       try {
         const { startBookingPoller } = require('./workers/bookingPoller');
         startBookingPoller();
@@ -395,7 +444,6 @@ async function startServer() {
         logger.error(`bookingPoller start failed: ${e.message}`);
       }
 
-      // ✅ Start dispatch watcher
       try {
         const { startWatcher } = require('./workers/dispatchWorker');
         startWatcher();
@@ -413,14 +461,14 @@ async function startServer() {
       const { isProviderFirebaseReady, isAdminWebFirebaseReady } = require('./config/firebase');
       console.log(`
 ╔════════════════════════════════════════════════════════════════╗
-║  🚀 Admin Panel Backend v2.2.1 (FCM + DISPATCH + SOCKET.IO)    ║
+║  🚀 Admin Panel Backend v2.2.2 (CORS FIX + SOCKET.IO)          ║
 ╠════════════════════════════════════════════════════════════════╣
 ║  Port:                  ${PORT.toString().padEnd(39)}║
 ║  Database:              ✅ Connected                            ║
 ║  Provider Firebase:     ${isProviderFirebaseReady() ? '✅ Ready    ' : '⚠️  Not Ready'}                            ║
 ║  Admin Web Firebase:    ${isAdminWebFirebaseReady() ? '✅ Ready    ' : '⚠️  Not Ready'}                            ║
 ║  Dispatch:              ${process.env.DISPATCH_ENABLED === 'true' ? '✅ RUNNING  ' : '⚠️  DISABLED '}                            ║
-║  Socket.IO:             ✅ Ready (auto-join 'admins' room)      ║
+║  Socket.IO CORS:        ✅ FIXED (dynamic origin reflection)    ║
 ╚════════════════════════════════════════════════════════════════╝
       `);
     });
