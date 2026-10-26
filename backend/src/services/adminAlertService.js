@@ -19,7 +19,6 @@ function getModels() {
   if (!AdminFcmToken) {
     try {
       AdminFcmToken = require('../models/AdminFcmToken');
-      // Unwrap default/named export
       AdminFcmToken = AdminFcmToken?.default || AdminFcmToken?.AdminFcmToken || AdminFcmToken;
     } catch (e) {
       logger.error('Failed to load AdminFcmToken model: ' + e.message);
@@ -33,6 +32,24 @@ function setIo(io) {
   ioRef = io;
   liveEmitter.setLiveIo(io);
   logger.info('✅ Socket.IO attached to adminAlertService');
+}
+
+/* ─── BACKEND DEDUPE CACHE — blocks same alert within 10s ─── */
+const recentAlerts = new Map();
+function isDuplicateAlert(key) {
+  const now = Date.now();
+  const last = recentAlerts.get(key);
+
+  // Clean old entries
+  if (recentAlerts.size > 200) {
+    for (const [k, t] of recentAlerts.entries()) {
+      if (now - t > 60_000) recentAlerts.delete(k);
+    }
+  }
+
+  if (last && now - last < 10_000) return true;
+  recentAlerts.set(key, now);
+  return false;
 }
 
 /**
@@ -61,12 +78,20 @@ async function createAdminAlert(typeOrObject, dataArg = {}, options = {}) {
     const actionUrl = data.actionUrl || null;
     const extraData = data.data || {};
 
+    // 🛡️ DEDUPE at backend level
+    const dedupeKey = `${type}::${bookingId || title}::${message}`;
+    if (isDuplicateAlert(dedupeKey)) {
+      logger.info(`🚫 Duplicate admin alert blocked: ${type} / ${bookingId || title}`);
+      return { success: true, type, deduped: true };
+    }
+
     const { AdminNotification, AdminFcmToken } = getModels();
 
     // Save to DB
+    let savedDoc = null;
     if (AdminNotification) {
       try {
-        await AdminNotification.create({
+        savedDoc = await AdminNotification.create({
           type,
           title,
           message,
@@ -84,15 +109,22 @@ async function createAdminAlert(typeOrObject, dataArg = {}, options = {}) {
       }
     }
 
-    // Emit to all admins via Socket.IO
+    // ✅ EMIT ONLY ONCE — single canonical event
     try {
-      liveEmitter.emitLive(type, {
-        type, title, message, severity, bookingId, providerId, actionUrl, data: extraData,
-      });
-      liveEmitter.emitLive('admin:notification', {
-        type, title, message, severity, bookingId, providerId, actionUrl, data: extraData,
-      });
-      logger.info(`🔔 Socket.IO emitted: ${type}`);
+      const payload = {
+        _id: savedDoc?._id,
+        type,
+        title,
+        message,
+        severity,
+        bookingId,
+        providerId,
+        actionUrl,
+        data: extraData,
+        createdAt: savedDoc?.createdAt || new Date(),
+      };
+      liveEmitter.emitLive('admin:notification', payload);
+      logger.info(`🔔 Socket.IO emitted: admin:notification (${type})`);
     } catch (e) {
       logger.error(`Socket emit failed: ${e.message}`);
     }
@@ -109,7 +141,6 @@ async function createAdminAlert(typeOrObject, dataArg = {}, options = {}) {
         if (tokens.length > 0) {
           await Promise.all(
             tokens.map(async (t) => {
-              // ✅ FIXED: Use t.fcmToken (schema field name now matches)
               if (!t.fcmToken) {
                 logger.warn(`[FCM] Token doc ${t._id} has no fcmToken field — skipping`);
                 return;
@@ -167,7 +198,7 @@ async function createAdminAlert(typeOrObject, dataArg = {}, options = {}) {
   }
 }
 
-// Backward compat — re-export emitLive
+// Backward compat
 function emitLive(event, data = {}, room = 'admins') {
   return liveEmitter.emitLive(event, data, room);
 }
