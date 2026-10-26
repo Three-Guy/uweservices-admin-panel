@@ -1,322 +1,295 @@
 // backend/src/controllers/dispatch.controller.js
-// ✅ All dispatch endpoints for admin panel
-
-const mongoose = require('mongoose');
-const { getBookingModel } = require('../config/database');
 const DispatchJob = require('../models/DispatchJob');
 const ProviderOffer = require('../models/ProviderOffer');
-const {
-  dispatchBooking,
-  manualReassign,
-  manualAssignProvider,
-  clearCooldown,
-} = require('../services/dispatchService');
-const { findEligibleProviders, debugEligibility } = require('../services/eligibilityService');
+const Booking = require('../models/Booking');
 
-// ─── GET /admin/dispatch/stats ───
+const dispatchService = require('../services/dispatchService');
+const eligibilityService = require('../services/eligibilityService');
+
+/* ─── small helpers ─────────────────────────────────────────── */
+const ok = (res, data, extra = {}) =>
+  res.json({ success: true, data, ...extra });
+
+const fail = (res, err, code = 500) => {
+  const msg = err?.message || String(err) || 'Internal error';
+  console.error('[DispatchController]', msg);
+  return res.status(code).json({ success: false, message: msg });
+};
+
+/* ══════════════════════════════════════════════════════════════
+   GET /stats  — live dispatch engine stats
+   ══════════════════════════════════════════════════════════════ */
 exports.getStats = async (req, res) => {
   try {
-    const Booking = getBookingModel();
-
     const [
-      searching,
-      confirmedWaiting,
+      activeDispatches,
+      queuedJobs,
+      recentFailures,
       noProviderFound,
-      failedJobs,
-      runningJobs,
+      offers24h,
     ] = await Promise.all([
-      Booking.countDocuments({ status: 'searching', isDeleted: { $ne: true } }),
-      Booking.countDocuments({
-        status: 'confirmed',
-        providerId: { $in: [null, undefined] },
-        isDeleted: { $ne: true },
-      }),
-      Booking.countDocuments({ status: 'no_provider_found', isDeleted: { $ne: true } }),
-      DispatchJob.countDocuments({ status: 'failed' }),
       DispatchJob.countDocuments({ status: 'running' }),
+      DispatchJob.countDocuments({ status: 'queued' }),
+      DispatchJob.countDocuments({
+        status: 'no_provider_found',
+        updatedAt: { $gte: new Date(Date.now() - 60 * 60 * 1000) },
+      }),
+      Booking.countDocuments({ status: 'no_provider_found' }),
+      ProviderOffer.find({
+        createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+      }).select('status').lean(),
     ]);
 
-    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const [totalOffers, accepted, rejected, timeout] = await Promise.all([
-      ProviderOffer.countDocuments({ createdAt: { $gte: since } }),
-      ProviderOffer.countDocuments({ createdAt: { $gte: since }, status: 'accepted' }),
-      ProviderOffer.countDocuments({ createdAt: { $gte: since }, status: 'rejected' }),
-      ProviderOffer.countDocuments({ createdAt: { $gte: since }, status: 'timeout' }),
-    ]);
-
-    const acceptanceRate = totalOffers > 0 ? Math.round((accepted / totalOffers) * 100) : 0;
-
-    res.json({
-      success: true,
-      data: {
-        liveState: {
-          searching,
-          confirmedWaitingDispatch: confirmedWaiting,
-          noProviderFound,
-          failedJobs,
-          runningJobs,
-        },
-        last24h: {
-          totalOffers,
-          accepted,
-          rejected,
-          timeout,
-          acceptanceRate,
-        },
-      },
+    // Cooldowns = unique bookings currently in no_provider_found with recent fail
+    const cooldownBookings = await Booking.countDocuments({
+      status: 'no_provider_found',
+      updatedAt: { $gte: new Date(Date.now() - 10 * 60 * 1000) },
     });
-  } catch (e) {
-    console.error('[DispatchController] getStats error:', e.message);
-    res.status(500).json({ success: false, message: e.message });
+
+    const total24h = offers24h.length;
+    const breakdown24h = {
+      total: total24h,
+      accepted: offers24h.filter((o) => o.status === 'accepted').length,
+      rejected: offers24h.filter((o) => o.status === 'rejected').length,
+      expired: offers24h.filter((o) => o.status === 'expired').length,
+      failed: offers24h.filter((o) => o.status === 'failed').length,
+      noProvider: 0,
+    };
+    const acceptRate24h =
+      total24h > 0 ? (breakdown24h.accepted / total24h) * 100 : 0;
+
+    return ok(res, {
+      activeDispatches,
+      queuedJobs,
+      recentFailures,
+      noProviderFoundTotal: noProviderFound,
+      cooldowns: cooldownBookings,
+      acceptRate24h,
+      breakdown24h,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    return fail(res, err);
   }
 };
 
-// ─── GET /admin/dispatch/active ───
+/* ══════════════════════════════════════════════════════════════
+   GET /active — currently running dispatches
+   ══════════════════════════════════════════════════════════════ */
 exports.getActiveDispatches = async (req, res) => {
   try {
     const jobs = await DispatchJob.find({
       status: { $in: ['running', 'queued'] },
     })
-      .sort({ startedAt: -1 })
+      .sort({ createdAt: -1 })
       .limit(50)
       .lean();
 
-    res.json({ success: true, data: { jobs } });
-  } catch (e) {
-    console.error('[DispatchController] getActiveDispatches error:', e.message);
-    res.status(500).json({ success: false, message: e.message });
+    const data = jobs.map((j) => ({
+      bookingId: j.bookingId,
+      startedAt: j.createdAt,
+      status: j.status,
+      cycle: j.currentCycle,
+      batch: j.currentBatch,
+      currentRadius: j.currentRadiusKm,
+      attempt: j.attempts,
+      reason: j.reason,
+    }));
+
+    return ok(res, data);
+  } catch (err) {
+    return fail(res, err);
   }
 };
 
-// ─── GET /admin/dispatch/no-provider-found ───
+/* ══════════════════════════════════════════════════════════════
+   GET /no-provider-found
+   ══════════════════════════════════════════════════════════════ */
 exports.getNoProviderBookings = async (req, res) => {
   try {
-    const Booking = getBookingModel();
-    const page = parseInt(req.query.page || '1', 10);
-    const limit = parseInt(req.query.limit || '20', 10);
-    const skip = (page - 1) * limit;
-
-    const [bookings, total] = await Promise.all([
-      Booking.find({
-        status: 'no_provider_found',
-        isDeleted: { $ne: true },
-      })
-        .sort({ updatedAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean(),
-      Booking.countDocuments({
-        status: 'no_provider_found',
-        isDeleted: { $ne: true },
-      }),
-    ]);
-
-    res.json({
-      success: true,
-      data: {
-        bookings,
-        pagination: {
-          page,
-          limit,
-          total,
-          totalPages: Math.ceil(total / limit),
-          hasNext: page * limit < total,
-          hasPrev: page > 1,
-        },
-      },
-    });
-  } catch (e) {
-    console.error('[DispatchController] getNoProviderBookings error:', e.message);
-    res.status(500).json({ success: false, message: e.message });
+    const bookings = await Booking.find({ status: 'no_provider_found' })
+      .sort({ updatedAt: -1 })
+      .limit(100)
+      .lean();
+    return ok(res, bookings);
+  } catch (err) {
+    return fail(res, err);
   }
 };
 
-// ─── GET /admin/dispatch/unassigned ───
-// ALL bookings waiting for provider (confirmed + searching + no_provider_found)
+/* ══════════════════════════════════════════════════════════════
+   GET /unassigned — confirmed / searching / no_provider_found
+   ══════════════════════════════════════════════════════════════ */
 exports.getUnassignedBookings = async (req, res) => {
   try {
-    const Booking = getBookingModel();
-    const page = parseInt(req.query.page || '1', 10);
-    const limit = parseInt(req.query.limit || '20', 10);
-    const skip = (page - 1) * limit;
+    const bookings = await Booking.find({
+      status: { $in: ['confirmed', 'searching', 'no_provider_found', 'pending'] },
+      $or: [{ providerId: null }, { providerId: { $exists: false } }],
+    })
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .lean();
 
-    const filter = {
-      status: { $in: ['confirmed', 'searching', 'no_provider_found'] },
-      providerId: { $in: [null, undefined] },
-      isDeleted: { $ne: true },
-    };
+    // Attach offer trail per booking
+    const ids = bookings.map((b) => b.bookingId);
+    const offers = await ProviderOffer.find({ bookingId: { $in: ids } })
+      .sort({ sentAt: -1 })
+      .lean();
 
-    const [bookings, total] = await Promise.all([
-      Booking.find(filter)
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean(),
-      Booking.countDocuments(filter),
-    ]);
-
-    res.json({
-      success: true,
-      data: {
-        bookings,
-        pagination: {
-          page, limit, total,
-          totalPages: Math.ceil(total / limit),
-          hasNext: page * limit < total,
-          hasPrev: page > 1,
-        },
-      },
+    const offerMap = {};
+    offers.forEach((o) => {
+      if (!offerMap[o.bookingId]) offerMap[o.bookingId] = [];
+      offerMap[o.bookingId].push({
+        providerId: o.providerId,
+        providerName: o.providerName,
+        status: o.status,
+        sentAt: o.sentAt,
+        respondedAt: o.respondedAt,
+        distanceKm: o.distanceKm,
+        fcmSent: o.fcmSent,
+      });
     });
-  } catch (e) {
-    console.error('[DispatchController] getUnassignedBookings error:', e.message);
-    res.status(500).json({ success: false, message: e.message });
+
+    const enriched = bookings.map((b) => ({
+      ...b,
+      offers: offerMap[b.bookingId] || [],
+      offerCount: (offerMap[b.bookingId] || []).length,
+    }));
+
+    return ok(res, enriched);
+  } catch (err) {
+    return fail(res, err);
   }
 };
 
-// ─── GET /admin/dispatch/eligible-providers/:bookingId ───
+/* ══════════════════════════════════════════════════════════════
+   GET /eligible-providers/:bookingId
+   ══════════════════════════════════════════════════════════════ */
 exports.getEligibleProviders = async (req, res) => {
   try {
     const { bookingId } = req.params;
-    const radiusKm = parseInt(req.query.radiusKm || '12', 10);
-    const strict = req.query.strict !== 'false';
+    const booking = await Booking.findOne({ bookingId }).lean();
+    if (!booking)
+      return res
+        .status(404)
+        .json({ success: false, message: 'Booking not found' });
 
-    const Booking = getBookingModel();
-    const booking = await Booking.findOne({
-      $or: [
-        { _id: mongoose.Types.ObjectId.isValid(bookingId) ? new mongoose.Types.ObjectId(bookingId) : null },
-        { bookingId: bookingId },
-      ],
-    }).lean();
-
-    if (!booking) {
-      return res.status(404).json({ success: false, message: 'Booking not found' });
-    }
-
-    const providers = await findEligibleProviders(booking, { radiusKm, strict, debug: false });
-
-    const bookingLat = booking.latitude ?? booking.customerLocation?.coordinates?.[1];
-    const bookingLng = booking.longitude ?? booking.customerLocation?.coordinates?.[0];
-
-    const formatted = providers.map((p) => ({
-      _id: String(p._id),
-      providerId: p.providerId || String(p._id),
-      name: p.name || 'Unknown',
-      phone: p.phone || '',
-      categoryName: p.categoryName || p.profession || '',
-      city: p.city || '',
-      distanceKm: p._distanceKm,
-      rating: typeof p.rating === 'object' ? (p.rating?.average || 0) : (p.rating || 0),
-      completedJobs: p.completedJobs || 0,
-      isOnline: !!p.isOnline,
-      isAvailable: !!p.isAvailable,
-      isAcceptingJobs: !!p.isAcceptingJobs,
-      isBusy: !!p.isBusy,
-      hasFcmToken: !!p.fcmToken,
-    }));
-
-    res.json({ success: true, data: { providers: formatted, count: formatted.length, bookingLat, bookingLng } });
-  } catch (e) {
-    console.error('[DispatchController] getEligibleProviders error:', e.message);
-    res.status(500).json({ success: false, message: e.message });
+    const providers = await eligibilityService.findEligibleProviders(booking);
+    return ok(res, providers);
+  } catch (err) {
+    return fail(res, err);
   }
 };
 
-// ─── GET /admin/dispatch/eligible-providers-debug/:bookingId ───
+/* ══════════════════════════════════════════════════════════════
+   GET /eligible-providers-debug/:bookingId
+   ══════════════════════════════════════════════════════════════ */
 exports.getEligibleProvidersDebug = async (req, res) => {
   try {
     const { bookingId } = req.params;
-    const Booking = getBookingModel();
-    const booking = await Booking.findOne({
-      $or: [
-        { _id: mongoose.Types.ObjectId.isValid(bookingId) ? new mongoose.Types.ObjectId(bookingId) : null },
-        { bookingId: bookingId },
-      ],
-    }).lean();
-    if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
+    const booking = await Booking.findOne({ bookingId }).lean();
+    if (!booking)
+      return res
+        .status(404)
+        .json({ success: false, message: 'Booking not found' });
 
-    const debug = await debugEligibility(booking);
-    res.json({ success: true, data: debug });
-  } catch (e) {
-    console.error('[DispatchController] debug error:', e.message);
-    res.status(500).json({ success: false, message: e.message });
+    if (typeof eligibilityService.debugEligibility === 'function') {
+      const result = await eligibilityService.debugEligibility(booking);
+      return ok(res, result);
+    }
+
+    // Fallback
+    const providers = await eligibilityService.findEligibleProviders(booking);
+    return ok(res, { booking, eligibleCount: providers.length, providers });
+  } catch (err) {
+    return fail(res, err);
   }
 };
 
-// ─── POST /admin/dispatch/trigger/:bookingId ───
+/* ══════════════════════════════════════════════════════════════
+   POST /trigger/:bookingId
+   ══════════════════════════════════════════════════════════════ */
 exports.triggerDispatch = async (req, res) => {
   try {
     const { bookingId } = req.params;
-    clearCooldown(bookingId);
-    // Fire-and-forget
-    setImmediate(() => {
-      dispatchBooking(bookingId, { manual: true }).catch((e) => {
-        console.error('[Trigger] error:', e.message);
-      });
+    const result = await dispatchService.dispatchBooking(bookingId, {
+      manual: true,
+      reason: 'manual_trigger',
     });
-    res.json({ success: true, message: 'Dispatch triggered' });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
+    return ok(res, result);
+  } catch (err) {
+    return fail(res, err);
   }
 };
 
-// ─── POST /admin/dispatch/reassign/:bookingId ───
+/* ══════════════════════════════════════════════════════════════
+   POST /reassign/:bookingId
+   ══════════════════════════════════════════════════════════════ */
 exports.reassignBooking = async (req, res) => {
   try {
     const { bookingId } = req.params;
-    const { reason } = req.body || {};
-    const result = await manualReassign(bookingId, reason);
-    if (!result.success) {
-      return res.status(400).json({ success: false, message: result.error });
-    }
-
-    // Fetch updated booking to return
-    const Booking = getBookingModel();
-    const booking = await Booking.findOne({ bookingId: result.bookingId }).lean();
-    res.json({ success: true, data: { booking }, message: 'Reassignment triggered' });
-  } catch (e) {
-    console.error('[DispatchController] reassign error:', e.message);
-    res.status(500).json({ success: false, message: e.message });
+    const { providerId } = req.body || {};
+    const result = await dispatchService.manualReassign(bookingId, providerId);
+    return ok(res, result);
+  } catch (err) {
+    return fail(res, err);
   }
 };
 
-// ─── POST /admin/dispatch/auto-redispatch/:bookingId ───
-// Simpler alias for reassign — admin-friendly label
+/* ══════════════════════════════════════════════════════════════
+   POST /auto-redispatch/:bookingId
+   ══════════════════════════════════════════════════════════════ */
 exports.autoRedispatch = async (req, res) => {
   try {
     const { bookingId } = req.params;
-    const result = await manualReassign(bookingId, 'Admin auto-redispatch');
-    if (!result.success) {
-      return res.status(400).json({ success: false, message: result.error });
+
+    // 1. Supersede old offers
+    await ProviderOffer.updateMany(
+      { bookingId, status: { $in: ['pending', 'sent', 'failed'] } },
+      { $set: { status: 'superseded', supersededBy: 'auto_redispatch' } }
+    );
+
+    // 2. Reset booking status
+    await Booking.updateOne(
+      { bookingId },
+      { $set: { status: 'confirmed', providerId: null } }
+    );
+
+    // 3. Clear cooldown in dispatch service memory
+    if (typeof dispatchService.clearCooldown === 'function') {
+      dispatchService.clearCooldown(bookingId);
     }
-    const Booking = getBookingModel();
-    const booking = await Booking.findOne({ bookingId: result.bookingId }).lean();
-    res.json({ success: true, data: { booking }, message: 'Auto-redispatch triggered' });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
+
+    // 4. Trigger fresh dispatch
+    const result = await dispatchService.dispatchBooking(bookingId, {
+      manual: true,
+      reason: 'auto_redispatch',
+    });
+
+    return ok(res, result);
+  } catch (err) {
+    return fail(res, err);
   }
 };
 
-// ─── POST /admin/dispatch/assign-manual/:bookingId ───
+/* ══════════════════════════════════════════════════════════════
+   POST /assign-manual/:bookingId
+   ══════════════════════════════════════════════════════════════ */
 exports.assignProviderManually = async (req, res) => {
   try {
     const { bookingId } = req.params;
     const { providerId } = req.body || {};
-    if (!providerId) return res.status(400).json({ success: false, message: 'providerId required' });
+    if (!providerId)
+      return res
+        .status(400)
+        .json({ success: false, message: 'providerId required' });
 
-    const result = await manualAssignProvider(bookingId, providerId);
-    if (!result.success) return res.status(400).json({ success: false, message: result.error });
-
-    const Booking = getBookingModel();
-    const booking = await Booking.findOne({
-      $or: [
-        { _id: mongoose.Types.ObjectId.isValid(bookingId) ? new mongoose.Types.ObjectId(bookingId) : null },
-        { bookingId: bookingId },
-      ],
-    }).lean();
-
-    res.json({ success: true, data: { booking }, message: `Assigned to ${result.provider.name}` });
-  } catch (e) {
-    console.error('[DispatchController] assignManual error:', e.message);
-    res.status(500).json({ success: false, message: e.message });
+    const result = await dispatchService.manualAssignProvider(
+      bookingId,
+      providerId
+    );
+    return ok(res, result);
+  } catch (err) {
+    return fail(res, err);
   }
 };

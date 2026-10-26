@@ -1,5 +1,7 @@
 // backend/src/workers/bookingPoller.js
-// ✅ FIXED: Only change stream + safety net for >30 min stuck bookings
+// ✅ FCM alert to admin on every NEW booking (change stream)
+// ✅ Change stream for real-time dispatch
+// ✅ Safety net for stuck bookings > 30 min
 // ✅ No duplicate handlers
 
 const { getBookingModel } = require('../config/database');
@@ -8,16 +10,99 @@ const { dispatchBooking, isInCooldown } = require('../services/dispatchService')
 let changeStream = null;
 let safetyNetInterval = null;
 const inFlight = new Set();
+const notifiedBookings = new Set(); // Dedupe admin alerts
 
 const SAFETY_NET_STUCK_MIN = parseInt(process.env.DISPATCH_SAFETY_NET_STUCK_MIN || '30', 10);
-const SAFETY_NET_INTERVAL_MS = parseInt(process.env.DISPATCH_SAFETY_NET_INTERVAL_MS || '120000', 10); // 2 min
+const SAFETY_NET_INTERVAL_MS = parseInt(process.env.DISPATCH_SAFETY_NET_INTERVAL_MS || '120000', 10);
 
+/* ─── Helper: safely load admin alert service ─── */
+let adminAlertService = null;
+try {
+  adminAlertService = require('../services/adminAlertService');
+} catch (e) {
+  console.warn('[Poller] ⚠️ adminAlertService not available:', e.message);
+}
+
+/* ─── Helper: safely load socket emitter ─── */
+let socketEmitter = null;
+try {
+  socketEmitter = require('../socket/socketServer');
+} catch (_) {
+  try {
+    socketEmitter = require('../config/socket');
+  } catch (_) { /* ignore */ }
+}
+
+function emitToAdmins(event, payload) {
+  try {
+    if (!socketEmitter) return;
+    if (typeof socketEmitter.emitToAdmins === 'function') {
+      socketEmitter.emitToAdmins(event, payload);
+    } else if (typeof socketEmitter.emitLive === 'function') {
+      socketEmitter.emitLive(event, payload);
+    } else if (typeof socketEmitter.io === 'object' && socketEmitter.io?.emit) {
+      socketEmitter.io.emit(event, payload);
+    } else if (typeof socketEmitter.getIO === 'function') {
+      socketEmitter.getIO().emit(event, payload);
+    }
+  } catch (e) {
+    console.warn('[Poller] socket emit failed:', e.message);
+  }
+}
+
+/* ─── Alert admins when a new booking arrives ─── */
+async function notifyAdminsOfNewBooking(booking) {
+  const bid = booking.bookingId || String(booking._id);
+  if (notifiedBookings.has(bid)) return;
+  notifiedBookings.add(bid);
+  // Clean dedupe set after 1 hour
+  setTimeout(() => notifiedBookings.delete(bid), 60 * 60 * 1000);
+
+  const payload = {
+    bookingId: bid,
+    customerName: booking.customerName,
+    serviceName: booking.serviceName,
+    categoryName: booking.categoryName,
+    cityName: booking.city?.cityName || booking.cityName,
+    bookingType: booking.bookingType,
+    status: booking.status,
+    createdAt: booking.createdAt,
+  };
+
+  // 1. Emit Socket.IO event to all connected admins
+  emitToAdmins('new:booking', payload);
+  emitToAdmins('new_booking', payload);
+
+  // 2. Create persistent admin alert + send FCM push
+  try {
+    if (adminAlertService) {
+      if (typeof adminAlertService.createAdminAlert === 'function') {
+        await adminAlertService.createAdminAlert({
+          type: 'new_booking',
+          title: '🆕 New Booking Received',
+          message: `${bid} · ${booking.serviceName || 'Service'} · ${booking.customerName || 'Customer'}`,
+          bookingId: bid,
+          priority: 'high',
+          data: payload,
+        });
+      } else if (typeof adminAlertService.notifyNewBooking === 'function') {
+        await adminAlertService.notifyNewBooking(booking);
+      }
+    }
+  } catch (e) {
+    console.warn('[Poller] Admin alert failed:', e.message);
+  }
+
+  console.log(`[Poller] 🔔 Admin alerted: ${bid}`);
+}
+
+/* ─── Safe dispatch (dedupe + cooldown) ─── */
 async function safeDispatch(bookingId, reason) {
   if (inFlight.has(bookingId)) {
     console.log(`[Poller] ${bookingId} already in flight (${reason})`);
     return;
   }
-  if (isInCooldown(bookingId)) {
+  if (typeof isInCooldown === 'function' && isInCooldown(bookingId)) {
     console.log(`[Poller] ${bookingId} in cooldown, skip (${reason})`);
     return;
   }
@@ -25,7 +110,7 @@ async function safeDispatch(bookingId, reason) {
   inFlight.add(bookingId);
   try {
     console.log(`[Poller] 🚀 Triggering dispatch for ${bookingId} (${reason})`);
-    await dispatchBooking(bookingId);
+    await dispatchBooking(bookingId, { reason });
   } catch (e) {
     console.error(`[Poller] Dispatch error for ${bookingId}:`, e.message);
   } finally {
@@ -33,6 +118,7 @@ async function safeDispatch(bookingId, reason) {
   }
 }
 
+/* ─── Change stream (real-time trigger) ─── */
 async function startChangeStream() {
   const Booking = getBookingModel();
 
@@ -61,9 +147,13 @@ async function startChangeStream() {
       const status = doc.status;
       const bookingId = doc.bookingId || String(doc._id);
 
-      // Only trigger for 'confirmed' status with no provider assigned
+      // 🔔 On INSERT: always alert admins (regardless of status)
+      if (change.operationType === 'insert') {
+        await notifyAdminsOfNewBooking(doc);
+      }
+
+      // 🚀 On confirmed + no provider: trigger dispatch
       if (status === 'confirmed' && !doc.providerId) {
-        // Instant bookings go NOW. Scheduled go only within 2 hrs of scheduled time.
         if (doc.bookingType === 'instant' || !doc.scheduledDateTime) {
           await safeDispatch(bookingId, 'change_stream:confirmed_instant');
         } else if (doc.scheduledDateTime) {
@@ -75,13 +165,21 @@ async function startChangeStream() {
           }
         }
       }
+
+      // 📡 Emit status updates to admins
+      if (change.operationType === 'update') {
+        emitToAdmins('booking:updated', {
+          bookingId,
+          status,
+          providerId: doc.providerId,
+        });
+      }
     });
 
     changeStream.on('error', (err) => {
       console.error('[Poller] Change stream error:', err.message);
-      // Restart after 5s
       setTimeout(() => {
-        try { changeStream.close(); } catch (e) {}
+        try { changeStream.close(); } catch (_) {}
         startChangeStream();
       }, 5000);
     });
@@ -92,7 +190,7 @@ async function startChangeStream() {
   }
 }
 
-// Safety net: Pick stuck bookings (>30 min in confirmed/searching/no_provider_found) and retry
+/* ─── Safety net for stuck bookings ─── */
 async function runSafetyNet() {
   try {
     const Booking = getBookingModel();
@@ -119,6 +217,7 @@ async function runSafetyNet() {
   }
 }
 
+/* ─── Start / Stop ─── */
 async function startBookingPoller() {
   console.log('[Poller] Starting booking poller...');
   await startChangeStream();
@@ -128,7 +227,7 @@ async function startBookingPoller() {
 
 async function stopBookingPoller() {
   if (changeStream) {
-    try { await changeStream.close(); } catch (e) {}
+    try { await changeStream.close(); } catch (_) {}
     changeStream = null;
   }
   if (safetyNetInterval) {

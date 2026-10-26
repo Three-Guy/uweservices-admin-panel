@@ -1,75 +1,89 @@
-// src/models/ProviderOffer.js
+// backend/src/models/ProviderOffer.js
+// ✅ Auto-detects admin connection
+// ✅ Exports MODEL directly
+
 const mongoose = require('mongoose');
-const { getBookingConnection } = require('../config/database');
+
+function getAdminConn() {
+  try {
+    const multiDb = require('../config/multiDb');
+    if (typeof multiDb.getAdminConnection === 'function') return multiDb.getAdminConnection();
+    if (typeof multiDb.getAdminPanelConnection === 'function') return multiDb.getAdminPanelConnection();
+    if (typeof multiDb.adminConnection === 'function') return multiDb.adminConnection();
+    if (multiDb.adminConnection && typeof multiDb.adminConnection.model === 'function') return multiDb.adminConnection;
+    if (multiDb.adminDb && typeof multiDb.adminDb.model === 'function') return multiDb.adminDb;
+    if (multiDb.admin && typeof multiDb.admin.model === 'function') return multiDb.admin;
+  } catch (_) { /* ignore */ }
+
+  try {
+    const db = require('../config/database');
+    if (typeof db.getAdminConnection === 'function') return db.getAdminConnection();
+    if (typeof db.getAdminPanelConnection === 'function') return db.getAdminPanelConnection();
+    if (db.adminConnection && typeof db.adminConnection.model === 'function') return db.adminConnection;
+    if (db.adminDb && typeof db.adminDb.model === 'function') return db.adminDb;
+  } catch (_) { /* ignore */ }
+
+  return mongoose;
+}
 
 const providerOfferSchema = new mongoose.Schema(
   {
     bookingId: { type: String, required: true, index: true },
-    bookingObjectId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true },
-
     providerId: { type: String, required: true, index: true },
-    providerObjectId: { type: mongoose.Schema.Types.ObjectId, required: true },
-    providerName: { type: String, default: '' },
-    providerPhone: { type: String, default: '' },
-    providerCategory: { type: String, default: '' },
-    providerCity: { type: String, default: '' },
+    providerName: { type: String },
+    providerPhone: { type: String },
 
-    // Offer lifecycle
     status: {
       type: String,
-      enum: ['sent', 'delivered', 'viewed', 'accepted', 'rejected', 'cancelled', 'timeout', 'failed', 'superseded'],
-      default: 'sent',
+      enum: [
+        'pending', 'sent', 'delivered', 'viewed',
+        'accepted', 'rejected', 'expired', 'timeout',
+        'failed', 'superseded',
+      ],
+      default: 'pending',
       index: true,
     },
 
-    // Timings
-    offeredAt: { type: Date, default: Date.now, index: true },
-    deliveredAt: { type: Date, default: null },
-    viewedAt: { type: Date, default: null },
+    cycle: { type: Number, default: 1 },
+    batch: { type: Number, default: 1 },
+    radiusKm: { type: Number, default: 0 },
+    distanceKm: { type: Number, default: null },
+
+    fcmSent: { type: Boolean, default: false },
+    fcmError: { type: String, default: null },
+    fcmResponse: { type: mongoose.Schema.Types.Mixed, default: null },
+
+    sentAt: { type: Date, default: Date.now },
     respondedAt: { type: Date, default: null },
     expiresAt: { type: Date, default: null },
 
-    // Dispatch metadata
-    dispatchCycle: { type: Number, default: 1 },
-    batchNumber: { type: Number, default: 1 },
-    radiusKm: { type: Number, default: 0 },
-    distanceKm: { type: Number, default: 0 },
-
-    // FCM
-    fcmSent: { type: Boolean, default: false },
-    fcmMessageId: { type: String, default: null },
-    fcmError: { type: String, default: null },
-    fcmToken: { type: String, default: null },
-
-    // Context
+    responseMessage: { type: String, default: null },
+    rejectionReason: { type: String, default: null },
     reason: { type: String, default: null },
-    isCurrentOffer: { type: Boolean, default: true, index: true },
-    isScheduled: { type: Boolean, default: false },
 
-    // Snapshot of booking at offer time
-    bookingSnapshot: {
-      serviceName: String,
-      totalAmount: Number,
-      address: String,
-      scheduledDate: String,
-      scheduledTime: String,
-    },
+    isCurrentOffer: { type: Boolean, default: true },
+    supersededBy: { type: String, default: null },
   },
-  { timestamps: true }
+  { timestamps: true, collection: 'provideroffers' }
 );
 
-providerOfferSchema.index({ bookingId: 1, providerId: 1, offeredAt: -1 });
-providerOfferSchema.index({ status: 1, offeredAt: -1 });
-providerOfferSchema.index({ bookingId: 1, isCurrentOffer: 1 });
+providerOfferSchema.index({ bookingId: 1, providerId: 1 });
+providerOfferSchema.index({ bookingId: 1, status: 1 });
+providerOfferSchema.index({ status: 1, sentAt: -1 });
+providerOfferSchema.index({ status: 1, expiresAt: 1 });
 
-let ProviderOfferModel = null;
-
-function getProviderOfferModel() {
-  if (ProviderOfferModel) return ProviderOfferModel;
-  const conn = getBookingConnection();
-  if (!conn) throw new Error('Booking DB connection not ready');
-  ProviderOfferModel = conn.models.ProviderOffer || conn.model('ProviderOffer', providerOfferSchema, 'provideroffers');
-  return ProviderOfferModel;
+let ProviderOffer;
+try {
+  const conn = getAdminConn();
+  ProviderOffer =
+    (conn.models && conn.models.ProviderOffer) ||
+    conn.model('ProviderOffer', providerOfferSchema);
+  console.log('[ProviderOffer] ✅ Model registered on:', conn?.name || conn?.db?.databaseName || 'default');
+} catch (err) {
+  console.error('[ProviderOffer] ⚠️ Fallback to default mongoose:', err.message);
+  ProviderOffer =
+    mongoose.models.ProviderOffer ||
+    mongoose.model('ProviderOffer', providerOfferSchema);
 }
 
-module.exports = { getProviderOfferModel, providerOfferSchema };
+module.exports = ProviderOffer;
