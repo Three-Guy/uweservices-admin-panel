@@ -4,15 +4,50 @@ const admin = require('firebase-admin');
 let adminWebApp = null;
 let providerApp = null;
 
+/**
+ * Firebase-admin v12+ uses default export directly.
+ * Access cert via admin.credential.cert OR require('firebase-admin/app')
+ */
+function getCertFunction() {
+  // Try v11 and below style
+  if (admin.credential && typeof admin.credential.cert === 'function') {
+    return admin.credential.cert.bind(admin.credential);
+  }
+  // Try v12+ named export style
+  try {
+    const { cert } = require('firebase-admin/app');
+    if (typeof cert === 'function') return cert;
+  } catch (e) {
+    // ignore
+  }
+  // Try direct cert on admin
+  if (typeof admin.cert === 'function') return admin.cert.bind(admin);
+  return null;
+}
+
+function getInitializeAppFunction() {
+  // v12+ style
+  try {
+    const { initializeApp, getApp } = require('firebase-admin/app');
+    if (typeof initializeApp === 'function') {
+      return { initializeApp, getApp };
+    }
+  } catch (e) {
+    // ignore
+  }
+  // v11 style
+  return {
+    initializeApp: admin.initializeApp.bind(admin),
+    getApp: admin.app ? admin.app.bind(admin) : null,
+  };
+}
+
 function parseServiceAccount(raw) {
   if (!raw) return null;
   try {
-    // If already an object, return it
     if (typeof raw === 'object') return raw;
-    // Try parsing as JSON string
     const parsed = JSON.parse(raw);
     if (parsed && parsed.type === 'service_account') return parsed;
-    // Maybe it's a JSON string wrapped in quotes
     if (typeof parsed === 'string') return JSON.parse(parsed);
     return parsed;
   } catch (e) {
@@ -24,7 +59,13 @@ function parseServiceAccount(raw) {
 function decodeBase64ServiceAccount(base64Str) {
   if (!base64Str) return null;
   try {
-    const cleaned = base64Str.replace(/\s+/g, '').trim();
+    // Remove surrounding quotes if present
+    let cleaned = base64Str.trim();
+    if ((cleaned.startsWith('"') && cleaned.endsWith('"')) ||
+        (cleaned.startsWith("'") && cleaned.endsWith("'"))) {
+      cleaned = cleaned.slice(1, -1);
+    }
+    cleaned = cleaned.replace(/\s+/g, '').trim();
     const jsonStr = Buffer.from(cleaned, 'base64').toString('utf8');
     return parseServiceAccount(jsonStr);
   } catch (e) {
@@ -36,17 +77,17 @@ function decodeBase64ServiceAccount(base64Str) {
 function loadServiceAccountFromEnv(envKey) {
   const raw = process.env[envKey];
   if (!raw) return null;
-
-  // Check if it looks like base64 (no curly braces)
   const trimmed = raw.trim();
-  if (!trimmed.startsWith('{')) {
-    console.info(`✅ Loading Firebase credentials from ${envKey} (base64)`);
-    return decodeBase64ServiceAccount(trimmed);
+  // If starts with { → raw JSON
+  if (trimmed.startsWith('{') || trimmed.startsWith('"{')) {
+    console.info(`✅ Loading Firebase credentials from ${envKey} (raw JSON)`);
+    let cleaned = trimmed;
+    if (cleaned.startsWith('"') && cleaned.endsWith('"')) cleaned = cleaned.slice(1, -1);
+    return parseServiceAccount(cleaned);
   }
-
-  // Otherwise treat as raw JSON
-  console.info(`✅ Loading Firebase credentials from ${envKey} (raw JSON)`);
-  return parseServiceAccount(trimmed);
+  // Else base64
+  console.info(`✅ Loading Firebase credentials from ${envKey} (base64)`);
+  return decodeBase64ServiceAccount(trimmed);
 }
 
 function loadServiceAccountFromFile(filePath) {
@@ -65,7 +106,16 @@ function loadServiceAccountFromFile(filePath) {
 }
 
 function initializeFirebase() {
-  // ─── ADMIN WEB FIREBASE (uwe-services-web) ───
+  const certFn = getCertFunction();
+  const { initializeApp, getApp } = getInitializeAppFunction();
+
+  if (!certFn) {
+    console.error('❌ Cannot find Firebase cert() function. firebase-admin version:', admin.SDK_VERSION || 'unknown');
+    console.error('   Available admin keys:', Object.keys(admin));
+    return;
+  }
+
+  // ─── ADMIN WEB FIREBASE ───
   let adminServiceAccount =
     loadServiceAccountFromEnv('ADMIN_FIREBASE_SERVICE_ACCOUNT_BASE64') ||
     loadServiceAccountFromEnv('ADMIN_FIREBASE_SERVICE_ACCOUNT_JSON') ||
@@ -74,35 +124,26 @@ function initializeFirebase() {
 
   if (adminServiceAccount && adminServiceAccount.project_id) {
     try {
-      // Make sure firebase-admin credential module is available
-      if (!admin.credential || typeof admin.credential.cert !== 'function') {
-        console.error('❌ firebase-admin credential.cert is not available. Check firebase-admin installation.');
-        console.error('   admin keys:', Object.keys(admin));
-      } else {
-        adminWebApp = admin.initializeApp(
-          {
-            credential: admin.credential.cert(adminServiceAccount),
-          },
-          'adminWeb'
-        );
-        console.info(`✅ Admin Web Firebase initialized (project: ${adminServiceAccount.project_id})`);
-      }
+      adminWebApp = initializeApp(
+        { credential: certFn(adminServiceAccount) },
+        'adminWeb'
+      );
+      console.info(`✅ Admin Web Firebase initialized (project: ${adminServiceAccount.project_id})`);
     } catch (e) {
-      if (e.code === 'app/duplicate-app') {
-        adminWebApp = admin.app('adminWeb');
-        console.info('✅ Admin Web Firebase already initialized');
+      if (e.code === 'app/duplicate-app' && getApp) {
+        try {
+          adminWebApp = getApp('adminWeb');
+          console.info('✅ Admin Web Firebase already initialized (reused)');
+        } catch {}
       } else {
         console.error('❌ Admin Web Firebase init failed:', e.message);
       }
     }
   } else {
     console.warn('⚠️  No Admin Web Firebase credentials found. Admin FCM disabled.');
-    if (adminServiceAccount) {
-      console.warn('   Credentials loaded but missing project_id. Keys:', Object.keys(adminServiceAccount));
-    }
   }
 
-  // ─── PROVIDER FIREBASE (serviceproviderapp-b7767) ───
+  // ─── PROVIDER FIREBASE ───
   let providerServiceAccount =
     loadServiceAccountFromEnv('PROVIDER_FIREBASE_SERVICE_ACCOUNT_BASE64') ||
     loadServiceAccountFromEnv('PROVIDER_FIREBASE_SERVICE_ACCOUNT_JSON') ||
@@ -111,18 +152,14 @@ function initializeFirebase() {
 
   if (providerServiceAccount && providerServiceAccount.project_id) {
     try {
-      if (admin.credential && typeof admin.credential.cert === 'function') {
-        providerApp = admin.initializeApp(
-          {
-            credential: admin.credential.cert(providerServiceAccount),
-          },
-          'providerApp'
-        );
-        console.info(`✅ Provider Firebase initialized (project: ${providerServiceAccount.project_id})`);
-      }
+      providerApp = initializeApp(
+        { credential: certFn(providerServiceAccount) },
+        'providerApp'
+      );
+      console.info(`✅ Provider Firebase initialized (project: ${providerServiceAccount.project_id})`);
     } catch (e) {
-      if (e.code === 'app/duplicate-app') {
-        providerApp = admin.app('providerApp');
+      if (e.code === 'app/duplicate-app' && getApp) {
+        try { providerApp = getApp('providerApp'); } catch {}
       } else {
         console.error('❌ Provider Firebase init failed:', e.message);
       }
@@ -132,32 +169,25 @@ function initializeFirebase() {
   }
 }
 
-function isAdminWebFirebaseReady() {
-  return !!adminWebApp;
-}
-
-function isProviderFirebaseReady() {
-  return !!providerApp;
-}
+function isAdminWebFirebaseReady() { return !!adminWebApp; }
+function isProviderFirebaseReady() { return !!providerApp; }
 
 async function sendAdminFcmNotification(token, title, body, data = {}) {
-  if (!adminWebApp) {
-    console.warn('⚠️ Admin FCM not ready, skipping push');
-    return { success: false, error: 'Admin Firebase not initialized' };
-  }
+  if (!adminWebApp) return { success: false, error: 'Admin Firebase not initialized' };
   try {
-    const messaging = admin.messaging(adminWebApp);
+    const { getMessaging } = require('firebase-admin/messaging');
+    const messaging = getMessaging(adminWebApp);
     const message = {
       token,
       notification: { title, body },
       data: Object.fromEntries(
-        Object.entries(data).map(([k, v]) => [k, String(v)])
+        Object.entries(data || {}).map(([k, v]) => [k, String(v == null ? '' : v)])
       ),
       webpush: {
         notification: {
           icon: '/logo192.png',
           badge: '/badge72.png',
-          tag: data.bookingId || 'admin-alert',
+          tag: (data && data.bookingId) || 'admin-alert',
         },
       },
     };
@@ -170,17 +200,15 @@ async function sendAdminFcmNotification(token, title, body, data = {}) {
 }
 
 async function sendProviderFcmNotification(token, title, body, data = {}) {
-  if (!providerApp) {
-    console.warn('⚠️ Provider FCM not ready, skipping push');
-    return { success: false, error: 'Provider Firebase not initialized' };
-  }
+  if (!providerApp) return { success: false, error: 'Provider Firebase not initialized' };
   try {
-    const messaging = admin.messaging(providerApp);
+    const { getMessaging } = require('firebase-admin/messaging');
+    const messaging = getMessaging(providerApp);
     const message = {
       token,
       notification: { title, body },
       data: Object.fromEntries(
-        Object.entries(data).map(([k, v]) => [k, String(v)])
+        Object.entries(data || {}).map(([k, v]) => [k, String(v == null ? '' : v)])
       ),
     };
     const response = await messaging.send(message);
