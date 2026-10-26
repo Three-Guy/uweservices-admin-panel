@@ -5,7 +5,7 @@ const logger = require('../utils/logger');
 let AdminNotification = null;
 try {
   const notifModule = require('../models/AdminNotification');
-  AdminNotification = notifModule.getAdminNotificationModel
+  AdminNotification = typeof notifModule.getAdminNotificationModel === 'function'
     ? notifModule.getAdminNotificationModel()
     : notifModule;
 } catch (err) {
@@ -19,7 +19,7 @@ try {
   logger.warn('AdminFcmToken model not available: ' + err.message);
 }
 
-// ── Firebase (safe import) ──
+// ── Firebase ──
 let sendAdminFcmNotification = null;
 let isAdminWebFirebaseReady = () => false;
 try {
@@ -30,30 +30,32 @@ try {
   logger.warn('Firebase config not available: ' + err.message);
 }
 
-// ── Socket.IO instance (set from server.js) ──
+// ── Live Emitter ──
+let setLiveIo = null;
+try {
+  setLiveIo = require('./liveEmitter').setLiveIo;
+} catch (err) {
+  logger.warn('liveEmitter not available: ' + err.message);
+}
+
+// ── Socket.IO ──
 let io = null;
 
-/**
- * Set Socket.IO instance
- */
 function setIo(socketIO) {
   io = socketIO;
+  if (setLiveIo) {
+    setLiveIo(socketIO);
+    logger.info('✅ Socket.IO also attached to liveEmitter');
+  }
   logger.info('✅ Socket.IO attached to adminAlertService');
 }
 
-// Backward compat alias
 const setSocketIO = setIo;
 
-/**
- * Get all active admin FCM tokens
- */
 async function getActiveAdminFcmTokens() {
   if (!AdminFcmToken) return [];
-
   try {
-    const tokens = await AdminFcmToken.find({ isActive: true })
-      .select('fcmToken')
-      .lean();
+    const tokens = await AdminFcmToken.find({ isActive: true }).select('fcmToken').lean();
     return tokens.map((t) => t.fcmToken).filter(Boolean);
   } catch (err) {
     logger.error('Failed to fetch admin FCM tokens: ' + err.message);
@@ -61,12 +63,8 @@ async function getActiveAdminFcmTokens() {
   }
 }
 
-/**
- * Cleanup invalid FCM tokens
- */
 async function cleanupInvalidTokens(invalidTokens) {
   if (!AdminFcmToken || !invalidTokens || invalidTokens.length === 0) return;
-
   try {
     await AdminFcmToken.updateMany(
       { fcmToken: { $in: invalidTokens } },
@@ -79,21 +77,34 @@ async function cleanupInvalidTokens(invalidTokens) {
 }
 
 /**
- * Create admin alert
- * Flow: Save to DB → Emit Socket.IO → Send FCM Push
+ * Create admin alert — handles multiple call signatures
  * 
- * @param {string} type - Alert type (new_booking, booking_assigned, no_provider_found, etc.)
- * @param {object} data - Alert data payload
- * @param {object} options - { skipFcm, skipSocket, skipDb, priority }
+ * Supports both:
+ *   createAdminAlert('new_booking', { bookingId, ... })  ← preferred
+ *   createAdminAlert({ type: 'new_booking', title: '...', message: '...' })  ← legacy
  */
-async function createAdminAlert(type, data = {}, options = {}) {
+async function createAdminAlert(typeOrObject, dataArg = {}, options = {}) {
+  // ── Normalize arguments ──
+  let type, data;
+
+  if (typeof typeOrObject === 'object' && typeOrObject !== null) {
+    // Legacy call style: createAdminAlert({ type, title, message, ... })
+    type = typeOrObject.type || 'admin_alert';
+    data = { ...typeOrObject };
+    delete data.type;
+  } else {
+    // Preferred style: createAdminAlert('type', { data })
+    type = String(typeOrObject || 'admin_alert');
+    data = dataArg || {};
+  }
+
   const alertData = {
-    type,
+    type: String(type),  // ✅ ALWAYS string
     title: data.title || getAlertTitle(type),
     message: data.message || getAlertMessage(type, data),
     data,
     isRead: false,
-    priority: options.priority || data.priority || 'normal',
+    priority: options.priority || data.priority || data.severity || 'normal',
     createdAt: new Date(),
   };
 
@@ -109,18 +120,16 @@ async function createAdminAlert(type, data = {}, options = {}) {
     }
   }
 
-  // ── 2. Socket.IO Real-time Emit ──
+  // ── 2. Socket.IO ──
   if (!options.skipSocket && io) {
     try {
-      // Generic admin_alert event
       io.to('admins').emit('admin_alert', {
         ...alertData,
         _id: savedAlert?._id,
         timestamp: new Date().toISOString(),
       });
 
-      // Specific event name for dispatch monitor
-      io.to('admins').emit(type, {
+      io.to('admins').emit(String(type), {
         ...data,
         title: alertData.title,
         message: alertData.message,
@@ -133,31 +142,27 @@ async function createAdminAlert(type, data = {}, options = {}) {
     }
   }
 
-  // ── 3. FCM Push Notification ──
+  // ── 3. FCM Push ──
   if (!options.skipFcm && sendAdminFcmNotification && isAdminWebFirebaseReady()) {
     try {
       const tokens = await getActiveAdminFcmTokens();
-
       if (tokens.length > 0) {
         const result = await sendAdminFcmNotification(
           tokens,
           alertData.title,
           alertData.message,
           {
-            type,
-            bookingId: data.bookingId || '',
+            type: String(type),
+            bookingId: String(data.bookingId || ''),
             alertId: savedAlert?._id?.toString() || '',
-            priority: alertData.priority,
+            priority: String(alertData.priority),
           }
         );
-
-        // Auto-cleanup invalid tokens
-        if (result.invalidTokens && result.invalidTokens.length > 0) {
+        if (result.invalidTokens?.length > 0) {
           await cleanupInvalidTokens(result.invalidTokens);
         }
       } else {
         logger.warn('⚠️  No active admin FCM tokens — push skipped');
-        logger.warn('   Admin must login and allow browser notifications');
       }
     } catch (fcmErr) {
       logger.error('FCM push failed: ' + fcmErr.message);
@@ -169,12 +174,8 @@ async function createAdminAlert(type, data = {}, options = {}) {
   return savedAlert;
 }
 
-/**
- * Get unread alert count
- */
 async function getUnreadCount(adminEmail = null) {
   if (!AdminNotification) return 0;
-
   try {
     const filter = { isRead: false };
     if (adminEmail) filter.adminEmail = adminEmail;
@@ -184,39 +185,24 @@ async function getUnreadCount(adminEmail = null) {
   }
 }
 
-/**
- * Mark alert as read
- */
 async function markAsRead(alertId) {
   if (!AdminNotification) return;
-
   try {
-    await AdminNotification.findByIdAndUpdate(alertId, {
-      isRead: true,
-      readAt: new Date(),
-    });
+    await AdminNotification.findByIdAndUpdate(alertId, { isRead: true, readAt: new Date() });
   } catch (err) {
     logger.error('markAsRead failed: ' + err.message);
   }
 }
 
-/**
- * Mark all alerts as read
- */
 async function markAllAsRead() {
   if (!AdminNotification) return;
-
   try {
-    await AdminNotification.updateMany(
-      { isRead: false },
-      { isRead: true, readAt: new Date() }
-    );
+    await AdminNotification.updateMany({ isRead: false }, { isRead: true, readAt: new Date() });
   } catch (err) {
     logger.error('markAllAsRead failed: ' + err.message);
   }
 }
 
-// ── Alert title helpers ──
 function getAlertTitle(type) {
   const titles = {
     new_booking: '🆕 New Booking Received',
@@ -225,6 +211,7 @@ function getAlertTitle(type) {
     dispatch_update: '🔄 Dispatch Update',
     dispatch_started: '🚀 Dispatch Started',
     dispatch_retry: '🔁 Dispatch Retry',
+    dispatch_failed: '🚨 Dispatch Failed',
     provider_accepted: '✅ Provider Accepted',
     provider_rejected: '❌ Provider Rejected',
     booking_cancelled: '🚫 Booking Cancelled',
@@ -234,31 +221,18 @@ function getAlertTitle(type) {
   return titles[type] || '📢 Admin Alert';
 }
 
-// ── Alert message helpers ──
 function getAlertMessage(type, data) {
   switch (type) {
     case 'new_booking':
-      return `${data.serviceName || 'Service'} booking from ${data.userName || 'customer'} — ₹${data.amount || 0}`;
+      return `${data.serviceName || 'Service'} booking — ₹${data.amount || 0}`;
     case 'booking_assigned':
-      return `Assigned to ${data.providerName || 'provider'} (${data.distance ? data.distance + ' km' : 'nearby'})`;
+      return `Assigned to ${data.providerName || 'provider'}`;
     case 'no_provider_found':
-      return `No provider accepted booking #${(data.bookingId || '').toString().slice(-6)} after ${data.attempts || 1} attempts`;
-    case 'dispatch_update':
-      return `Status: ${data.status || 'updated'} for booking #${(data.bookingId || '').toString().slice(-6)}`;
-    case 'dispatch_started':
-      return `Searching for providers for ${data.serviceName || 'booking'}`;
-    case 'dispatch_retry':
-      return `Retrying dispatch for booking #${(data.bookingId || '').toString().slice(-6)}`;
-    case 'provider_accepted':
-      return `${data.providerName || 'Provider'} accepted the booking`;
-    case 'provider_rejected':
-      return `${data.providerName || 'Provider'} rejected the booking`;
-    case 'booking_cancelled':
-      return `Booking #${(data.bookingId || '').toString().slice(-6)} cancelled by ${data.cancelledBy || 'user'}`;
-    case 'booking_completed':
-      return `Booking #${(data.bookingId || '').toString().slice(-6)} completed successfully`;
+      return `No provider found for #${(data.bookingId || '').toString().slice(-6)}`;
+    case 'dispatch_failed':
+      return data.message || `Dispatch failed`;
     default:
-      return data.message || 'New admin notification';
+      return data.message || 'New notification';
   }
 }
 

@@ -7,7 +7,8 @@ const { findEligibleProviders } = require('./eligibilityService');
 const { sendBookingOfferToProvider, sendCancellationToProvider } = require('./fcmService');
 const { createAdminAlert, emitLive } = require('./adminAlertService');
 const logger = require('../utils/logger');
-
+// ✅ ADD THIS AT TOP (with other requires)
+const { emitLive } = require('./liveEmitter');
 // ─── Config ───
 const CFG = {
   radiusProgression: (process.env.DISPATCH_RADIUS_PROGRESSION || '5,8,12')

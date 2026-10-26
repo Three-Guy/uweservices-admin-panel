@@ -1,77 +1,97 @@
-// src/models/AdminNotification.js
+// backend/src/models/AdminNotification.js
 const mongoose = require('mongoose');
-const { getAdminConnection } = require('../config/database');
 
 const adminNotificationSchema = new mongoose.Schema(
   {
     type: {
       type: String,
-      enum: [
-        'new_booking',
-        'booking_assigned',
-        'booking_rejected',
-        'booking_cancelled',
-        'booking_completed',
-        'no_provider_found',
-        'dispatch_failed',
-        'provider_timeout',
-        'reassignment',
-        'payment_received',
-        'manual_alert',
-        'system',
-      ],
       required: true,
-      index: true,
+      default: 'admin_alert',
+      // ✅ Pre-validate hook ensures string conversion
     },
-    title: { type: String, required: true },
-    message: { type: String, required: true },
-    severity: {
+    title: {
       type: String,
-      enum: ['info', 'success', 'warning', 'error', 'critical'],
-      default: 'info',
+      required: true,
+      default: 'Admin Alert',
+    },
+    message: {
+      type: String,
+      default: '',
+    },
+    data: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
+    },
+    priority: {
+      type: String,
+      enum: ['low', 'normal', 'high', 'critical', 'error', 'warning', 'info'],
+      default: 'normal',
+    },
+    isRead: {
+      type: Boolean,
+      default: false,
       index: true,
     },
-
-    // Relations
-    bookingId: { type: String, default: null, index: true },
-    providerId: { type: String, default: null, index: true },
-    userId: { type: String, default: null, index: true },
-
-    // Payload
-    data: { type: mongoose.Schema.Types.Mixed, default: {} },
-
-    // State
-    isRead: { type: Boolean, default: false, index: true },
-    readAt: { type: Date, default: null },
-    readBy: { type: String, default: null },
-
-    // Delivery tracking
-    socketDelivered: { type: Boolean, default: false },
-    fcmSent: { type: Boolean, default: false },
-    fcmMessageIds: { type: [String], default: [] },
-
-    // Action link
-    actionUrl: { type: String, default: null },
-    actionLabel: { type: String, default: null },
-
-    expiresAt: { type: Date, default: null },
+    readAt: {
+      type: Date,
+      default: null,
+    },
+    adminEmail: {
+      type: String,
+      default: null,
+      index: true,
+    },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    collection: 'adminnotifications',
+    strict: false,  // ✅ Allow extra fields
+  }
 );
 
-adminNotificationSchema.index({ createdAt: -1 });
-adminNotificationSchema.index({ isRead: 1, createdAt: -1 });
+// ✅ Pre-validate: force type to always be a string
+adminNotificationSchema.pre('validate', function (next) {
+  if (this.type && typeof this.type !== 'string') {
+    if (typeof this.type === 'object' && this.type.type) {
+      // If type is an object with a nested type field, extract it
+      const nested = this.type;
+      this.type = String(nested.type || 'admin_alert');
+      if (!this.title && nested.title) this.title = nested.title;
+      if (!this.message && nested.message) this.message = nested.message;
+      if (!this.data) this.data = nested;
+    } else {
+      this.type = String(this.type);
+    }
+  }
+  if (!this.type) this.type = 'admin_alert';
+  next();
+});
 
-let AdminNotificationModel = null;
+adminNotificationSchema.index({ createdAt: -1 });
+adminNotificationSchema.index({ type: 1, isRead: 1 });
 
 function getAdminNotificationModel() {
-  if (AdminNotificationModel) return AdminNotificationModel;
-  const conn = getAdminConnection();
-  if (!conn) throw new Error('Admin DB connection not ready');
-  AdminNotificationModel =
-    conn.models.AdminNotification ||
-    conn.model('AdminNotification', adminNotificationSchema, 'adminnotifications');
-  return AdminNotificationModel;
+  try {
+    const { getAdminConnection } = require('../config/database');
+    const adminConn = getAdminConnection();
+    if (adminConn && adminConn.readyState === 1) {
+      if (adminConn.models.AdminNotification) {
+        return adminConn.models.AdminNotification;
+      }
+      return adminConn.model('AdminNotification', adminNotificationSchema);
+    }
+  } catch (err) {
+    // Fallback
+  }
+
+  if (mongoose.models.AdminNotification) {
+    return mongoose.models.AdminNotification;
+  }
+  return mongoose.model('AdminNotification', adminNotificationSchema);
 }
 
-module.exports = { getAdminNotificationModel, adminNotificationSchema };
+const AdminNotification = getAdminNotificationModel();
+
+module.exports = AdminNotification;
+module.exports.getAdminNotificationModel = getAdminNotificationModel;
+module.exports.schema = adminNotificationSchema;
