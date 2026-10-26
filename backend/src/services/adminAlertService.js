@@ -1,189 +1,274 @@
-// src/services/adminAlertService.js
-const { getAdminNotificationModel } = require('../models/AdminNotification');
-const { getAdminFcmTokenModel } = require('../models/AdminFcmToken');
-const { sendAdminAlert } = require('./fcmService');
+// backend/src/services/adminAlertService.js
 const logger = require('../utils/logger');
 
-let ioRef = null;
-
-function setIo(io) {
-  ioRef = io;
-  logger.info('[AdminAlert] Socket.IO instance registered');
+// ── Safe model loading ──
+let AdminNotification = null;
+try {
+  const notifModule = require('../models/AdminNotification');
+  AdminNotification = notifModule.getAdminNotificationModel
+    ? notifModule.getAdminNotificationModel()
+    : notifModule;
+} catch (err) {
+  logger.warn('AdminNotification model not available: ' + err.message);
 }
 
+let AdminFcmToken = null;
+try {
+  AdminFcmToken = require('../models/AdminFcmToken');
+} catch (err) {
+  logger.warn('AdminFcmToken model not available: ' + err.message);
+}
+
+// ── Firebase (safe import) ──
+let sendAdminFcmNotification = null;
+let isAdminWebFirebaseReady = () => false;
+try {
+  const fb = require('../config/firebase');
+  sendAdminFcmNotification = fb.sendAdminFcmNotification;
+  isAdminWebFirebaseReady = fb.isAdminWebFirebaseReady;
+} catch (err) {
+  logger.warn('Firebase config not available: ' + err.message);
+}
+
+// ── Socket.IO instance (set from server.js) ──
+let io = null;
+
 /**
- * Fetch all active admin FCM tokens from DB
+ * Set Socket.IO instance
  */
-async function getAllActiveAdminTokens() {
+function setIo(socketIO) {
+  io = socketIO;
+  logger.info('✅ Socket.IO attached to adminAlertService');
+}
+
+// Backward compat alias
+const setSocketIO = setIo;
+
+/**
+ * Get all active admin FCM tokens
+ */
+async function getActiveAdminFcmTokens() {
+  if (!AdminFcmToken) return [];
+
   try {
-    const AdminFcmToken = getAdminFcmTokenModel();
-    const tokens = await AdminFcmToken.find({ isActive: true }).select('fcmToken').lean();
+    const tokens = await AdminFcmToken.find({ isActive: true })
+      .select('fcmToken')
+      .lean();
     return tokens.map((t) => t.fcmToken).filter(Boolean);
   } catch (err) {
-    logger.warn(`[AdminAlert] Could not fetch admin tokens: ${err.message}`);
+    logger.error('Failed to fetch admin FCM tokens: ' + err.message);
     return [];
   }
 }
 
 /**
- * Deactivate invalid tokens based on FCM response errors
+ * Cleanup invalid FCM tokens
  */
-async function cleanupInvalidTokens(tokens, responses) {
+async function cleanupInvalidTokens(invalidTokens) {
+  if (!AdminFcmToken || !invalidTokens || invalidTokens.length === 0) return;
+
   try {
-    const AdminFcmToken = getAdminFcmTokenModel();
-    const toDeactivate = [];
-
-    responses.forEach((resp, idx) => {
-      if (!resp.success) {
-        const code = resp.error?.code || '';
-        if (
-          code === 'messaging/registration-token-not-registered' ||
-          code === 'messaging/invalid-registration-token' ||
-          code === 'messaging/invalid-argument'
-        ) {
-          toDeactivate.push(tokens[idx]);
-        }
-      }
-    });
-
-    if (toDeactivate.length > 0) {
-      await AdminFcmToken.updateMany(
-        { fcmToken: { $in: toDeactivate } },
-        {
-          $set: { isActive: false, lastErrorAt: new Date() },
-          $inc: { failureCount: 1 },
-        }
-      );
-      logger.info(`[AdminAlert] Deactivated ${toDeactivate.length} invalid tokens`);
-    }
+    await AdminFcmToken.updateMany(
+      { fcmToken: { $in: invalidTokens } },
+      { $set: { isActive: false }, $inc: { failureCount: 1 } }
+    );
+    logger.info(`🧹 Cleaned up ${invalidTokens.length} invalid FCM tokens`);
   } catch (err) {
-    logger.warn(`[AdminAlert] Token cleanup error: ${err.message}`);
+    logger.error('Failed to cleanup invalid tokens: ' + err.message);
   }
 }
 
 /**
- * Create admin alert → persist → socket emit → FCM push
+ * Create admin alert
+ * Flow: Save to DB → Emit Socket.IO → Send FCM Push
+ * 
+ * @param {string} type - Alert type (new_booking, booking_assigned, no_provider_found, etc.)
+ * @param {object} data - Alert data payload
+ * @param {object} options - { skipFcm, skipSocket, skipDb, priority }
  */
-async function createAdminAlert({
-  type,
-  title,
-  message,
-  severity = 'info',
-  bookingId = null,
-  providerId = null,
-  userId = null,
-  data = {},
-  actionUrl = null,
-  actionLabel = null,
-  skipFcm = false,
-}) {
-  try {
-    const Notification = getAdminNotificationModel();
-    const notification = await Notification.create({
-      type,
-      title,
-      message,
-      severity,
-      bookingId,
-      providerId,
-      userId,
-      data,
-      actionUrl,
-      actionLabel,
-    });
+async function createAdminAlert(type, data = {}, options = {}) {
+  const alertData = {
+    type,
+    title: data.title || getAlertTitle(type),
+    message: data.message || getAlertMessage(type, data),
+    data,
+    isRead: false,
+    priority: options.priority || data.priority || 'normal',
+    createdAt: new Date(),
+  };
 
-    // 1. Socket.IO realtime delivery (bell + sound in open admin tabs)
-    if (ioRef) {
-      try {
-        const payload = {
-          _id: notification._id,
-          type,
-          title,
-          message,
-          severity,
-          bookingId,
-          providerId,
-          userId,
-          data,
-          actionUrl,
-          actionLabel,
-          createdAt: notification.createdAt,
-          isRead: false,
-        };
-        ioRef.to('admins').emit('admin:notification', payload);
-        notification.socketDelivered = true;
-        await notification.save();
-        logger.debug(`[AdminAlert] Socket emitted: ${type} → ${title}`);
-      } catch (e) {
-        logger.warn(`[AdminAlert] Socket emit failed: ${e.message}`);
-      }
+  let savedAlert = null;
+
+  // ── 1. Save to Database ──
+  if (!options.skipDb && AdminNotification) {
+    try {
+      savedAlert = await AdminNotification.create(alertData);
+      logger.info(`📝 Admin alert saved: ${type} — ${alertData.title}`);
+    } catch (dbErr) {
+      logger.error('Failed to save admin alert: ' + dbErr.message);
     }
+  }
 
-    // 2. FCM Web Push (for closed tabs / different browsers)
-    if (!skipFcm) {
-      try {
-        const tokens = await getAllActiveAdminTokens();
-        if (tokens.length > 0) {
-          const fcmRes = await sendAdminAlert({
-            tokens,
-            title,
-            body: message,
-            data: {
-              type: String(type || ''),
-              bookingId: String(bookingId || ''),
-              providerId: String(providerId || ''),
-              actionUrl: String(actionUrl || '/notifications'),
-              severity: String(severity),
-              notificationId: String(notification._id),
-            },
-          });
+  // ── 2. Socket.IO Real-time Emit ──
+  if (!options.skipSocket && io) {
+    try {
+      // Generic admin_alert event
+      io.to('admins').emit('admin_alert', {
+        ...alertData,
+        _id: savedAlert?._id,
+        timestamp: new Date().toISOString(),
+      });
 
-          if (fcmRes.success) {
-            notification.fcmSent = true;
-            notification.fcmMessageIds = (fcmRes.responses || [])
-              .filter((r) => r.success)
-              .map((r) => r.messageId || '');
-            await notification.save();
-            logger.info(
-              `[AdminAlert] FCM sent → ${fcmRes.successCount}/${tokens.length} devices for "${title}"`
-            );
+      // Specific event name for dispatch monitor
+      io.to('admins').emit(type, {
+        ...data,
+        title: alertData.title,
+        message: alertData.message,
+        timestamp: new Date().toISOString(),
+      });
+
+      logger.info(`🔔 Socket.IO emitted: ${type}`);
+    } catch (socketErr) {
+      logger.warn('Socket emit failed: ' + socketErr.message);
+    }
+  }
+
+  // ── 3. FCM Push Notification ──
+  if (!options.skipFcm && sendAdminFcmNotification && isAdminWebFirebaseReady()) {
+    try {
+      const tokens = await getActiveAdminFcmTokens();
+
+      if (tokens.length > 0) {
+        const result = await sendAdminFcmNotification(
+          tokens,
+          alertData.title,
+          alertData.message,
+          {
+            type,
+            bookingId: data.bookingId || '',
+            alertId: savedAlert?._id?.toString() || '',
+            priority: alertData.priority,
           }
+        );
 
-          // Cleanup bad tokens
-          if (fcmRes.responses) {
-            await cleanupInvalidTokens(tokens, fcmRes.responses);
-          }
-        } else {
-          logger.debug(`[AdminAlert] No active admin FCM tokens registered`);
+        // Auto-cleanup invalid tokens
+        if (result.invalidTokens && result.invalidTokens.length > 0) {
+          await cleanupInvalidTokens(result.invalidTokens);
         }
-      } catch (e) {
-        logger.warn(`[AdminAlert] FCM push failed: ${e.message}`);
+      } else {
+        logger.warn('⚠️  No active admin FCM tokens — push skipped');
+        logger.warn('   Admin must login and allow browser notifications');
       }
+    } catch (fcmErr) {
+      logger.error('FCM push failed: ' + fcmErr.message);
     }
+  } else if (!options.skipFcm && !isAdminWebFirebaseReady()) {
+    logger.warn('⚠️  FCM disabled — push skipped (Socket.IO only)');
+  }
 
-    return notification;
+  return savedAlert;
+}
+
+/**
+ * Get unread alert count
+ */
+async function getUnreadCount(adminEmail = null) {
+  if (!AdminNotification) return 0;
+
+  try {
+    const filter = { isRead: false };
+    if (adminEmail) filter.adminEmail = adminEmail;
+    return await AdminNotification.countDocuments(filter);
   } catch (err) {
-    logger.error(`[AdminAlert] createAdminAlert error: ${err.message}`);
-    logger.error(err.stack);
-    return null;
+    return 0;
   }
 }
 
 /**
- * Emit arbitrary live event to admin panel (no persistence, no FCM)
+ * Mark alert as read
  */
-function emitLive(eventName, payload) {
-  if (!ioRef) return;
+async function markAsRead(alertId) {
+  if (!AdminNotification) return;
+
   try {
-    ioRef.to('admins').emit(eventName, payload);
-  } catch (e) {
-    logger.warn(`emitLive(${eventName}) failed: ${e.message}`);
+    await AdminNotification.findByIdAndUpdate(alertId, {
+      isRead: true,
+      readAt: new Date(),
+    });
+  } catch (err) {
+    logger.error('markAsRead failed: ' + err.message);
+  }
+}
+
+/**
+ * Mark all alerts as read
+ */
+async function markAllAsRead() {
+  if (!AdminNotification) return;
+
+  try {
+    await AdminNotification.updateMany(
+      { isRead: false },
+      { isRead: true, readAt: new Date() }
+    );
+  } catch (err) {
+    logger.error('markAllAsRead failed: ' + err.message);
+  }
+}
+
+// ── Alert title helpers ──
+function getAlertTitle(type) {
+  const titles = {
+    new_booking: '🆕 New Booking Received',
+    booking_assigned: '✅ Booking Assigned',
+    no_provider_found: '⚠️ No Provider Found',
+    dispatch_update: '🔄 Dispatch Update',
+    dispatch_started: '🚀 Dispatch Started',
+    dispatch_retry: '🔁 Dispatch Retry',
+    provider_accepted: '✅ Provider Accepted',
+    provider_rejected: '❌ Provider Rejected',
+    booking_cancelled: '🚫 Booking Cancelled',
+    booking_completed: '🎉 Booking Completed',
+    booking_in_progress: '🔧 Service In Progress',
+  };
+  return titles[type] || '📢 Admin Alert';
+}
+
+// ── Alert message helpers ──
+function getAlertMessage(type, data) {
+  switch (type) {
+    case 'new_booking':
+      return `${data.serviceName || 'Service'} booking from ${data.userName || 'customer'} — ₹${data.amount || 0}`;
+    case 'booking_assigned':
+      return `Assigned to ${data.providerName || 'provider'} (${data.distance ? data.distance + ' km' : 'nearby'})`;
+    case 'no_provider_found':
+      return `No provider accepted booking #${(data.bookingId || '').toString().slice(-6)} after ${data.attempts || 1} attempts`;
+    case 'dispatch_update':
+      return `Status: ${data.status || 'updated'} for booking #${(data.bookingId || '').toString().slice(-6)}`;
+    case 'dispatch_started':
+      return `Searching for providers for ${data.serviceName || 'booking'}`;
+    case 'dispatch_retry':
+      return `Retrying dispatch for booking #${(data.bookingId || '').toString().slice(-6)}`;
+    case 'provider_accepted':
+      return `${data.providerName || 'Provider'} accepted the booking`;
+    case 'provider_rejected':
+      return `${data.providerName || 'Provider'} rejected the booking`;
+    case 'booking_cancelled':
+      return `Booking #${(data.bookingId || '').toString().slice(-6)} cancelled by ${data.cancelledBy || 'user'}`;
+    case 'booking_completed':
+      return `Booking #${(data.bookingId || '').toString().slice(-6)} completed successfully`;
+    default:
+      return data.message || 'New admin notification';
   }
 }
 
 module.exports = {
-  setIo,
   createAdminAlert,
-  emitLive,
-  getAllActiveAdminTokens,
+  getUnreadCount,
+  markAsRead,
+  markAllAsRead,
+  setIo,
+  setSocketIO,
+  getActiveAdminFcmTokens,
+  cleanupInvalidTokens,
 };

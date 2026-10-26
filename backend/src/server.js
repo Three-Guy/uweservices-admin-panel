@@ -57,8 +57,8 @@ const io = new Server(server, {
 });
 
 app.set('io', io);
-
 app.set('trust proxy', true);
+
 app.use(helmet({
   contentSecurityPolicy: false,
   crossOriginResourcePolicy: false,
@@ -208,6 +208,7 @@ async function startServer() {
 
     console.log('🔄 Initializing routes...');
 
+    // ── Core Routes ──
     const authRoutes = require('./routes/auth.routes');
     const verificationRoutes = require('./routes/verification.routes');
     const providerRoutes = require('./routes/provider.routes');
@@ -231,11 +232,21 @@ async function startServer() {
     const bookingRoutes = require('./routes/booking.routes');
     const trackingRoutes = require('./routes/tracking.routes');
 
+    // ── Dispatch & Alerts Routes ──
     const dispatchRoutes = require('./routes/dispatch.routes');
     const providerOfferRoutes = require('./routes/providerOffer.routes');
     const adminNotificationRoutes = require('./routes/adminNotification.routes');
-    const adminFcmTokenRoutes = require('./routes/adminFcmToken.routes'); // ✅ NEW
 
+    // ── FCM Token Routes (SAFE LOADING) ──
+    let adminFcmTokenRoutes = null;
+    try {
+      adminFcmTokenRoutes = require('./routes/adminFcmToken.routes');
+      logger.info('✓ FCM token routes loaded');
+    } catch (fcmRouteErr) {
+      logger.error('❌ FCM token routes failed to load: ' + fcmRouteErr.message);
+    }
+
+    // ── Mount Routes ──
     app.use('/api/v1/admin/auth', authRoutes);
     app.use('/api/v1/admin/verifications', verificationRoutes);
     app.use('/api/v1/admin/providers', providerRoutes);
@@ -249,9 +260,13 @@ async function startServer() {
     app.use('/api/v1/admin/provider-offers', providerOfferRoutes);
     app.use('/api/v1/admin/admin-notifications', adminNotificationRoutes);
 
-    // ✅ NEW: Admin FCM token registration (handles /admin/fcm/register, /admin/fcm/unregister)
-    app.use('/api/v1/admin/fcm', adminFcmTokenRoutes);
-    console.log('✓ /api/v1/admin/fcm routes mounted');
+    // ✅ FCM routes (only if loaded successfully)
+    if (adminFcmTokenRoutes) {
+      app.use('/api/v1/admin/fcm', adminFcmTokenRoutes);
+      console.log('✓ /api/v1/admin/fcm routes mounted');
+    } else {
+      console.warn('⚠️  /api/v1/admin/fcm routes NOT mounted (file missing)');
+    }
 
     app.use('/api/v1/admin/categories', categoryRoutes);
     app.use('/api/v1/admin/services', serviceRoutes);
@@ -287,7 +302,7 @@ async function startServer() {
       const { setIo } = require('./services/adminAlertService');
       setIo(io);
 
-      // ✅ FIX: use correct exports from bookingPoller
+      // ✅ Use correct exports from bookingPoller
       const { startBookingPoller } = require('./workers/bookingPoller');
       const { startWatcher } = require('./workers/dispatchWorker');
       startBookingPoller();
@@ -310,9 +325,6 @@ async function startServer() {
 ║  Admin Web Firebase:    ${isAdminWebFirebaseReady() ? '✅ Ready    ' : '⚠️  Not Ready'}                            ║
 ║  Dispatch:              ${process.env.DISPATCH_ENABLED === 'true' ? '✅ RUNNING  ' : '⚠️  DISABLED '}                            ║
 ║  Socket.IO:             ✅ Ready                                ║
-╠════════════════════════════════════════════════════════════════╣
-║  LOCAL:   http://localhost:${PORT}                                 ║
-║  NETWORK: http://${LOCAL_IP}:${PORT}                               ║
 ╚════════════════════════════════════════════════════════════════╝
       `);
     });
