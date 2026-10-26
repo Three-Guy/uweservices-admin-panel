@@ -98,7 +98,7 @@ async function createAdminAlert(optionsOrType, titleOrUndefined, messageOrUndefi
       data,
     };
 
-    // Emit via socket
+    // ── SOCKET EMIT ──
     const io = getIo();
     if (io) {
       try {
@@ -127,7 +127,7 @@ async function createAdminAlert(optionsOrType, titleOrUndefined, messageOrUndefi
       }
     }
 
-    // Send FCM push
+    // ── FCM PUSH ──
     try {
       const AdminFcmToken = require('../models/AdminFcmToken');
       const activeTokens = await AdminFcmToken.find({ isActive: true }).lean();
@@ -141,8 +141,8 @@ async function createAdminAlert(optionsOrType, titleOrUndefined, messageOrUndefi
               const token = t.fcmToken || t.token;
               if (!token || typeof token !== 'string') continue;
 
-              // ✅✅✅ FIXED: Pass title, body, data as SEPARATE arguments
-              // Function signature: sendAdminFcmNotification(token, title, body, data)
+              // ✅ CORRECT: Pass title, body, data as SEPARATE arguments
+              // Signature: sendAdminFcmNotification(token, title, body, data)
               const result = await sendAdminFcmNotification(
                 token,
                 title,
@@ -156,8 +156,28 @@ async function createAdminAlert(optionsOrType, titleOrUndefined, messageOrUndefi
 
               if (result && result.success) {
                 console.log(`✅ [AdminAlert] FCM sent to ${token.substring(0, 20)}...`);
+                try {
+                  await AdminFcmToken.findByIdAndUpdate(t._id, {
+                    lastUsedAt: new Date(),
+                    lastSuccessAt: new Date(),
+                    failureCount: 0,
+                  });
+                } catch {}
               } else {
                 console.error(`❌ [AdminAlert] FCM failed: ${result ? result.error : 'unknown'}`);
+                try {
+                  await AdminFcmToken.findByIdAndUpdate(t._id, {
+                    $inc: { failureCount: 1 },
+                    lastError: result ? result.error : 'unknown',
+                    lastErrorAt: new Date(),
+                  });
+                  const updated = await AdminFcmToken.findById(t._id);
+                  if (updated && updated.failureCount >= 5) {
+                    updated.isActive = false;
+                    await updated.save();
+                    console.log(`⚠️ [AdminAlert] Deactivated token after 5 failures`);
+                  }
+                } catch {}
               }
             } catch (fcmErr) {
               console.error(`❌ [AdminAlert] FCM error:`, fcmErr.message);
@@ -166,7 +186,7 @@ async function createAdminAlert(optionsOrType, titleOrUndefined, messageOrUndefi
         }
       }
     } catch (e) {
-      console.error('❌ [AdminAlert] FCM error:', e.message);
+      console.error('❌ [AdminAlert] FCM block error:', e.message);
     }
 
     return notification;
