@@ -71,7 +71,6 @@ function registerAdmin(s: Socket) {
   const email = getAdminEmail();
   const token = getAuthToken();
 
-  // Try multiple event names (backend might listen for any of them)
   const payload = { email, token, role: 'admin' };
   s.emit('admin:register', payload);
   s.emit('admin:join', payload);
@@ -86,12 +85,14 @@ function registerAdmin(s: Socket) {
 export function getSocket(): Socket {
   if (socket && socket.connected) return socket;
 
-  // Cleanup old socket if it exists but disconnected
+  // Cleanup old socket if disconnected
   if (socket && !socket.connected) {
     try { socket.disconnect(); } catch {}
     socket = null;
     adminRegistered = false;
   }
+
+  console.log('🔌 Creating new socket connection to:', SOCKET_URL);
 
   socket = io(SOCKET_URL, {
     transports: ['websocket', 'polling'],
@@ -103,7 +104,6 @@ export function getSocket(): Socket {
     autoConnect: true,
     withCredentials: true,
     auth: (cb) => {
-      // Attach JWT so backend middleware can authenticate
       cb({
         token: getAuthToken() || '',
         email: getAdminEmail(),
@@ -114,6 +114,7 @@ export function getSocket(): Socket {
 
   socket.on('connect', () => {
     console.log('🔌 ✅ Socket CONNECTED:', socket?.id);
+    console.log('🔌 Transport:', socket?.io?.engine?.transport?.name || 'unknown');
     adminRegistered = false;
     if (socket) registerAdmin(socket);
   });
@@ -125,12 +126,23 @@ export function getSocket(): Socket {
 
   socket.on('connect_error', (err) => {
     console.error('🔌 ❌ Socket CONNECT ERROR:', err.message);
+    console.error('🔌 ❌ Error type:', err.type);
+    console.error('🔌 ❌ Error description:', err.description);
+    // This is where you'll see the CORS error if it persists
   });
 
   socket.on('reconnect', (attempt) => {
     console.log(`🔌 🔄 Socket RECONNECTED after ${attempt} attempt(s)`);
     adminRegistered = false;
     if (socket) registerAdmin(socket);
+  });
+
+  socket.on('reconnect_error', (err) => {
+    console.error('🔌 ❌ Reconnect error:', err.message);
+  });
+
+  socket.on('reconnect_failed', () => {
+    console.error('🔌 ❌ Reconnect FAILED — giving up');
   });
 
   // Debug: log every event received
