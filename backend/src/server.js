@@ -142,10 +142,23 @@ app.get('/health', (req, res) => {
     redisStatus = isRedisConnected() ? 'connected' : 'disconnected';
   } catch (e) {}
 
+  // Count connected sockets
+  let socketCount = 0;
+  let adminRoomCount = 0;
+  try {
+    socketCount = io.engine.clientsCount || 0;
+    const adminRoom = io.sockets.adapter.rooms.get('admins');
+    adminRoomCount = adminRoom ? adminRoom.size : 0;
+  } catch (e) {}
+
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
     service: 'admin-panel-backend',
+    sockets: {
+      totalConnected: socketCount,
+      inAdminRoom: adminRoomCount,
+    },
     connections: {
       adminDb: getAdminConnection()?.readyState === 1 ? 'connected' : 'disconnected',
       providerDb: getProviderConnection()?.readyState === 1 ? 'connected' : 'disconnected',
@@ -158,7 +171,7 @@ app.get('/health', (req, res) => {
       overall: isDbConnected() ? 'connected' : 'disconnected',
     },
     environment: process.env.NODE_ENV || 'development',
-    version: '2.2.0',
+    version: '2.2.1',
     serverIP: LOCAL_IP,
   });
 });
@@ -173,14 +186,50 @@ app.post('/api/v1/mobile/register-device', (req, res) => {
 
 // ===== SOCKET.IO =====
 io.on('connection', (socket) => {
-  logger.info(`Client connected: ${socket.id}`);
-  socket.join('admins');
+  logger.info(`🔌 Client connected: ${socket.id}`);
 
-  socket.on('admin:register', (data) => {
-    logger.info(`Admin socket registered: ${socket.id}`, data);
-    if (data?.email) socket.join(`admin:${data.email}`);
+  // ✅ ALWAYS auto-join 'admins' room on connect (safety net)
+  socket.join('admins');
+  console.log(`✅ Socket ${socket.id} auto-joined 'admins' room`);
+
+  // Log current connected count
+  try {
+    const adminRoom = io.sockets.adapter.rooms.get('admins');
+    const count = adminRoom ? adminRoom.size : 0;
+    console.log(`👥 Total sockets in 'admins' room: ${count}`);
+  } catch (e) {}
+
+  // ===== ADMIN REGISTRATION (multiple event names for compatibility) =====
+  const handleAdminRegister = (data) => {
+    try {
+      logger.info(`👑 Admin registered: ${socket.id}`, data?.email || 'no-email');
+      socket.join('admins');
+      if (data?.email) {
+        socket.join(`admin:${data.email}`);
+        console.log(`✅ Socket ${socket.id} joined admin:${data.email}`);
+      }
+      socket.data = socket.data || {};
+      socket.data.isAdmin = true;
+      socket.data.email = data?.email || '';
+      socket.data.role = data?.role || 'admin';
+
+      socket.emit('admin:registered', { success: true, socketId: socket.id });
+    } catch (e) {
+      console.error('admin:register error:', e.message);
+    }
+  };
+
+  socket.on('admin:register', handleAdminRegister);
+  socket.on('admin:join', handleAdminRegister);
+  socket.on('register:admin', handleAdminRegister);
+  socket.on('join:admins', handleAdminRegister);
+  socket.on('join', (data) => {
+    if (data?.room === 'admins' || data?.role === 'admin') {
+      handleAdminRegister(data);
+    }
   });
 
+  // ===== MOBILE REGISTRATION =====
   socket.on('mobile:register', (data) => {
     if (data?.deviceId) socket.join(`device:${data.deviceId}`);
   });
@@ -189,12 +238,20 @@ io.on('connection', (socket) => {
     socket.emit('mobile:heartbeat:ack', { timestamp: Date.now() });
   });
 
+  // ===== DISCONNECT =====
   socket.on('disconnect', (reason) => {
-    logger.info(`Client disconnected: ${socket.id}, reason: ${reason}`);
+    logger.info(`🔌 Client disconnected: ${socket.id}, reason: ${reason}`);
   });
 
+  // ===== LAYOUT PREVIEW =====
   socket.on('layout:preview', (data) => {
     socket.broadcast.to('admins').emit('layout:preview', data);
+  });
+
+  // ===== PING (for debugging) =====
+  socket.on('ping:test', (data) => {
+    console.log('🏓 Ping received from', socket.id);
+    socket.emit('pong:test', { ...data, serverTime: Date.now() });
   });
 });
 
@@ -203,7 +260,7 @@ const HOST = '0.0.0.0';
 
 async function startServer() {
   try {
-    logger.info('Starting Admin Panel Backend Server v2.2 ...');
+    logger.info('Starting Admin Panel Backend Server v2.2.1 ...');
     console.log('\n🔌 Connecting to databases...');
     await connectDB();
     console.log('✅ All databases connected successfully\n');
@@ -319,15 +376,18 @@ async function startServer() {
       const { setIo } = require('./services/adminAlertService');
       setIo(io);
 
-      // Also attach to liveEmitter directly as a safety measure
+      // Also attach to liveEmitter directly
       try {
         const liveEmitter = require('./services/liveEmitter');
         if (typeof liveEmitter.setLiveIo === 'function') {
           liveEmitter.setLiveIo(io);
+          console.log('✅ liveEmitter.setLiveIo attached');
         }
-      } catch (e) {}
+      } catch (e) {
+        console.warn('liveEmitter attach warning:', e.message);
+      }
 
-      // ✅ Start booking poller (change stream + safety-net + startup scan)
+      // ✅ Start booking poller
       try {
         const { startBookingPoller } = require('./workers/bookingPoller');
         startBookingPoller();
@@ -335,7 +395,7 @@ async function startServer() {
         logger.error(`bookingPoller start failed: ${e.message}`);
       }
 
-      // ✅ Start dispatch watcher (DispatchJob queue processor)
+      // ✅ Start dispatch watcher
       try {
         const { startWatcher } = require('./workers/dispatchWorker');
         startWatcher();
@@ -353,14 +413,14 @@ async function startServer() {
       const { isProviderFirebaseReady, isAdminWebFirebaseReady } = require('./config/firebase');
       console.log(`
 ╔════════════════════════════════════════════════════════════════╗
-║  🚀 Admin Panel Backend v2.2 (FCM + DISPATCH + CHANGE STREAM)  ║
+║  🚀 Admin Panel Backend v2.2.1 (FCM + DISPATCH + SOCKET.IO)    ║
 ╠════════════════════════════════════════════════════════════════╣
 ║  Port:                  ${PORT.toString().padEnd(39)}║
 ║  Database:              ✅ Connected                            ║
 ║  Provider Firebase:     ${isProviderFirebaseReady() ? '✅ Ready    ' : '⚠️  Not Ready'}                            ║
 ║  Admin Web Firebase:    ${isAdminWebFirebaseReady() ? '✅ Ready    ' : '⚠️  Not Ready'}                            ║
 ║  Dispatch:              ${process.env.DISPATCH_ENABLED === 'true' ? '✅ RUNNING  ' : '⚠️  DISABLED '}                            ║
-║  Socket.IO:             ✅ Ready                                ║
+║  Socket.IO:             ✅ Ready (auto-join 'admins' room)      ║
 ╚════════════════════════════════════════════════════════════════╝
       `);
     });
