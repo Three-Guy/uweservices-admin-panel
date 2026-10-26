@@ -2,6 +2,7 @@
 // ✅ FIXED: Single source of dispatch, cooldown 10 min
 // ✅ Supersedes old offers on redispatch
 // ✅ Full ProviderOffer tracking
+// ✅ REMOVED: no_provider_found admin alert (new_booking only)
 
 const mongoose = require('mongoose');
 const { getBookingModel } = require('../config/database');
@@ -18,15 +19,14 @@ const CFG = {
     .split(',').map((x) => parseInt(x.trim(), 10)).filter(Boolean),
   batchSize: parseInt(process.env.DISPATCH_BATCH_SIZE || '5', 10),
   requestTimeoutMs: parseInt(process.env.DISPATCH_REQUEST_TIMEOUT_MS || '15000', 10),
-  cooldownAfterFailMs: parseInt(process.env.DISPATCH_COOLDOWN_AFTER_FAIL_MS || '600000', 10), // 10 min
-  retryAfterMs: parseInt(process.env.DISPATCH_RETRY_AFTER_MS || '600000', 10), // 10 min
+  cooldownAfterFailMs: parseInt(process.env.DISPATCH_COOLDOWN_AFTER_FAIL_MS || '600000', 10),
+  retryAfterMs: parseInt(process.env.DISPATCH_RETRY_AFTER_MS || '600000', 10),
 };
 
 console.log('[DispatchService] Config:', CFG);
 
-// ─── IN-MEMORY STATE ───
-const activeDispatches = new Map(); // bookingId -> timestamp
-const recentlyFailed = new Map();   // bookingId -> timestamp of last no_provider_found
+const activeDispatches = new Map();
+const recentlyFailed = new Map();
 
 function isInCooldown(bookingId) {
   const t = recentlyFailed.get(String(bookingId));
@@ -39,27 +39,12 @@ function isInCooldown(bookingId) {
   return true;
 }
 
-function markFailed(bookingId) {
-  recentlyFailed.set(String(bookingId), Date.now());
-}
+function markFailed(bookingId) { recentlyFailed.set(String(bookingId), Date.now()); }
+function clearCooldown(bookingId) { recentlyFailed.delete(String(bookingId)); }
+function isActive(bookingId) { return activeDispatches.has(String(bookingId)); }
+function markActive(bookingId) { activeDispatches.set(String(bookingId), Date.now()); }
+function markInactive(bookingId) { activeDispatches.delete(String(bookingId)); }
 
-function clearCooldown(bookingId) {
-  recentlyFailed.delete(String(bookingId));
-}
-
-function isActive(bookingId) {
-  return activeDispatches.has(String(bookingId));
-}
-
-function markActive(bookingId) {
-  activeDispatches.set(String(bookingId), Date.now());
-}
-
-function markInactive(bookingId) {
-  activeDispatches.delete(String(bookingId));
-}
-
-// ─── EMIT HELPER ───
 function safeEmit(event, payload) {
   try {
     if (liveEmitter && typeof liveEmitter.emitLive === 'function') {
@@ -72,14 +57,10 @@ function safeEmit(event, payload) {
   }
 }
 
-// ─── SUPERSEDE OLD OFFERS ───
 async function supersedeOldOffers(bookingId) {
   try {
     const result = await ProviderOffer.updateMany(
-      {
-        bookingId,
-        status: { $in: ['sent', 'delivered', 'viewed'] },
-      },
+      { bookingId, status: { $in: ['sent', 'delivered', 'viewed'] } },
       {
         $set: {
           status: 'superseded',
@@ -99,29 +80,18 @@ async function supersedeOldOffers(bookingId) {
   }
 }
 
-// ─── UPDATE BOOKING STATUS ───
 async function updateBookingStatus(bookingObjectId, status, reason = '', changedBy = 'dispatch_system') {
   const Booking = getBookingModel();
-  const update = {
-    status,
-    updatedAt: new Date(),
-  };
+  const update = { status, updatedAt: new Date() };
   const push = {
-    statusHistory: {
-      status,
-      changedAt: new Date(),
-      changedBy,
-      reason,
-    },
+    statusHistory: { status, changedAt: new Date(), changedBy, reason },
   };
   await Booking.updateOne({ _id: bookingObjectId }, { $set: update, $push: push });
 }
 
-// ─── MAIN DISPATCH FUNCTION ───
 async function dispatchBooking(bookingId, { manual = false, forceCycle = false } = {}) {
   const Booking = getBookingModel();
 
-  // Get booking
   let booking;
   try {
     booking = await Booking.findOne({
@@ -135,45 +105,33 @@ async function dispatchBooking(bookingId, { manual = false, forceCycle = false }
     return { success: false, error: 'Booking lookup failed' };
   }
 
-  if (!booking) {
-    return { success: false, error: 'Booking not found' };
-  }
+  if (!booking) return { success: false, error: 'Booking not found' };
 
   const bId = booking.bookingId;
   const bOid = booking._id;
 
   console.log(`\n[Dispatch] 🚀 Starting dispatch for ${bId} (manual=${manual})`);
 
-  // Guard: already in active dispatch
   if (isActive(bId) && !manual) {
     console.log(`[Dispatch] ${bId} already in-flight, skipping`);
     return { success: false, error: 'Already dispatching', skipped: true };
   }
-
-  // Guard: cooldown
   if (isInCooldown(bId) && !manual) {
     console.log(`[Dispatch] ${bId} in cooldown, skipping`);
     return { success: false, error: 'In cooldown', skipped: true };
   }
-
-  // Guard: already assigned
   if (booking.providerId && !manual && !forceCycle) {
     console.log(`[Dispatch] ${bId} already has provider ${booking.providerId}, skipping`);
     return { success: false, error: 'Already assigned', skipped: true };
   }
-
-  // Guard: terminal status
   if (['completed', 'cancelled', 'refunded'].includes(booking.status)) {
     console.log(`[Dispatch] ${bId} in terminal status ${booking.status}, skipping`);
     return { success: false, error: `Terminal status: ${booking.status}` };
   }
 
   markActive(bId);
-
-  // Supersede old offers if this is a fresh retry
   await supersedeOldOffers(bId);
 
-  // Create DispatchJob
   let dispatchJob;
   try {
     dispatchJob = await DispatchJob.create({
@@ -190,7 +148,6 @@ async function dispatchBooking(bookingId, { manual = false, forceCycle = false }
     return { success: false, error: 'Failed to create dispatch job' };
   }
 
-  // Update booking status → searching
   await updateBookingStatus(bOid, 'searching', 'Dispatch started');
   safeEmit('dispatch:started', { bookingId: bId, dispatchJobId: dispatchJob._id });
   safeEmit('booking:status_changed', { bookingId: bId, status: 'searching' });
@@ -200,12 +157,10 @@ async function dispatchBooking(bookingId, { manual = false, forceCycle = false }
   let assignedProvider = null;
   let totalOffersSent = 0;
 
-  // Loop through radii
   for (let radiusIdx = 0; radiusIdx < CFG.radiusProgression.length; radiusIdx++) {
     const radiusKm = CFG.radiusProgression[radiusIdx];
     console.log(`[Dispatch] ${bId} radius ${radiusKm}km`);
 
-    // Re-check booking in case it got cancelled/assigned by other means
     const freshBooking = await Booking.findById(bOid).lean();
     if (!freshBooking) break;
     if (['completed', 'cancelled', 'refunded', 'accepted', 'assigned'].includes(freshBooking.status) && !manual) {
@@ -218,7 +173,6 @@ async function dispatchBooking(bookingId, { manual = false, forceCycle = false }
       break;
     }
 
-    // Find eligible providers
     const providers = await findEligibleProviders(booking, {
       radiusKm,
       excludeProviderIds: triedProviderObjectIds,
@@ -231,11 +185,9 @@ async function dispatchBooking(bookingId, { manual = false, forceCycle = false }
       continue;
     }
 
-    // Take batch
     const batch = providers.slice(0, CFG.batchSize);
     console.log(`[Dispatch] ${bId} sending to ${batch.length} providers at ${radiusKm}km`);
 
-    // Create ProviderOffer docs + send FCM in parallel
     const offerPromises = batch.map(async (provider, idx) => {
       try {
         const providerIdStr = provider.providerId || String(provider._id);
@@ -272,7 +224,6 @@ async function dispatchBooking(bookingId, { manual = false, forceCycle = false }
 
         totalOffersSent++;
 
-        // Send FCM
         try {
           const fcmResult = await sendBookingOfferToProvider(provider, booking, {
             offerId: String(offerDoc._id),
@@ -310,7 +261,6 @@ async function dispatchBooking(bookingId, { manual = false, forceCycle = false }
 
     await Promise.all(offerPromises);
 
-    // Update DispatchJob stats
     await DispatchJob.updateOne(
       { _id: dispatchJob._id },
       {
@@ -324,7 +274,6 @@ async function dispatchBooking(bookingId, { manual = false, forceCycle = false }
       }
     );
 
-    // Wait for timeout or until acceptance
     const waitStart = Date.now();
     while (Date.now() - waitStart < CFG.requestTimeoutMs) {
       await new Promise((r) => setTimeout(r, 1500));
@@ -347,7 +296,6 @@ async function dispatchBooking(bookingId, { manual = false, forceCycle = false }
         break;
       }
 
-      // Re-check if booking was externally updated
       const chk = await Booking.findById(bOid).lean();
       if (chk && chk.providerId && !assignedProvider) {
         assignedProvider = {
@@ -361,7 +309,6 @@ async function dispatchBooking(bookingId, { manual = false, forceCycle = false }
 
     if (assignedProvider) break;
 
-    // Timeout — mark unresponded offers as timeout
     await ProviderOffer.updateMany(
       {
         bookingId: bId,
@@ -380,10 +327,7 @@ async function dispatchBooking(bookingId, { manual = false, forceCycle = false }
     );
   }
 
-  // ─── FINAL ───
   if (assignedProvider) {
-    // Booking should already be updated by provider-app accept flow,
-    // but ensure booking has providerId set
     await Booking.updateOne(
       { _id: bOid },
       {
@@ -444,7 +388,7 @@ async function dispatchBooking(bookingId, { manual = false, forceCycle = false }
     return { success: true, assignedProvider };
   }
 
-  // No provider found
+  // ─── No provider found ───
   console.log(`[Dispatch] ❌ ${bId} no provider found after ${totalOffersSent} offers`);
 
   await updateBookingStatus(bOid, 'no_provider_found', `Tried ${totalOffersSent} providers, none accepted`);
@@ -464,29 +408,16 @@ async function dispatchBooking(bookingId, { manual = false, forceCycle = false }
   markFailed(bId);
   markInactive(bId);
 
-  safeEmit('dispatch:no_provider_found', {
-    bookingId: bId,
-    totalOffersSent,
-  });
+  // Socket emit (silent — doesn't trigger notification bell)
+  safeEmit('dispatch:no_provider_found', { bookingId: bId, totalOffersSent });
   safeEmit('booking:status_changed', { bookingId: bId, status: 'no_provider_found' });
 
-  try {
-    await createAdminAlert('no_provider_found', {
-      title: '⚠️ No Provider Found',
-      message: `Booking ${bId} — ${totalOffersSent} providers notified, none accepted`,
-      severity: 'warning',
-      bookingId: bId,
-      actionUrl: `/dispatch`,
-      actionLabel: 'View Dispatch',
-    });
-  } catch (e) {
-    console.warn('[Dispatch] admin alert error:', e.message);
-  }
+  // ❌ NO admin alert — user requested removal
+  // (createAdminAlert('no_provider_found', ...) deleted on purpose)
 
   return { success: false, error: 'No provider accepted', totalOffersSent };
 }
 
-// ─── MANUAL REASSIGN ───
 async function manualReassign(bookingId, reason = 'Admin reassignment') {
   const Booking = getBookingModel();
 
@@ -499,10 +430,8 @@ async function manualReassign(bookingId, reason = 'Admin reassignment') {
 
   if (!booking) return { success: false, error: 'Booking not found' };
 
-  // Supersede all old offers
   await supersedeOldOffers(booking.bookingId);
 
-  // Clear previous provider assignment
   await Booking.updateOne(
     { _id: booking._id },
     {
@@ -527,7 +456,6 @@ async function manualReassign(bookingId, reason = 'Admin reassignment') {
   clearCooldown(booking.bookingId);
   markInactive(booking.bookingId);
 
-  // Notify previous provider via FCM (cancel)
   if (booking.providerId) {
     try {
       await sendCancellationToProvider(booking.providerId, booking, reason);
@@ -538,7 +466,6 @@ async function manualReassign(bookingId, reason = 'Admin reassignment') {
 
   safeEmit('booking:status_changed', { bookingId: booking.bookingId, status: 'confirmed' });
 
-  // Trigger fresh dispatch
   setImmediate(() => {
     dispatchBooking(booking.bookingId, { manual: true, forceCycle: true }).catch((e) => {
       console.error('[Dispatch] Reassign-triggered dispatch error:', e.message);
@@ -548,7 +475,6 @@ async function manualReassign(bookingId, reason = 'Admin reassignment') {
   return { success: true, bookingId: booking.bookingId };
 }
 
-// ─── MANUAL ASSIGN TO SPECIFIC PROVIDER ───
 async function manualAssignProvider(bookingId, providerId) {
   const Booking = getBookingModel();
   const { getProviderConnection } = require('../config/database');
@@ -562,7 +488,6 @@ async function manualAssignProvider(bookingId, providerId) {
   }).lean();
   if (!booking) return { success: false, error: 'Booking not found' };
 
-  // Find provider by providerId string or _id
   let provider = null;
   try {
     provider = await providerColl.findOne({
@@ -577,10 +502,257 @@ async function manualAssignProvider(bookingId, providerId) {
 
   if (!provider) return { success: false, error: 'Provider not found' };
 
-  // Supersede old offers
   await supersedeOldOffers(booking.bookingId);
 
-  // Create ProviderOffer doc
+  const offer = await ProviderOffer.create({
+    bookingId: booking.bookingId,
+    bookingObjectId: booking._id,
+    providerId: provider.providerId || String(provider._id),
+    providerObjectId: provider._id,
+    providerName: provider.name,
+    providerPhone: provider.phone || '',
+    providerCategory: provider.profession || provider.categoryName || '',
+    providerCity: provider.city || '',
+    status: 'sent',
+    offeredAt: new Date(),
+    expiresAt: new Date(Date.now() + CFG.requestTimeoutMs),
+    dispatchCycle: 1,
+    batchNumber: 1,
+    radiusKm: 999,
+    distanceKm: 0,
+    isCurrentOffer: true,
+    isScheduled: booking.bookingType === 'scheduled',
+    ProviderOffer.findOne({
+        bookingId: bId,
+        dispatchCycle: dispatchJob.cycle,
+        batchNumber: radiusIdx + 1,
+        status: 'accepted',
+      }).lean();
+
+      if (acceptedOffer) {
+        console.log(`[Dispatch] ✅ ${bId} accepted by ${acceptedOffer.providerId}`);
+        assignedProvider = {
+          providerId: acceptedOffer.providerId,
+          providerObjectId: acceptedOffer.providerObjectId,
+          name: acceptedOffer.providerName,
+          phone: acceptedOffer.providerPhone,
+        };
+        break;
+      }
+
+      const chk = await Booking.findById(bOid).lean();
+      if (chk && chk.providerId && !assignedProvider) {
+        assignedProvider = {
+          providerId: chk.providerId,
+          name: chk.providerName,
+          phone: chk.providerPhone,
+        };
+        break;
+      }
+    }
+
+    if (assignedProvider) break;
+
+    await ProviderOffer.updateMany(
+      {
+        bookingId: bId,
+        dispatchCycle: dispatchJob.cycle,
+        batchNumber: radiusIdx + 1,
+        status: { $in: ['sent', 'delivered', 'viewed'] },
+      },
+      {
+        $set: {
+          status: 'timeout',
+          respondedAt: new Date(),
+          reason: 'No response within window',
+          isCurrentOffer: false,
+        },
+      }
+    );
+  }
+
+  if (assignedProvider) {
+    await Booking.updateOne(
+      { _id: bOid },
+      {
+        $set: {
+          providerId: assignedProvider.providerId,
+          providerName: assignedProvider.name || null,
+          providerPhone: assignedProvider.phone || null,
+          assignedAt: new Date(),
+          dispatchCompletedAt: new Date(),
+          status: 'accepted',
+        },
+        $push: {
+          statusHistory: {
+            status: 'accepted',
+            changedAt: new Date(),
+            changedBy: 'dispatch_system',
+            reason: `Accepted by ${assignedProvider.name}`,
+          },
+        },
+      }
+    );
+
+    await DispatchJob.updateOne(
+      { _id: dispatchJob._id },
+      {
+        $set: {
+          status: 'completed',
+          completedAt: new Date(),
+          assignedProviderId: assignedProvider.providerId,
+        },
+      }
+    );
+
+    clearCooldown(bId);
+    markInactive(bId);
+
+    safeEmit('dispatch:assigned', {
+      bookingId: bId,
+      providerId: assignedProvider.providerId,
+      providerName: assignedProvider.name,
+    });
+    safeEmit('booking:status_changed', { bookingId: bId, status: 'accepted' });
+
+    // ✅ Still send "booking_assigned" admin alert (silent — not blocked by filter)
+    try {
+      await createAdminAlert('booking_assigned', {
+        title: '✅ Provider Assigned',
+        message: `${assignedProvider.name} accepted booking ${bId}`,
+        severity: 'success',
+        bookingId: bId,
+        providerId: assignedProvider.providerId,
+        actionUrl: `/bookings?open=${bId}`,
+        actionLabel: 'View Booking',
+      });
+    } catch (e) {
+      console.warn('[Dispatch] admin alert error:', e.message);
+    }
+
+    return { success: true, assignedProvider };
+  }
+
+  // ─── NO PROVIDER FOUND ───
+  console.log(`[Dispatch] ❌ ${bId} no provider found after ${totalOffersSent} offers`);
+
+  await updateBookingStatus(bOid, 'no_provider_found', `Tried ${totalOffersSent} providers, none accepted`);
+
+  await DispatchJob.updateOne(
+    { _id: dispatchJob._id },
+    {
+      $set: {
+        status: 'no_provider_found',
+        completedAt: new Date(),
+        totalOffersSent,
+        totalProvidersConsidered: triedProviderIds.length,
+      },
+    }
+  );
+
+  markFailed(bId);
+  markInactive(bId);
+
+  // ✅ Still emit socket for admin dispatch dashboard (if any dashboard listens)
+  safeEmit('dispatch:no_provider_found', {
+    bookingId: bId,
+    totalOffersSent,
+  });
+  safeEmit('booking:status_changed', { bookingId: bId, status: 'no_provider_found' });
+
+  // ❌ REMOVED: createAdminAlert('no_provider_found', ...) — no more annoying notification!
+  // Status update + DispatchJob record still exist for audit; admin can see it in dispatch dashboard
+  console.log(`[Dispatch] 🔕 No admin notification sent (silenced by user request)`);
+
+  return { success: false, error: 'No provider accepted', totalOffersSent };
+}
+
+async function manualReassign(bookingId, reason = 'Admin reassignment') {
+  const Booking = getBookingModel();
+
+  const booking = await Booking.findOne({
+    $or: [
+      { _id: mongoose.Types.ObjectId.isValid(bookingId) ? new mongoose.Types.ObjectId(bookingId) : null },
+      { bookingId: bookingId },
+    ],
+  }).lean();
+
+  if (!booking) return { success: false, error: 'Booking not found' };
+
+  await supersedeOldOffers(booking.bookingId);
+
+  await Booking.updateOne(
+    { _id: booking._id },
+    {
+      $set: {
+        providerId: null,
+        providerName: null,
+        providerPhone: null,
+        assignedAt: null,
+        status: 'confirmed',
+      },
+      $push: {
+        statusHistory: {
+          status: 'confirmed',
+          changedAt: new Date(),
+          changedBy: 'admin',
+          reason: `Reassignment: ${reason}`,
+        },
+      },
+    }
+  );
+
+  clearCooldown(booking.bookingId);
+  markInactive(booking.bookingId);
+
+  if (booking.providerId) {
+    try {
+      await sendCancellationToProvider(booking.providerId, booking, reason);
+    } catch (e) {
+      console.warn('[Dispatch] cancel notify error:', e.message);
+    }
+  }
+
+  safeEmit('booking:status_changed', { bookingId: booking.bookingId, status: 'confirmed' });
+
+  setImmediate(() => {
+    dispatchBooking(booking.bookingId, { manual: true, forceCycle: true }).catch((e) => {
+      console.error('[Dispatch] Reassign-triggered dispatch error:', e.message);
+    });
+  });
+
+  return { success: true, bookingId: booking.bookingId };
+}
+
+async function manualAssignProvider(bookingId, providerId) {
+  const Booking = getBookingModel();
+  const { getProviderConnection } = require('../config/database');
+  const providerColl = getProviderConnection().collection('providers');
+
+  const booking = await Booking.findOne({
+    $or: [
+      { _id: mongoose.Types.ObjectId.isValid(bookingId) ? new mongoose.Types.ObjectId(bookingId) : null },
+      { bookingId: bookingId },
+    ],
+  }).lean();
+  if (!booking) return { success: false, error: 'Booking not found' };
+
+  let provider = null;
+  try {
+    provider = await providerColl.findOne({
+      $or: [
+        { providerId: providerId },
+        ...(mongoose.Types.ObjectId.isValid(providerId)
+          ? [{ _id: new mongoose.Types.ObjectId(providerId) }]
+          : []),
+      ],
+    });
+  } catch (e) {}
+
+  if (!provider) return { success: false, error: 'Provider not found' };
+
+  await supersedeOldOffers(booking.bookingId);
+
   const offer = await ProviderOffer.create({
     bookingId: booking.bookingId,
     bookingObjectId: booking._id,
@@ -602,7 +774,6 @@ async function manualAssignProvider(bookingId, providerId) {
     fcmSent: false,
   });
 
-  // Update booking
   await Booking.updateOne(
     { _id: booking._id },
     {
@@ -625,7 +796,6 @@ async function manualAssignProvider(bookingId, providerId) {
     }
   );
 
-  // Send FCM to provider
   try {
     const fcmResult = await sendBookingOfferToProvider(provider, booking, {
       offerId: String(offer._id),
