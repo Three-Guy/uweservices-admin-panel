@@ -118,9 +118,31 @@ function getProviderMessaging() {
 }
 
 // ============================================================
-// DB CONNECTIONS
+// DB CONNECTIONS — compatible with your database.js
 // ============================================================
 function getConn(name) {
+  // Try the exported helpers from your database.js first
+  try {
+    const db = require('../config/database');
+    if (name === 'admin_panel' && typeof db.getAdminConnection === 'function') {
+      const c = db.getAdminConnection();
+      if (c) return c;
+    }
+    if (name === 'provider_db' && typeof db.getProviderConnection === 'function') {
+      const c = db.getProviderConnection();
+      if (c) return c;
+    }
+    if (name === 'user_db' && typeof db.getUserConnection === 'function') {
+      const c = db.getUserConnection();
+      if (c) return c;
+    }
+    if (name === 'bookings_db' && typeof db.getBookingConnection === 'function') {
+      const c = db.getBookingConnection();
+      if (c) return c;
+    }
+  } catch (e) {}
+
+  // Fallback: scan mongoose connections
   const conns = mongoose.connections || [];
   for (const c of conns) {
     if (c && c.name === name) return c;
@@ -132,8 +154,12 @@ function getModel(connName, modelName, schemaDef) {
   const conn = getConn(connName);
   if (!conn) return null;
   if (conn.models && conn.models[modelName]) return conn.models[modelName];
-  const schema = new mongoose.Schema(schemaDef || {}, { strict: false, timestamps: true });
-  return conn.model(modelName, schema);
+  try {
+    const schema = new mongoose.Schema(schemaDef || {}, { strict: false, timestamps: true });
+    return conn.model(modelName, schema);
+  } catch (e) {
+    return null;
+  }
 }
 
 // ============================================================
@@ -308,16 +334,29 @@ async function sendCancellationFCM(fcmToken, bookingId, reason) {
 // MODELS
 // ============================================================
 function Bookings() {
-  return getModel('bookings_db', 'Booking', {}) || getModel('user_db', 'Booking', {});
+  return (
+    getModel('bookings_db', 'Booking', {}) ||
+    getModel('user_db', 'Booking', {}) ||
+    getModel('admin_panel', 'Booking', {})
+  );
 }
 function Providers() {
-  return getModel('admin_panel', 'Provider', {}) || getModel('provider_db', 'Provider', {});
+  return (
+    getModel('admin_panel', 'Provider', {}) ||
+    getModel('provider_db', 'Provider', {})
+  );
 }
 function ProviderOffers() {
-  return getModel('bookings_db', 'ProviderOffer', {}) || getModel('admin_panel', 'ProviderOffer', {});
+  return (
+    getModel('bookings_db', 'ProviderOffer', {}) ||
+    getModel('admin_panel', 'ProviderOffer', {})
+  );
 }
 function DispatchJobs() {
-  return getModel('bookings_db', 'DispatchJob', {}) || getModel('admin_panel', 'DispatchJob', {});
+  return (
+    getModel('bookings_db', 'DispatchJob', {}) ||
+    getModel('admin_panel', 'DispatchJob', {})
+  );
 }
 
 // ============================================================
@@ -345,7 +384,9 @@ exports.getOnlineProviders = async (req, res) => {
       q.$and = [{ $or: [{ name: rx }, { phone: rx }, { email: rx }, { providerId: rx }] }];
     }
     if (category) {
-      q.$and = (q.$and || []).concat([{ $or: [{ profession: new RegExp(category, 'i') }, { category: new RegExp(category, 'i') }] }]);
+      q.$and = (q.$and || []).concat([
+        { $or: [{ profession: new RegExp(category, 'i') }, { category: new RegExp(category, 'i') }] },
+      ]);
     }
 
     const docs = await Provider.find(q).limit(500).lean();
@@ -400,6 +441,10 @@ exports.send = async (req, res) => {
     const Offer = ProviderOffers();
     const Job = DispatchJobs();
 
+    if (!Booking || !Provider) {
+      return res.status(500).json({ success: false, error: 'Database models not available' });
+    }
+
     // Find booking
     let booking = null;
     try {
@@ -451,14 +496,16 @@ exports.send = async (req, res) => {
     }
 
     // Supersede existing offers
-    try {
-      await Offer.updateMany(
-        { bookingId: booking._id, status: { $in: ['pending', 'sent', 'active'] } },
-        { $set: { status: 'superseded', supersededAt: new Date() } }
-      );
-      console.log('🔄 Superseded old offers');
-    } catch (e) {
-      console.error('⚠️ Supersede failed:', e.message);
+    if (Offer) {
+      try {
+        await Offer.updateMany(
+          { bookingId: booking._id, status: { $in: ['pending', 'sent', 'active'] } },
+          { $set: { status: 'superseded', supersededAt: new Date() } }
+        );
+        console.log('🔄 Superseded old offers');
+      } catch (e) {
+        console.error('⚠️ Supersede failed:', e.message);
+      }
     }
 
     // Reset booking to searching
@@ -480,35 +527,44 @@ exports.send = async (req, res) => {
 
     // Create new offer
     const expiresAt = new Date(Date.now() + 30 * 1000);
-    const offer = await Offer.create({
-      bookingId: booking._id,
-      providerId: provider._id,
-      providerCode: provider.providerId,
-      status: 'pending',
-      source: 'manual_admin',
-      adminNote: adminNote || '',
-      expiresAt,
-      createdAt: new Date(),
-    });
-    console.log(`📝 Offer: ${offer._id}`);
-
-    // Create dispatch job
-    const jobStatuses = ['pending', 'active', 'dispatched', 'searching', 'sent', 'waiting'];
-    let job = null;
-    for (const st of jobStatuses) {
+    let offer = null;
+    if (Offer) {
       try {
-        job = await Job.create({
+        offer = await Offer.create({
           bookingId: booking._id,
           providerId: provider._id,
-          status: st,
+          providerCode: provider.providerId,
+          status: 'pending',
           source: 'manual_admin',
+          adminNote: adminNote || '',
           expiresAt,
           createdAt: new Date(),
         });
-        console.log(`📝 DispatchJob status=${st}`);
-        break;
+        console.log(`📝 Offer: ${offer._id}`);
       } catch (e) {
-        // try next
+        console.error('⚠️ Offer create failed:', e.message);
+      }
+    }
+
+    // Create dispatch job — try multiple statuses
+    const jobStatuses = ['pending', 'active', 'dispatched', 'searching', 'sent', 'waiting'];
+    let job = null;
+    if (Job) {
+      for (const st of jobStatuses) {
+        try {
+          job = await Job.create({
+            bookingId: booking._id,
+            providerId: provider._id,
+            status: st,
+            source: 'manual_admin',
+            expiresAt,
+            createdAt: new Date(),
+          });
+          console.log(`📝 DispatchJob status=${st}`);
+          break;
+        } catch (e) {
+          // try next
+        }
       }
     }
 
@@ -520,7 +576,7 @@ exports.send = async (req, res) => {
       const io = req.app.get('io');
       if (io) {
         const payload = {
-          offerId: offer._id,
+          offerId: offer ? offer._id : null,
           bookingId: booking._id,
           providerId: provider._id,
           providerName: provider.name,
@@ -539,41 +595,47 @@ exports.send = async (req, res) => {
     }
 
     // Setup 30s timeout
-    setTimeout(async () => {
-      try {
-        const current = await Offer.findById(offer._id).lean();
-        if (current && current.status === 'pending') {
-          await Offer.updateOne({ _id: offer._id }, { $set: { status: 'timeout', timedOutAt: new Date() } });
-          if (job) {
-            await Job.updateOne({ _id: job._id }, { $set: { status: 'timeout' } });
-          }
-          await Booking.updateOne(
-            { _id: booking._id, status: 'searching' },
-            { $set: { status: 'no_provider_found' } }
-          );
-          console.log(`⏰ Offer ${offer._id} TIMEOUT`);
+    if (offer) {
+      setTimeout(async () => {
+        try {
+          const current = await Offer.findById(offer._id).lean();
+          if (current && current.status === 'pending') {
+            await Offer.updateOne({ _id: offer._id }, { $set: { status: 'timeout', timedOutAt: new Date() } });
+            if (job && Job) {
+              try {
+                await Job.updateOne({ _id: job._id }, { $set: { status: 'timeout' } });
+              } catch {}
+            }
+            await Booking.updateOne(
+              { _id: booking._id, status: 'searching' },
+              { $set: { status: 'no_provider_found' } }
+            );
+            console.log(`⏰ Offer ${offer._id} TIMEOUT`);
 
-          try {
-            const io = req.app.get('io');
-            if (io) io.emit('manual-dispatch:timeout', { offerId: offer._id, bookingId: booking._id });
-          } catch {}
+            try {
+              const io = req.app.get('io');
+              if (io) io.emit('manual-dispatch:timeout', { offerId: offer._id, bookingId: booking._id });
+            } catch {}
+          }
+        } catch (e) {
+          console.error('⚠️ Timeout handler failed:', e.message);
         }
-      } catch (e) {
-        console.error('⚠️ Timeout handler failed:', e.message);
-      }
-    }, 30 * 1000);
+      }, 30 * 1000);
+    }
 
     console.log(`✅ FCM: ${fcmResult.success ? 'SENT ✅ ' + fcmResult.messageId : 'FAILED ❌ ' + fcmResult.error}`);
     console.log('============================================================\n');
 
     return res.json({
       success: true,
-      offer: {
-        _id: offer._id,
-        bookingId: booking._id,
-        providerId: provider._id,
-        expiresAt,
-      },
+      offer: offer
+        ? {
+            _id: offer._id,
+            bookingId: booking._id,
+            providerId: provider._id,
+            expiresAt,
+          }
+        : null,
       fcm: fcmResult,
     });
   } catch (err) {
@@ -603,13 +665,14 @@ exports.getOfferStatus = async (req, res) => {
 };
 
 // ============================================================
-// DEBUG
+// DEBUG — exposed as BOTH names so routes file works either way
 // ============================================================
-exports.debug = async (req, res) => {
+async function debugHandler(req, res) {
   const info = {
     env: {
       hasB64: !!process.env.PROVIDER_FIREBASE_SERVICE_ACCOUNT_BASE64,
       hasJSON: !!process.env.PROVIDER_FIREBASE_SERVICE_ACCOUNT_JSON,
+      adminSecretSet: !!process.env.ADMIN_SECRET_KEY,
     },
     firebase: {
       appsCount: Array.isArray(firebaseAdmin.apps) ? firebaseAdmin.apps.length : 0,
@@ -626,7 +689,11 @@ exports.debug = async (req, res) => {
   info.messagingInitialized = !!messaging;
 
   return res.json(info);
-};
+}
+
+// Export under BOTH names — routes file might use either
+exports.debug = debugHandler;
+exports.debugConnections = debugHandler;
 
 // ============================================================
 // HEALTH
