@@ -61,7 +61,7 @@ const buildAllowedOrigins = () => {
 const ALLOWED_ORIGINS = buildAllowedOrigins();
 console.log('📋 Allowed Origins:', ALLOWED_ORIGINS);
 
-// Socket.IO with dynamic origin reflection (fixes CORS + credentials bug)
+// Socket.IO with dynamic origin reflection
 const io = new Server(server, {
   cors: {
     origin: (origin, callback) => {
@@ -94,7 +94,7 @@ app.use(helmet({
 }));
 app.use(compression());
 
-// CORS middleware - always reflects actual origin (never '*' with credentials)
+// CORS middleware
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (origin) {
@@ -106,7 +106,7 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
   res.setHeader('Access-Control-Allow-Headers',
     'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control, Pragma, ' +
-    'X-App-Version, X-Platform, X-Device-Id, X-Device-Model, X-OS-Version, X-Push-Token, X-Timezone, X-Locale, X-Network-Type, X-App-Build'
+    'X-App-Version, X-Platform, X-Device-Id, X-Device-Model, X-OS-Version, X-Push-Token, X-Timezone, X-Locale, X-Network-Type, X-App-Build, X-Admin-Secret, x-admin-secret'
   );
   res.setHeader('Access-Control-Expose-Headers',
     'X-Total-Count, X-Page, X-Per-Page, X-Total-Pages, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, Content-Disposition'
@@ -206,7 +206,6 @@ app.get('/api/v1/admin/socket-test', (req, res) => {
 });
 
 // ===== TEST NOTIFICATION ENDPOINT =====
-// Visit this URL to manually trigger a notification and verify socket + FCM delivery
 app.get('/api/v1/admin/test-notification', async (req, res) => {
   try {
     const testPayload = {
@@ -232,12 +231,10 @@ app.get('/api/v1/admin/test-notification', async (req, res) => {
       adminRoomCount = adminRoom ? adminRoom.size : 0;
     } catch (e) {}
 
-    // Emit socket
     io.to('admins').emit('admin:notification', testPayload);
     io.emit('admin:notification', testPayload);
     console.log(`📡 [TEST] Socket emitted to ${adminRoomCount} admins (${socketCount} total)`);
 
-    // Send FCM push
     let fcmResults = [];
     try {
       const AdminFcmToken = require('./models/AdminFcmToken');
@@ -303,7 +300,6 @@ io.on('connection', (socket) => {
   console.log(`   Transport: ${socket.conn.transport.name}`);
   console.log(`   Auth: ${JSON.stringify(socket.handshake.auth || {})}`);
 
-  // Always auto-join 'admins' room
   socket.join('admins');
   console.log(`✅ Socket ${socket.id} auto-joined 'admins' room`);
 
@@ -313,7 +309,6 @@ io.on('connection', (socket) => {
     console.log(`👥 Total in 'admins' room: ${count}`);
   } catch (e) {}
 
-  // Admin registration handler (handles all event names)
   const handleAdminRegister = (eventName) => (data) => {
     try {
       console.log(`👑 Admin event "${eventName}" from ${socket.id}:`, JSON.stringify(data || {}));
@@ -438,8 +433,19 @@ async function startServer() {
     app.use('/api/v1/admin/dispatch', dispatchRoutes);
     app.use('/api/v1/admin/provider-offers', providerOfferRoutes);
     app.use('/api/v1/admin/admin-notifications', adminNotificationRoutes);
-    app.use('/api/v1/admin/provider-offers', providerOfferRoutes);
-app.use('/api/v1/admin/admin-notifications', adminNotificationRoutes);
+
+    // ═══════════════════════════════════════════════════════════════
+    // 🚨 MANUAL DISPATCH ROUTES — MOUNTED BEFORE 404 HANDLER
+    // ═══════════════════════════════════════════════════════════════
+    try {
+      const manualDispatchRoutes = require('./routes/manualDispatch.routes');
+      app.use('/api/v1/admin/manual-dispatch', manualDispatchRoutes);
+      console.log('✅ [Routes] Manual Dispatch routes mounted at /api/v1/admin/manual-dispatch');
+    } catch (e) {
+      console.error('❌ [Routes] Manual Dispatch routes load failed:', e.message);
+      console.error(e.stack);
+    }
+
     if (adminFcmTokenRoutes) {
       app.use('/api/v1/admin/fcm', adminFcmTokenRoutes);
       console.log('✓ /api/v1/admin/fcm routes mounted');
@@ -463,6 +469,9 @@ app.use('/api/v1/admin/admin-notifications', adminNotificationRoutes);
 
     logger.info('✓ All routes initialized successfully');
 
+    // ═══════════════════════════════════════════════════════════════
+    // ERROR HANDLER + 404 HANDLER — MUST BE LAST
+    // ═══════════════════════════════════════════════════════════════
     const errorHandler = require('./middleware/error.middleware');
     app.use(errorHandler);
 
@@ -471,6 +480,9 @@ app.use('/api/v1/admin/admin-notifications', adminNotificationRoutes);
       res.status(404).json({ success: false, message: 'Route not found', path: req.path });
     });
 
+    // ═══════════════════════════════════════════════════════════════
+    // BACKGROUND SERVICES
+    // ═══════════════════════════════════════════════════════════════
     try {
       const connectRabbitMQ = require('./config/rabbitmq');
       connectRabbitMQ(io).catch(err => logger.warn('RabbitMQ failed:', err.message));
@@ -496,15 +508,7 @@ app.use('/api/v1/admin/admin-notifications', adminNotificationRoutes);
       } catch (e) {
         logger.error(`bookingPoller start failed: ${e.message}`);
       }
-    // ✅ MANUAL DISPATCH ROUTES (NEW)
-try {
-  const manualDispatchRoutes = require('./routes/manualDispatch.routes');
-  app.use('/api/v1/admin/manual-dispatch', manualDispatchRoutes);
-  console.log('✅ [Routes] Manual Dispatch routes mounted at /api/v1/admin/manual-dispatch');
-} catch (e) {
-  console.error('❌ [Routes] Manual Dispatch routes load failed:', e.message);
-  console.error(e.stack);
-}
+
       try {
         const { startWatcher } = require('./workers/dispatchWorker');
         startWatcher();
