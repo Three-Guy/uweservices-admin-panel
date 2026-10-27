@@ -1,9 +1,17 @@
 // backend/src/controllers/manualDispatch.controller.js
-// COMPLETE MANUAL DISPATCH CONTROLLER — FINAL WORKING VERSION
-// Fixes: Strict online query, offer status polling, FCM test endpoint
+// COMPLETE MANUAL DISPATCH CONTROLLER — WITH REAL-TIME ONLINE DETECTION
+// FIX: lastActive-based online status + stale token warnings + better FCM diagnostics
 
 const mongoose = require('mongoose');
 const path = require('path');
+
+// ============================================================
+// CONSTANTS
+// ============================================================
+
+const ONLINE_THRESHOLD_MS = 2 * 60 * 1000;      // 2 minutes = ONLINE
+const RECENTLY_ACTIVE_MS = 10 * 60 * 1000;      // 10 minutes = RECENTLY ACTIVE
+const STALE_TOKEN_DAYS = 7;                     // Token older than 7 days = possibly stale
 
 // ============================================================
 // UTILITY HELPERS
@@ -60,13 +68,89 @@ function timeAgo(date) {
   var d = new Date(date);
   if (isNaN(d.getTime())) return '';
   var diffMs = now - d;
-  var diffMins = Math.floor(diffMs / 60000);
-  if (diffMins < 1) return 'just now';
+  var diffSec = Math.floor(diffMs / 1000);
+  if (diffSec < 60) return diffSec + 's ago';
+  var diffMins = Math.floor(diffSec / 60);
   if (diffMins < 60) return diffMins + 'm ago';
   var diffHrs = Math.floor(diffMins / 60);
   if (diffHrs < 24) return diffHrs + 'h ago';
   var diffDays = Math.floor(diffHrs / 24);
   return diffDays + 'd ago';
+}
+
+// REAL-TIME ONLINE DETECTION
+// A provider is TRULY online only if:
+// 1. DB flag says online (isOnline/online/isAvailable/status==='online')
+// 2. AND lastActive/lastSeen within 2 minutes
+// If no lastActive available, trust DB flag but mark as "unverified"
+function computeRealTimeStatus(p) {
+  var dbOnline = !!(p.isOnline === true || p.online === true || p.isAvailable === true ||
+                   p.status === 'online' || p.availability === 'online');
+
+  var lastActive = p.lastActive || p.lastSeen || p.lastHeartbeat ||
+                   p.lastOnlineAt || p.lastActiveAt || p.updatedAt || null;
+
+  var realTimeStatus = 'offline';
+  var minutesAgo = null;
+  var hasLiveSignal = false;
+
+  if (lastActive) {
+    var la = new Date(lastActive);
+    if (!isNaN(la.getTime())) {
+      var diffMs = Date.now() - la.getTime();
+      minutesAgo = Math.floor(diffMs / 60000);
+      hasLiveSignal = true;
+
+      if (diffMs <= ONLINE_THRESHOLD_MS && dbOnline) {
+        realTimeStatus = 'online';        // DB says online + recent activity
+      } else if (diffMs <= ONLINE_THRESHOLD_MS) {
+        realTimeStatus = 'recently_active'; // recent activity but DB says offline
+      } else if (diffMs <= RECENTLY_ACTIVE_MS) {
+        realTimeStatus = 'idle';           // active in last 10 min
+      } else {
+        realTimeStatus = 'offline';         // inactive > 10 min
+      }
+    }
+  } else if (dbOnline) {
+    // No lastActive but DB says online — trust DB but mark unverified
+    realTimeStatus = 'online_unverified';
+    hasLiveSignal = false;
+  }
+
+  return {
+    isOnline: realTimeStatus === 'online' || realTimeStatus === 'online_unverified',
+    realTimeStatus: realTimeStatus,
+    dbOnline: dbOnline,
+    hasLiveSignal: hasLiveSignal,
+    minutesAgo: minutesAgo,
+    lastActive: lastActive
+  };
+}
+
+// Detect if FCM token might be stale
+function computeTokenHealth(p, fcmToken) {
+  if (!fcmToken) {
+    return { status: 'missing', warning: 'No FCM token saved' };
+  }
+
+  if (fcmToken.length < 100) {
+    return { status: 'invalid', warning: 'Token too short (' + fcmToken.length + ' chars, expected 140+)' };
+  }
+
+  var tokenUpdatedAt = p.fcmTokenUpdatedAt || p.tokenUpdatedAt || p.fcmTokenAt || p.updatedAt || null;
+  if (tokenUpdatedAt) {
+    var ta = new Date(tokenUpdatedAt);
+    if (!isNaN(ta.getTime())) {
+      var ageMs = Date.now() - ta.getTime();
+      var ageDays = Math.floor(ageMs / (1000 * 60 * 60 * 24));
+      if (ageDays > STALE_TOKEN_DAYS) {
+        return { status: 'stale', warning: 'Token is ' + ageDays + ' days old — may be invalid', ageDays: ageDays };
+      }
+      return { status: 'fresh', ageDays: ageDays };
+    }
+  }
+
+  return { status: 'unknown', warning: 'Token age unknown' };
 }
 
 // ============================================================
@@ -255,8 +339,6 @@ async function findInAllDbsAggregated(collectionName, query, options) {
     return [];
   }
 
-  console.log('   🔎 Scanning ' + all.length + ' DBs for "' + collectionName + '"');
-
   var allDocs = [];
   var seenIds = {};
 
@@ -268,7 +350,6 @@ async function findInAllDbsAggregated(collectionName, query, options) {
       var count = await collection.countDocuments(query);
       if (count > 0) {
         var docs = await collection.find(query).sort(sort).limit(limit).toArray();
-        console.log('   ✓ Found ' + docs.length + ' in ' + dbName + '.' + collectionName);
         for (var j = 0; j < docs.length; j++) {
           var idStr = String(docs[j]._id);
           if (!seenIds[idStr]) {
@@ -347,12 +428,10 @@ async function loadCategoriesMap() {
   for (var i = 0; i < all.length; i++) {
     try {
       var docs = await all[i].conn.collection('categories').find({}).toArray();
-      if (docs.length > 0) {
-        for (var j = 0; j < docs.length; j++) {
-          var id = String(docs[j]._id);
-          if (!map[id]) {
-            map[id] = safeStr(docs[j].name || docs[j].categoryName || docs[j].title || '');
-          }
+      for (var j = 0; j < docs.length; j++) {
+        var id = String(docs[j]._id);
+        if (!map[id]) {
+          map[id] = safeStr(docs[j].name || docs[j].categoryName || docs[j].title || '');
         }
       }
     } catch (e) {}
@@ -366,12 +445,10 @@ async function loadCitiesMap() {
   for (var i = 0; i < all.length; i++) {
     try {
       var docs = await all[i].conn.collection('cities').find({}).toArray();
-      if (docs.length > 0) {
-        for (var j = 0; j < docs.length; j++) {
-          var id = String(docs[j]._id);
-          if (!map[id]) {
-            map[id] = safeStr(docs[j].cityName || docs[j].name || docs[j].title || '');
-          }
+      for (var j = 0; j < docs.length; j++) {
+        var id = String(docs[j]._id);
+        if (!map[id]) {
+          map[id] = safeStr(docs[j].cityName || docs[j].name || docs[j].title || '');
         }
       }
     } catch (e) {}
@@ -385,17 +462,15 @@ async function loadServicesMap() {
   for (var i = 0; i < all.length; i++) {
     try {
       var docs = await all[i].conn.collection('services').find({}).toArray();
-      if (docs.length > 0) {
-        for (var j = 0; j < docs.length; j++) {
-          var id = String(docs[j]._id);
-          if (!map[id]) {
-            map[id] = {
-              name: safeStr(docs[j].name || docs[j].serviceName || docs[j].title || ''),
-              icon: safeStr(docs[j].icon || docs[j].image || docs[j].imageUrl || ''),
-              category: docs[j].category || docs[j].categoryId || null,
-              price: safeNum(docs[j].price || docs[j].basePrice || docs[j].amount || 0)
-            };
-          }
+      for (var j = 0; j < docs.length; j++) {
+        var id = String(docs[j]._id);
+        if (!map[id]) {
+          map[id] = {
+            name: safeStr(docs[j].name || docs[j].serviceName || docs[j].title || ''),
+            icon: safeStr(docs[j].icon || docs[j].image || docs[j].imageUrl || ''),
+            category: docs[j].category || docs[j].categoryId || null,
+            price: safeNum(docs[j].price || docs[j].basePrice || docs[j].amount || 0)
+          };
         }
       }
     } catch (e) {}
@@ -409,16 +484,14 @@ async function loadUsersMap() {
   for (var i = 0; i < all.length; i++) {
     try {
       var docs = await all[i].conn.collection('users').find({}).toArray();
-      if (docs.length > 0) {
-        for (var j = 0; j < docs.length; j++) {
-          var id = String(docs[j]._id);
-          if (!map[id]) {
-            map[id] = {
-              name: safeStr(docs[j].name || docs[j].fullName || docs[j].firstName || docs[j].displayName || 'Customer'),
-              phone: safeStr(docs[j].phone || docs[j].phoneNumber || docs[j].mobile || ''),
-              email: safeStr(docs[j].email || '')
-            };
-          }
+      for (var j = 0; j < docs.length; j++) {
+        var id = String(docs[j]._id);
+        if (!map[id]) {
+          map[id] = {
+            name: safeStr(docs[j].name || docs[j].fullName || docs[j].firstName || docs[j].displayName || 'Customer'),
+            phone: safeStr(docs[j].phone || docs[j].phoneNumber || docs[j].mobile || ''),
+            email: safeStr(docs[j].email || '')
+          };
         }
       }
     } catch (e) {}
@@ -460,18 +533,12 @@ function formatAddress(booking) {
 
     if (parts.length > 0) return parts.join(', ');
     if (addr.address && typeof addr.address === 'string') return addr.address;
-
-    if (addr.coordinates || addr.lat || addr.latitude) {
-      var lat = addr.lat || addr.latitude || (addr.coordinates && addr.coordinates[1]) || '';
-      var lng = addr.lng || addr.longitude || (addr.coordinates && addr.coordinates[0]) || '';
-      if (lat && lng) return '📍 ' + lat + ', ' + lng;
-    }
   }
   return '';
 }
 
 // ============================================================
-// GET ONLINE PROVIDERS — STRICT ONLINE QUERY
+// GET ONLINE PROVIDERS — REAL-TIME DETECTION
 // ============================================================
 
 async function getOnlineProviders(req, res) {
@@ -480,35 +547,17 @@ async function getOnlineProviders(req, res) {
     var searchTerm = req.query.search || '';
     var categoryFilter = req.query.category || '';
 
-    // STRICT online query — NO isApproved! Only real online indicators
-    var query = {};
-    if (!includeAll) {
-      query = {
-        $or: [
-          { isOnline: true },
-          { online: true },
-          { isAvailable: true },
-          { status: 'online' },
-          { availability: 'online' }
-        ]
-      };
-    }
-
-    console.log('🔍 [getOnlineProviders] Query: ' + JSON.stringify(query) + ' includeAll: ' + includeAll);
+    console.log('🔍 [getOnlineProviders] includeAll=' + includeAll);
 
     var maps = await Promise.all([loadCategoriesMap(), loadCitiesMap()]);
     var categoriesMap = maps[0];
     var citiesMap = maps[1];
 
-    var providers = await findInAllDbsAggregated('providers', query, { limit: 500, sort: { _id: -1 } });
-
-    // Fallback: if no "online" providers found, fetch ALL and let frontend decide
-    if (providers.length === 0 && !includeAll) {
-      console.log('⚠️ No online providers — fetching all');
-      providers = await findInAllDbsAggregated('providers', {}, { limit: 500, sort: { _id: -1 } });
-    }
+    // Fetch ALL providers — compute online status in JS (REAL-TIME)
+    var providers = await findInAllDbsAggregated('providers', {}, { limit: 500, sort: { _id: -1 } });
 
     var enriched = providers.map(function(p) {
+      // CATEGORY
       var categoryName = '';
       var catField = p.category || p.categoryId || p.categories;
       if (catField) {
@@ -524,6 +573,7 @@ async function getOnlineProviders(req, res) {
         }
       }
 
+      // CITY
       var cityName = '';
       var cityField = p.city || p.cityId || p.serviceCity;
       if (cityField) {
@@ -535,15 +585,21 @@ async function getOnlineProviders(req, res) {
         }
       }
 
+      // FCM TOKEN
       var fcmToken = p.fcmToken || p.fcm_token || p.deviceToken || p.pushToken ||
                      (p.deviceInfo && (p.deviceInfo.fcmToken || p.deviceInfo.token)) || '';
 
-      // STRICT ONLINE: only true if ACTUALLY online, NOT just approved
-      var isOnline = !!(p.isOnline === true || p.online === true || p.isAvailable === true ||
-                       p.status === 'online' || p.availability === 'online');
+      // REAL-TIME ONLINE STATUS
+      var statusInfo = computeRealTimeStatus(p);
+      var tokenHealth = computeTokenHealth(p, fcmToken);
 
       var name = safeStr(p.name || p.fullName || p.firstName || p.businessName || 'Provider');
-      var phone = safeStr(p.phone || p.phoneNumber || p.mobile || '');
+      if (!name || name === 'Provider') {
+        var fn = safeStr(p.firstName || '');
+        var ln = safeStr(p.lastName || '');
+        if (fn || ln) name = (fn + ' ' + ln).trim();
+      }
+      var phone = safeStr(p.phone || p.phoneNumber || p.mobile || p.mobileNumber || p.contactNumber || '');
       var email = safeStr(p.email || '');
 
       return {
@@ -557,23 +613,54 @@ async function getOnlineProviders(req, res) {
         city: cityName,
         cityName: cityName,
         cityId: String(cityField && typeof cityField === 'object' ? (cityField._id || cityField) : (cityField || '')),
-        isOnline: isOnline,
+
+        // REAL-TIME STATUS
+        isOnline: statusInfo.isOnline,
+        realTimeStatus: statusInfo.realTimeStatus,  // 'online', 'online_unverified', 'recently_active', 'idle', 'offline'
+        dbOnline: statusInfo.dbOnline,
+        hasLiveSignal: statusInfo.hasLiveSignal,
+        minutesSinceActive: statusInfo.minutesAgo,
+        lastActive: statusInfo.lastActive,
+        lastActiveAgo: timeAgo(statusInfo.lastActive),
+
         isApproved: !!(p.isApproved || p.approved),
         isVerified: !!(p.isVerified || p.verified),
+
+        // FCM TOKEN HEALTH
         hasFCM: !!fcmToken,
         fcmToken: fcmToken,
+        fcmTokenLength: fcmToken.length,
+        tokenHealth: tokenHealth.status,            // 'fresh', 'stale', 'invalid', 'missing', 'unknown'
+        tokenWarning: tokenHealth.warning || '',
+        tokenAgeDays: tokenHealth.ageDays || null,
+
         rating: safeNum(p.rating || p.averageRating || p.avgRating || 0),
         totalJobs: safeNum(p.totalJobs || p.completedJobs || p.jobsCompleted || p.totalBookings || 0),
         profileImage: safeStr(p.profileImage || p.avatar || p.photo || p.image || ''),
         createdAt: p.createdAt || (p._id.getTimestamp ? p._id.getTimestamp() : new Date()),
         timeAgo: timeAgo(p.createdAt || (p._id.getTimestamp ? p._id.getTimestamp() : new Date())),
-        lastActive: p.lastActive || p.lastSeen || p.updatedAt || '',
-        lastActiveAgo: timeAgo(p.lastActive || p.lastSeen || p.updatedAt || ''),
         _sourceDb: p._sourceDb || ''
       };
     });
 
+    // FILTER: if not includeAll, show only ONLINE (real-time)
     var filtered = enriched;
+    if (!includeAll) {
+      filtered = filtered.filter(function(p) { return p.isOnline; });
+      // Fallback: if nothing truly online, show recently_active + idle
+      if (filtered.length === 0) {
+        console.log('⚠️ No truly online providers — showing recently_active + idle');
+        filtered = enriched.filter(function(p) {
+          return p.realTimeStatus === 'recently_active' || p.realTimeStatus === 'idle';
+        });
+      }
+      // Final fallback: show all
+      if (filtered.length === 0) {
+        console.log('⚠️ No active providers — showing all');
+        filtered = enriched;
+      }
+    }
+
     if (searchTerm) {
       var term = searchTerm.toLowerCase();
       filtered = filtered.filter(function(p) {
@@ -592,11 +679,22 @@ async function getOnlineProviders(req, res) {
       });
     }
 
+    // Sort: online first, then by last active
     filtered.sort(function(a, b) {
+      if (a.isOnline && !b.isOnline) return -1;
+      if (!a.isOnline && b.isOnline) return 1;
+      var la = a.lastActive ? new Date(a.lastActive).getTime() : 0;
+      var lb = b.lastActive ? new Date(b.lastActive).getTime() : 0;
+      if (lb !== la) return lb - la;
       return new Date(b.createdAt || 0) - new Date(a.createdAt || 0);
     });
 
-    console.log('📊 Returned ' + filtered.length + ' providers (online=' + filtered.filter(function(p){return p.isOnline;}).length + ')');
+    var onlineCount = enriched.filter(function(p) { return p.isOnline; }).length;
+    var recentCount = enriched.filter(function(p) { return p.realTimeStatus === 'recently_active'; }).length;
+    var idleCount = enriched.filter(function(p) { return p.realTimeStatus === 'idle'; }).length;
+    var offlineCount = enriched.filter(function(p) { return p.realTimeStatus === 'offline'; }).length;
+
+    console.log('📊 Returned ' + filtered.length + '/' + enriched.length + ' providers (online=' + onlineCount + ', recent=' + recentCount + ', idle=' + idleCount + ', offline=' + offlineCount + ')');
 
     res.json({
       success: true,
@@ -606,9 +704,13 @@ async function getOnlineProviders(req, res) {
         allCategories: Array.from(new Set(enriched.map(function(p) { return p.category; }).filter(Boolean))).sort(),
         stats: {
           total: enriched.length,
-          online: enriched.filter(function(p) { return p.isOnline; }).length,
-          offline: enriched.filter(function(p) { return !p.isOnline; }).length,
+          online: onlineCount,
+          recentlyActive: recentCount,
+          idle: idleCount,
+          offline: offlineCount,
           withFCM: enriched.filter(function(p) { return p.hasFCM; }).length,
+          withFreshToken: enriched.filter(function(p) { return p.tokenHealth === 'fresh'; }).length,
+          withStaleToken: enriched.filter(function(p) { return p.tokenHealth === 'stale'; }).length,
           approved: enriched.filter(function(p) { return p.isApproved; }).length
         }
       }
@@ -625,6 +727,16 @@ async function getOnlineProviders(req, res) {
 
 async function getDispatchableBookings(req, res) {
   try {
+    var statusFilter = req.query.status || '';
+
+    var query;
+    if (statusFilter && statusFilter !== 'all') {
+      query = { status: statusFilter };
+    } else {
+      // Default: only dispatchable statuses
+      query = { status: { $in: ['no_provider_found', 'searching', 'pending'] } };
+    }
+
     var maps = await Promise.all([
       loadCategoriesMap(), loadCitiesMap(), loadServicesMap(), loadUsersMap()
     ]);
@@ -633,7 +745,7 @@ async function getDispatchableBookings(req, res) {
     var servicesMap = maps[2];
     var usersMap = maps[3];
 
-    var allBookings = await findInAllDbsAggregated('bookings', {}, { limit: 500, sort: { _id: -1 } });
+    var allBookings = await findInAllDbsAggregated('bookings', query, { limit: 500, sort: { _id: -1 } });
 
     var enriched = allBookings.map(function(b) {
       var customerName = 'Customer';
@@ -751,7 +863,7 @@ async function getDispatchableBookings(req, res) {
     });
 
     var limited = enriched.slice(0, 300);
-    console.log('📊 Returned ' + limited.length + ' bookings');
+    console.log('📊 Returned ' + limited.length + ' bookings (status filter: ' + (statusFilter || 'default') + ')');
 
     res.json({
       success: true,
@@ -760,12 +872,13 @@ async function getDispatchableBookings(req, res) {
         total: limited.length,
         stats: {
           total: enriched.length,
+          noProvider: enriched.filter(function(b) { return b.status === 'no_provider_found'; }).length,
+          searching: enriched.filter(function(b) { return b.status === 'searching'; }).length,
+          pending: enriched.filter(function(b) { return b.status === 'pending'; }).length,
           active: enriched.filter(function(b) {
-            return ['searching', 'pending', 'confirmed', 'active', 'in_progress', 'accepted'].indexOf(b.status) !== -1;
+            return ['confirmed', 'active', 'in_progress', 'accepted'].indexOf(b.status) !== -1;
           }).length,
-          unassigned: enriched.filter(function(b) { return !b.assignedProviderId; }).length,
-          completed: enriched.filter(function(b) { return b.status === 'completed'; }).length,
-          cancelled: enriched.filter(function(b) { return b.status === 'cancelled'; }).length
+          unassigned: enriched.filter(function(b) { return !b.assignedProviderId; }).length
         }
       }
     });
@@ -776,7 +889,7 @@ async function getDispatchableBookings(req, res) {
 }
 
 // ============================================================
-// SEND MANUAL DISPATCH
+// SEND MANUAL DISPATCH — WITH TOKEN HEALTH WARNINGS
 // ============================================================
 
 async function send(req, res) {
@@ -784,6 +897,7 @@ async function send(req, res) {
     var bookingId = req.body.bookingId;
     var providerId = req.body.providerId;
     var adminNote = req.body.adminNote || '';
+    var forceEvenIfOffline = req.body.forceEvenIfOffline === true;
 
     if (!bookingId || !providerId) {
       return res.status(400).json({ success: false, error: 'bookingId and providerId are required' });
@@ -821,17 +935,41 @@ async function send(req, res) {
     var provider = providerResult.doc;
     console.log('👤 Provider: ' + (provider.name || provider.fullName || 'Unknown') + ' (from ' + providerResult.dbName + ')');
 
+    // CHECK REAL-TIME STATUS
+    var statusInfo = computeRealTimeStatus(provider);
+    console.log('   📡 Real-time status: ' + statusInfo.realTimeStatus +
+                ' (minutes since active: ' + statusInfo.minutesAgo + ')');
+
+    if (!statusInfo.isOnline && !forceEvenIfOffline) {
+      return res.status(400).json({
+        success: false,
+        error: 'Provider is OFFLINE (last active: ' + (statusInfo.minutesAgo || '?') + ' min ago)',
+        requiresForce: true,
+        data: {
+          realTimeStatus: statusInfo.realTimeStatus,
+          minutesSinceActive: statusInfo.minutesAgo,
+          hint: 'Add forceEvenIfOffline: true to dispatch anyway (notification may fail)'
+        }
+      });
+    }
+
     var fcmToken = provider.fcmToken || provider.fcm_token || provider.deviceToken || provider.pushToken ||
                    (provider.deviceInfo && (provider.deviceInfo.fcmToken || provider.deviceInfo.token)) || '';
 
     if (!fcmToken) {
       return res.status(400).json({
         success: false,
-        error: 'Provider ' + (provider.name || providerId) + ' has no FCM token.'
+        error: 'Provider ' + (provider.name || providerId) + ' has no FCM token. Ask them to logout+login in the app.'
       });
     }
-    console.log('📱 FCM Token: ' + fcmToken.substring(0, 20) + '... (length: ' + fcmToken.length + ')');
 
+    var tokenHealth = computeTokenHealth(provider, fcmToken);
+    console.log('   🔑 Token health: ' + tokenHealth.status + ' (length: ' + fcmToken.length + ')');
+    if (tokenHealth.warning) {
+      console.log('   ⚠️ ' + tokenHealth.warning);
+    }
+
+    // Cancel existing offers
     console.log('🔄 Cancelling existing offers for booking ' + bookingId + '...');
     var cancelledOffers = await updateInAllDbs('provideroffers',
       {
@@ -871,11 +1009,11 @@ async function send(req, res) {
           }
         }
       );
-      console.log('   🔄 Booking status reset to searching');
     } catch (e) {
       console.log('   ⚠️ Could not reset booking status: ' + e.message);
     }
 
+    // Load maps
     var maps = await Promise.all([
       loadCategoriesMap(), loadCitiesMap(), loadServicesMap(), loadUsersMap()
     ]);
@@ -1066,6 +1204,7 @@ async function send(req, res) {
 
     var fcmResult = null;
     var fcmError = null;
+    var fcmErrorCode = null;
 
     try {
       var firebase = getProviderFirebaseApp();
@@ -1075,7 +1214,6 @@ async function send(req, res) {
         throw new Error('Firebase messaging invalid');
       }
 
-      console.log('   ✅ messaging.send is a function, sending now...');
       fcmResult = await messaging.send(fcmMessage);
       console.log('✅ FCM SENT! messageId: ' + fcmResult);
 
@@ -1088,12 +1226,27 @@ async function send(req, res) {
 
     } catch (err) {
       fcmError = err.message || String(err);
-      console.error('❌ FCM FAILED: ' + fcmError);
+      fcmErrorCode = err.code || (err.errorInfo && err.errorInfo.code) || 'unknown';
+      console.error('❌ FCM FAILED: ' + fcmError + ' (code: ' + fcmErrorCode + ')');
+
+      // If token is invalid, mark provider's token as stale
+      if (fcmErrorCode === 'messaging/registration-token-not-registered' ||
+          fcmErrorCode === 'messaging/invalid-registration-token' ||
+          fcmError.indexOf('not-registered') !== -1 ||
+          fcmError.indexOf('invalid-registration-token') !== -1) {
+        console.log('   🔴 Marking provider\'s FCM token as INVALID in DB');
+        try {
+          await updateInAllDbs('providers',
+            { _id: providerOid },
+            { $set: { fcmTokenInvalid: true, fcmTokenInvalidAt: new Date(), fcmTokenInvalidReason: fcmError } }
+          );
+        } catch (e) {}
+      }
 
       try {
         await updateInAllDbs('provideroffers',
           { _id: offerId },
-          { $set: { fcmSent: false, fcmError: fcmError, fcmFailedAt: new Date() } }
+          { $set: { fcmSent: false, fcmError: fcmError, fcmErrorCode: fcmErrorCode, fcmFailedAt: new Date() } }
         );
       } catch (e) {}
     }
@@ -1110,14 +1263,27 @@ async function send(req, res) {
           fcmError: fcmError,
           timestamp: now.toISOString()
         });
-        io.to('admins').emit('dispatch:update', {
-          type: 'manual_dispatch',
-          bookingId: String(bookingOid || bookingId),
-          providerId: String(providerOid || providerId),
-          status: fcmResult ? 'sent' : 'fcm_failed'
-        });
       }
     } catch (e) {}
+
+    // Build diagnostic message
+    var diagnosticTips = [];
+    if (fcmResult) {
+      diagnosticTips.push('✅ Firebase accepted the FCM');
+      if (!statusInfo.isOnline) {
+        diagnosticTips.push('⚠️ Provider was OFFLINE at dispatch — notification may not show until they open the app');
+      }
+      if (tokenHealth.status === 'stale') {
+        diagnosticTips.push('⚠️ Token is ' + tokenHealth.ageDays + ' days old — may be stale. If popup doesn\'t show, ask provider to logout+login');
+      }
+      diagnosticTips.push('📱 Phone popup requires: notifications permission granted + battery optimization OFF + app installed + internet on');
+    } else {
+      diagnosticTips.push('❌ FCM delivery failed');
+      diagnosticTips.push('Code: ' + fcmErrorCode);
+      if (fcmErrorCode === 'messaging/registration-token-not-registered') {
+        diagnosticTips.push('🔴 TOKEN IS INVALID — provider MUST logout and login again to refresh FCM token');
+      }
+    }
 
     res.json({
       success: !!fcmResult,
@@ -1134,15 +1300,21 @@ async function send(req, res) {
         fcmSent: !!fcmResult,
         fcmMessageId: fcmResult || null,
         fcmError: fcmError,
+        fcmErrorCode: fcmErrorCode,
         fcmTokenPrefix: fcmToken.substring(0, 20) + '...',
         fcmTokenLength: fcmToken.length,
+        tokenHealth: tokenHealth.status,
+        tokenAgeDays: tokenHealth.ageDays || null,
+        providerRealTimeStatus: statusInfo.realTimeStatus,
+        providerMinutesSinceActive: statusInfo.minutesAgo,
         expiresAt: expiresAt.toISOString(),
         timeout: 30,
         cancelledPreviousOffers: cancelledOffers,
         offerInserted: offerResult.success,
         dispatchInserted: dispatchInserted,
+        diagnosticTips: diagnosticTips,
         message: fcmResult
-          ? '✅ Dispatch sent! Provider will get Accept/Reject popup. Expires in 30s.'
+          ? '✅ Dispatch sent! ' + (statusInfo.isOnline ? 'Provider is online, should see popup immediately.' : 'Provider was offline, popup will show when they open app.')
           : '❌ FCM failed: ' + fcmError
       }
     });
@@ -1156,7 +1328,7 @@ async function send(req, res) {
 }
 
 // ============================================================
-// GET OFFER STATUS — Enhanced with booking status check
+// GET OFFER STATUS
 // ============================================================
 
 async function getOfferStatus(req, res) {
@@ -1187,7 +1359,6 @@ async function getOfferStatus(req, res) {
     var currentStatus = offer.status || 'pending';
     var expired = false;
 
-    // Auto-expire if past expiresAt
     if (offer.expiresAt && new Date(offer.expiresAt) < new Date()) {
       expired = true;
       if (currentStatus === 'pending' || currentStatus === 'sent' || currentStatus === 'waiting') {
@@ -1201,7 +1372,6 @@ async function getOfferStatus(req, res) {
       }
     }
 
-    // Also check booking status — if booking is accepted, mark offer accepted
     if (currentStatus === 'pending' && offer.bookingId) {
       try {
         var bookingQuery = typeof offer.bookingId === 'object'
@@ -1261,7 +1431,7 @@ async function getOfferStatus(req, res) {
 }
 
 // ============================================================
-// TEST FCM — Standalone FCM test for a provider
+// TEST FCM
 // ============================================================
 
 async function testFCM(req, res) {
@@ -1284,6 +1454,9 @@ async function testFCM(req, res) {
     var fcmToken = provider.fcmToken || provider.fcm_token || provider.deviceToken || provider.pushToken ||
                    (provider.deviceInfo && (provider.deviceInfo.fcmToken || provider.deviceInfo.token)) || '';
 
+    var statusInfo = computeRealTimeStatus(provider);
+    var tokenHealth = computeTokenHealth(provider, fcmToken);
+
     if (!fcmToken) {
       return res.json({
         success: false,
@@ -1292,11 +1465,7 @@ async function testFCM(req, res) {
           providerId: String(provider._id),
           providerName: provider.name || provider.fullName || 'Unknown',
           hasToken: false,
-          tokenFields: {
-            fcmToken: !!provider.fcmToken,
-            deviceToken: !!provider.deviceToken,
-            pushToken: !!provider.pushToken
-          }
+          realTimeStatus: statusInfo.realTimeStatus
         }
       });
     }
@@ -1341,10 +1510,10 @@ async function testFCM(req, res) {
     };
 
     console.log('🧪 [TEST FCM] Sending to ' + (provider.name || provider.fullName) + '...');
-    console.log('   Token prefix: ' + fcmToken.substring(0, 20) + '... (length: ' + fcmToken.length + ')');
 
     var fcmResult = null;
     var fcmError = null;
+    var fcmErrorCode = null;
 
     try {
       var firebase = getProviderFirebaseApp();
@@ -1358,10 +1527,8 @@ async function testFCM(req, res) {
       console.log('✅ [TEST FCM] SENT! messageId: ' + fcmResult);
     } catch (err) {
       fcmError = err.message || String(err);
+      fcmErrorCode = err.code || (err.errorInfo && err.errorInfo.code) || 'unknown';
       console.error('❌ [TEST FCM] FAILED: ' + fcmError);
-      if (err.errorInfo) {
-        console.error('   errorInfo:', JSON.stringify(err.errorInfo));
-      }
     }
 
     return res.json({
@@ -1374,28 +1541,27 @@ async function testFCM(req, res) {
         providerName: provider.name || provider.fullName || 'Unknown',
         fcmTokenPrefix: fcmToken.substring(0, 20) + '...',
         fcmTokenLength: fcmToken.length,
-        isOnline: !!(provider.isOnline || provider.online || provider.isAvailable),
+        tokenHealth: tokenHealth.status,
+        tokenAgeDays: tokenHealth.ageDays || null,
+        realTimeStatus: statusInfo.realTimeStatus,
+        minutesSinceActive: statusInfo.minutesAgo,
         lastActive: provider.lastActive || provider.lastSeen || 'unknown',
         fcmResult: fcmResult,
         fcmMessageId: fcmResult,
         fcmError: fcmError,
+        fcmErrorCode: fcmErrorCode,
         sentAt: now.toISOString(),
         tips: fcmResult ? [
           '✅ Firebase accepted the FCM',
-          '📱 If popup not showing on phone, check:',
-          '  1. App is installed on phone',
-          '  2. Notification permission granted',
-          '  3. Battery optimization OFF for app',
-          '  4. FCM token might be STALE — ask provider to logout/login',
-          '  5. Internet is on phone',
-          'FCM token length: ' + fcmToken.length + ' (should be 140+ chars)'
+          statusInfo.isOnline ? '📱 Provider is ONLINE — should see popup within 5 sec' : '⚠️ Provider is OFFLINE — popup will show when they open app',
+          tokenHealth.status === 'stale' ? '⚠️ Token is ' + tokenHealth.ageDays + ' days old — may be stale' : '✅ Token is fresh',
+          'If popup not showing: 1) check notification permission, 2) battery optimization OFF, 3) ask provider to logout+login'
         ] : [
-          '❌ Firebase rejected FCM',
-          'Common causes:',
-          '  1. Invalid/expired token',
-          '  2. Wrong Firebase project',
-          '  3. Service account mismatch',
-          'Error: ' + fcmError
+          '❌ Firebase rejected FCM: ' + fcmError,
+          'Code: ' + fcmErrorCode,
+          fcmErrorCode === 'messaging/registration-token-not-registered'
+            ? '🔴 TOKEN IS INVALID — provider MUST logout and login again'
+            : 'Try testing on another provider'
         ]
       }
     });
@@ -1412,14 +1578,8 @@ async function testFCM(req, res) {
 async function debug(req, res) {
   try {
     var all = getAllConnections();
-
     var connectionsInfo = all.map(function(c) {
-      return {
-        name: c.name,
-        readyState: c.conn.readyState,
-        host: c.conn.host,
-        port: c.conn.port
-      };
+      return { name: c.name, readyState: c.conn.readyState, host: c.conn.host, port: c.conn.port };
     });
 
     var dbTests = {};
@@ -1435,56 +1595,22 @@ async function debug(req, res) {
       }
     }
 
-    var maps = await Promise.all([
-      loadCategoriesMap(), loadCitiesMap(), loadServicesMap(), loadUsersMap()
-    ]);
-
     var firebaseStatus = 'not tested';
     try {
       var fb = getProviderFirebaseApp();
-      firebaseStatus = fb.messaging && typeof fb.messaging.send === 'function'
-        ? 'messaging ready ✅'
-        : 'messaging INVALID ❌';
+      firebaseStatus = fb.messaging && typeof fb.messaging.send === 'function' ? 'messaging ready ✅' : 'messaging INVALID ❌';
     } catch (e) {
       firebaseStatus = 'error: ' + e.message;
     }
-
-    var provResult = await findInAllDbsAggregated('providers', {}, { limit: 2 });
-    var bookResult = await findInAllDbsAggregated('bookings', {}, { limit: 2 });
 
     res.json({
       success: true,
       data: {
         mongooseVersion: mongoose.version,
-        mongooseConnectionsCount: (mongoose.connections || []).length,
         connectedDbsCount: all.length,
         connectionsInfo: connectionsInfo,
-        defaultConnectionReadyState: mongoose.connection.readyState,
         dbTests: dbTests,
-        categoriesLoaded: Object.keys(maps[0]).length,
-        citiesLoaded: Object.keys(maps[1]).length,
-        servicesLoaded: Object.keys(maps[2]).length,
-        usersLoaded: Object.keys(maps[3]).length,
         firebaseStatus: firebaseStatus,
-        sampleProvidersFound: provResult.length,
-        sampleBookingsFound: bookResult.length,
-        sampleProviders: provResult.map(function(p) {
-          return {
-            _id: String(p._id),
-            name: p.name || p.fullName,
-            sourceDb: p._sourceDb,
-            fcmToken: p.fcmToken ? 'YES (' + String(p.fcmToken).substring(0, 20) + '...)' : 'NO',
-            fcmTokenLength: p.fcmToken ? String(p.fcmToken).length : 0,
-            isOnline: !!(p.isOnline || p.online || p.isAvailable)
-          };
-        }),
-        sampleBookings: bookResult.map(function(b) {
-          return {
-            _id: String(b._id),
-            status: b.status,
-            sourceDb: b._sourceDb
-          };
-        }),
         envVars: {
           PROVIDER_FIREBASE_BASE64: process.env.PROVIDER_FIREBASE_SERVICE_ACCOUNT_BASE64 ? 'SET' : 'NOT SET',
           ADMIN_SECRET: process.env.ADMIN_SECRET_KEY ? 'SET' : 'NOT SET',
@@ -1500,19 +1626,11 @@ async function debug(req, res) {
 async function debugConnections(req, res) {
   try {
     var all = getAllConnections();
-    var results = {
-      mongooseConnectionsArrayLength: (mongoose.connections || []).length,
-      connectedDbs: all.length,
-      dbs: {}
-    };
-
+    var results = { connectedDbs: all.length, dbs: {} };
     var collections = ['providers', 'bookings', 'categories', 'cities', 'services', 'users', 'provideroffers', 'dispatchjobs'];
 
     for (var i = 0; i < all.length; i++) {
-      results.dbs[all[i].name] = {
-        readyState: all[i].conn.readyState,
-        host: all[i].conn.host
-      };
+      results.dbs[all[i].name] = { readyState: all[i].conn.readyState, host: all[i].conn.host };
       for (var j = 0; j < collections.length; j++) {
         try {
           var count = await all[i].conn.collection(collections[j]).countDocuments();
