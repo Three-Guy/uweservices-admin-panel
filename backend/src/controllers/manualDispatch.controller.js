@@ -1,6 +1,6 @@
 // backend/src/controllers/manualDispatch.controller.js
-// COMPLETE MANUAL DISPATCH CONTROLLER — FINAL VERSION
-// Fix: Use mongoose.connections[] array (named connections) instead of mongoose.connection (default)
+// COMPLETE MANUAL DISPATCH CONTROLLER — FINAL WORKING VERSION
+// Fixes: Strict online query, offer status polling, FCM test endpoint
 
 const mongoose = require('mongoose');
 const path = require('path');
@@ -30,8 +30,7 @@ function safeStr(val) {
   if (typeof val === 'string') return val;
   if (typeof val === 'object') {
     return val.cityName || val.name || val.fullName || val.title || val.label ||
-           val.categoryName || val.serviceName || val.firstName ||
-           JSON.stringify(val);
+           val.categoryName || val.serviceName || val.firstName || '';
   }
   return String(val);
 }
@@ -59,6 +58,7 @@ function timeAgo(date) {
   if (!date) return '';
   var now = new Date();
   var d = new Date(date);
+  if (isNaN(d.getTime())) return '';
   var diffMs = now - d;
   var diffMins = Math.floor(diffMs / 60000);
   if (diffMins < 1) return 'just now';
@@ -80,7 +80,6 @@ function _getMessagingFromApp(admin, app) {
   try {
     var m1 = admin.messaging(app);
     if (m1 && typeof m1.send === 'function') {
-      console.log('✅ Messaging via admin.messaging(app)');
       return m1;
     }
   } catch (e) {
@@ -103,7 +102,6 @@ function _getMessagingFromApp(admin, app) {
     if (typeof getMessaging2 === 'function') {
       var m3 = getMessaging2();
       if (m3 && typeof m3.send === 'function') {
-        console.log('✅ Messaging via getMessaging() default');
         return m3;
       }
     }
@@ -111,7 +109,6 @@ function _getMessagingFromApp(admin, app) {
   try {
     var m4 = admin.messaging();
     if (m4 && typeof m4.send === 'function') {
-      console.log('✅ Messaging via admin.messaging() default');
       return m4;
     }
   } catch (e) {}
@@ -126,7 +123,6 @@ function getProviderFirebaseApp() {
 
   var admin = require('firebase-admin');
 
-  // Try to find any existing initialized Firebase app for provider project
   var existingApps = admin.apps || [];
   for (var i = 0; i < existingApps.length; i++) {
     var app = existingApps[i];
@@ -140,14 +136,12 @@ function getProviderFirebaseApp() {
         _providerApp = app;
         _providerMessaging = _getMessagingFromApp(admin, app);
         if (_providerMessaging) {
-          console.log('♻️ Reusing existing Firebase app "' + app.name + '" (project: ' + opts.projectId + ')');
           return { app: _providerApp, messaging: _providerMessaging };
         }
       }
     } catch (e) {}
   }
 
-  // Load service account
   var serviceAccount = null;
   var base64 = process.env.PROVIDER_FIREBASE_SERVICE_ACCOUNT_BASE64;
 
@@ -210,9 +204,7 @@ function getProviderFirebaseApp() {
 }
 
 // ============================================================
-// DATABASE — CRITICAL FIX
-// Scan mongoose.connections[] array (named connections)
-// NOT mongoose.connection (default/global) which is empty in this project
+// DATABASE HELPERS
 // ============================================================
 
 function getAllConnections() {
@@ -222,7 +214,6 @@ function getAllConnections() {
     for (var i = 0; i < conns.length; i++) {
       var c = conns[i];
       if (!c) continue;
-      // readyState: 0=disconnected, 1=connected, 2=connecting, 3=disconnecting
       if (c.readyState === 1) {
         var dbName = c.name || (c.db && c.db.databaseName) || 'unknown_' + i;
         result.push({ conn: c, name: dbName });
@@ -236,16 +227,13 @@ function getAllConnections() {
 
 function getConnectionByName(targetName) {
   var all = getAllConnections();
-  // Direct match first
   for (var i = 0; i < all.length; i++) {
     if (all[i].name === targetName) return all[i].conn;
   }
-  // Case-insensitive match
   var lower = targetName.toLowerCase();
   for (var j = 0; j < all.length; j++) {
     if (all[j].name.toLowerCase() === lower) return all[j].conn;
   }
-  // Partial match
   for (var k = 0; k < all.length; k++) {
     if (all[k].name.toLowerCase().indexOf(lower) !== -1 ||
         lower.indexOf(all[k].name.toLowerCase()) !== -1) {
@@ -255,7 +243,6 @@ function getConnectionByName(targetName) {
   return null;
 }
 
-// Scan ALL connected databases for a collection — aggregated
 async function findInAllDbsAggregated(collectionName, query, options) {
   query = query || {};
   options = options || {};
@@ -264,11 +251,11 @@ async function findInAllDbsAggregated(collectionName, query, options) {
 
   var all = getAllConnections();
   if (all.length === 0) {
-    console.log('   ❌ NO connected databases found! mongoose.connections.length=' + (mongoose.connections || []).length);
+    console.log('   ❌ NO connected databases!');
     return [];
   }
 
-  console.log('   🔎 Scanning ' + all.length + ' DBs for "' + collectionName + '": [' + all.map(function(a) { return a.name; }).join(', ') + ']');
+  console.log('   🔎 Scanning ' + all.length + ' DBs for "' + collectionName + '"');
 
   var allDocs = [];
   var seenIds = {};
@@ -291,9 +278,7 @@ async function findInAllDbsAggregated(collectionName, query, options) {
           }
         }
       }
-    } catch (e) {
-      // Collection doesn't exist in this DB — silent skip
-    }
+    } catch (e) {}
   }
   return allDocs;
 }
@@ -317,7 +302,6 @@ async function insertInAnyDb(collectionName, doc, preferredDbNames) {
   preferredDbNames = preferredDbNames || [];
   var all = getAllConnections();
 
-  // Try preferred DBs first
   for (var pi = 0; pi < preferredDbNames.length; pi++) {
     var pref = preferredDbNames[pi];
     var conn = getConnectionByName(pref);
@@ -326,13 +310,10 @@ async function insertInAnyDb(collectionName, doc, preferredDbNames) {
         var collection = conn.collection(collectionName);
         await collection.insertOne(doc);
         return { success: true, dbName: pref };
-      } catch (e) {
-        console.log('   ⚠️ Insert failed in preferred ' + pref + ': ' + e.message);
-      }
+      } catch (e) {}
     }
   }
 
-  // Fallback: try any connected DB
   for (var i = 0; i < all.length; i++) {
     try {
       var col = all[i].conn.collection(collectionName);
@@ -367,11 +348,10 @@ async function loadCategoriesMap() {
     try {
       var docs = await all[i].conn.collection('categories').find({}).toArray();
       if (docs.length > 0) {
-        console.log('   ✓ Found ' + docs.length + ' in ' + all[i].name + '.categories');
         for (var j = 0; j < docs.length; j++) {
           var id = String(docs[j]._id);
           if (!map[id]) {
-            map[id] = safeStr(docs[j].name || docs[j].categoryName || docs[j].title || docs[j]);
+            map[id] = safeStr(docs[j].name || docs[j].categoryName || docs[j].title || '');
           }
         }
       }
@@ -387,11 +367,10 @@ async function loadCitiesMap() {
     try {
       var docs = await all[i].conn.collection('cities').find({}).toArray();
       if (docs.length > 0) {
-        console.log('   ✓ Found ' + docs.length + ' in ' + all[i].name + '.cities');
         for (var j = 0; j < docs.length; j++) {
           var id = String(docs[j]._id);
           if (!map[id]) {
-            map[id] = safeStr(docs[j].cityName || docs[j].name || docs[j].title || docs[j]);
+            map[id] = safeStr(docs[j].cityName || docs[j].name || docs[j].title || '');
           }
         }
       }
@@ -407,12 +386,11 @@ async function loadServicesMap() {
     try {
       var docs = await all[i].conn.collection('services').find({}).toArray();
       if (docs.length > 0) {
-        console.log('   ✓ Found ' + docs.length + ' in ' + all[i].name + '.services');
         for (var j = 0; j < docs.length; j++) {
           var id = String(docs[j]._id);
           if (!map[id]) {
             map[id] = {
-              name: safeStr(docs[j].name || docs[j].serviceName || docs[j].title || docs[j]),
+              name: safeStr(docs[j].name || docs[j].serviceName || docs[j].title || ''),
               icon: safeStr(docs[j].icon || docs[j].image || docs[j].imageUrl || ''),
               category: docs[j].category || docs[j].categoryId || null,
               price: safeNum(docs[j].price || docs[j].basePrice || docs[j].amount || 0)
@@ -432,7 +410,6 @@ async function loadUsersMap() {
     try {
       var docs = await all[i].conn.collection('users').find({}).toArray();
       if (docs.length > 0) {
-        console.log('   ✓ Found ' + docs.length + ' in ' + all[i].name + '.users');
         for (var j = 0; j < docs.length; j++) {
           var id = String(docs[j]._id);
           if (!map[id]) {
@@ -475,8 +452,9 @@ function formatAddress(booking) {
     if (addr.area || addr.locality || addr.sector || addr.neighborhood)
       parts.push(String(addr.area || addr.locality || addr.sector || addr.neighborhood));
     if (addr.landmark) parts.push(String(addr.landmark));
-    if (addr.city || addr.cityName) parts.push(String(addr.city || addr.cityName));
-    if (addr.state) parts.push(String(addr.state));
+    if (addr.city && typeof addr.city === 'string') parts.push(String(addr.city));
+    else if (addr.cityName) parts.push(String(addr.cityName));
+    if (addr.state && typeof addr.state === 'string') parts.push(String(addr.state));
     if (addr.pincode || addr.zipCode || addr.postalCode || addr.pin)
       parts.push(String(addr.pincode || addr.zipCode || addr.postalCode || addr.pin));
 
@@ -493,7 +471,7 @@ function formatAddress(booking) {
 }
 
 // ============================================================
-// GET ONLINE PROVIDERS
+// GET ONLINE PROVIDERS — STRICT ONLINE QUERY
 // ============================================================
 
 async function getOnlineProviders(req, res) {
@@ -502,6 +480,7 @@ async function getOnlineProviders(req, res) {
     var searchTerm = req.query.search || '';
     var categoryFilter = req.query.category || '';
 
+    // STRICT online query — NO isApproved! Only real online indicators
     var query = {};
     if (!includeAll) {
       query = {
@@ -510,8 +489,7 @@ async function getOnlineProviders(req, res) {
           { online: true },
           { isAvailable: true },
           { status: 'online' },
-          { status: 'active' },
-          { isApproved: true }
+          { availability: 'online' }
         ]
       };
     }
@@ -524,8 +502,9 @@ async function getOnlineProviders(req, res) {
 
     var providers = await findInAllDbsAggregated('providers', query, { limit: 500, sort: { _id: -1 } });
 
+    // Fallback: if no "online" providers found, fetch ALL and let frontend decide
     if (providers.length === 0 && !includeAll) {
-      console.log('⚠️ No providers with filter — retrying with empty query');
+      console.log('⚠️ No online providers — fetching all');
       providers = await findInAllDbsAggregated('providers', {}, { limit: 500, sort: { _id: -1 } });
     }
 
@@ -558,8 +537,11 @@ async function getOnlineProviders(req, res) {
 
       var fcmToken = p.fcmToken || p.fcm_token || p.deviceToken || p.pushToken ||
                      (p.deviceInfo && (p.deviceInfo.fcmToken || p.deviceInfo.token)) || '';
-      var isOnline = p.isOnline || p.online || p.isAvailable ||
-                     p.status === 'online' || p.status === 'active' || false;
+
+      // STRICT ONLINE: only true if ACTUALLY online, NOT just approved
+      var isOnline = !!(p.isOnline === true || p.online === true || p.isAvailable === true ||
+                       p.status === 'online' || p.availability === 'online');
+
       var name = safeStr(p.name || p.fullName || p.firstName || p.businessName || 'Provider');
       var phone = safeStr(p.phone || p.phoneNumber || p.mobile || '');
       var email = safeStr(p.email || '');
@@ -570,12 +552,14 @@ async function getOnlineProviders(req, res) {
         phone: phone,
         email: email,
         category: categoryName,
+        categoryName: categoryName,
         categoryId: String(catField && typeof catField === 'object' ? (catField._id || catField) : (catField || '')),
         city: cityName,
+        cityName: cityName,
         cityId: String(cityField && typeof cityField === 'object' ? (cityField._id || cityField) : (cityField || '')),
         isOnline: isOnline,
-        isApproved: p.isApproved || p.approved || false,
-        isVerified: p.isVerified || p.verified || false,
+        isApproved: !!(p.isApproved || p.approved),
+        isVerified: !!(p.isVerified || p.verified),
         hasFCM: !!fcmToken,
         fcmToken: fcmToken,
         rating: safeNum(p.rating || p.averageRating || p.avgRating || 0),
@@ -612,7 +596,7 @@ async function getOnlineProviders(req, res) {
       return new Date(b.createdAt || 0) - new Date(a.createdAt || 0);
     });
 
-    console.log('📊 Returned ' + filtered.length + ' providers (enriched, recent-first)');
+    console.log('📊 Returned ' + filtered.length + ' providers (online=' + filtered.filter(function(p){return p.isOnline;}).length + ')');
 
     res.json({
       success: true,
@@ -623,6 +607,7 @@ async function getOnlineProviders(req, res) {
         stats: {
           total: enriched.length,
           online: enriched.filter(function(p) { return p.isOnline; }).length,
+          offline: enriched.filter(function(p) { return !p.isOnline; }).length,
           withFCM: enriched.filter(function(p) { return p.hasFCM; }).length,
           approved: enriched.filter(function(p) { return p.isApproved; }).length
         }
@@ -766,7 +751,7 @@ async function getDispatchableBookings(req, res) {
     });
 
     var limited = enriched.slice(0, 300);
-    console.log('📊 Returned ' + limited.length + ' bookings (enriched, recent-first)');
+    console.log('📊 Returned ' + limited.length + ' bookings');
 
     res.json({
       success: true,
@@ -816,7 +801,7 @@ async function send(req, res) {
       bookingResult = await findOneInAllDbs('bookings', { bookingId: bookingId });
     }
     if (!bookingResult || !bookingResult.doc) {
-      return res.status(404).json({ success: false, error: 'Booking ' + bookingId + ' not found in any database' });
+      return res.status(404).json({ success: false, error: 'Booking ' + bookingId + ' not found' });
     }
 
     var booking = bookingResult.doc;
@@ -845,7 +830,7 @@ async function send(req, res) {
         error: 'Provider ' + (provider.name || providerId) + ' has no FCM token.'
       });
     }
-    console.log('📱 FCM Token: ' + fcmToken.substring(0, 20) + '...');
+    console.log('📱 FCM Token: ' + fcmToken.substring(0, 20) + '... (length: ' + fcmToken.length + ')');
 
     console.log('🔄 Cancelling existing offers for booking ' + bookingId + '...');
     var cancelledOffers = await updateInAllDbs('provideroffers',
@@ -973,8 +958,6 @@ async function send(req, res) {
     var offerResult = await insertInAnyDb('provideroffers', offerDoc, ['bookings_db', 'admin_panel']);
     if (offerResult.success) {
       console.log('   ✅ ProviderOffer created in ' + offerResult.dbName + ': ' + offerId);
-    } else {
-      console.log('   ⚠️ ProviderOffer insert failed in all DBs');
     }
 
     var dispatchJobId = new mongoose.Types.ObjectId();
@@ -1151,6 +1134,8 @@ async function send(req, res) {
         fcmSent: !!fcmResult,
         fcmMessageId: fcmResult || null,
         fcmError: fcmError,
+        fcmTokenPrefix: fcmToken.substring(0, 20) + '...',
+        fcmTokenLength: fcmToken.length,
         expiresAt: expiresAt.toISOString(),
         timeout: 30,
         cancelledPreviousOffers: cancelledOffers,
@@ -1171,7 +1156,7 @@ async function send(req, res) {
 }
 
 // ============================================================
-// GET OFFER STATUS
+// GET OFFER STATUS — Enhanced with booking status check
 // ============================================================
 
 async function getOfferStatus(req, res) {
@@ -1191,22 +1176,57 @@ async function getOfferStatus(req, res) {
       result = await findOneInAllDbs('provideroffers', { offerId: offerId });
     }
     if (!result || !result.doc) {
-      return res.status(404).json({ success: false, error: 'Offer ' + offerId + ' not found' });
+      return res.status(404).json({
+        success: false,
+        error: 'Offer ' + offerId + ' not found',
+        data: { status: 'not_found' }
+      });
     }
 
     var offer = result.doc;
+    var currentStatus = offer.status || 'pending';
     var expired = false;
+
+    // Auto-expire if past expiresAt
     if (offer.expiresAt && new Date(offer.expiresAt) < new Date()) {
       expired = true;
-      if (offer.status === 'pending' || offer.status === 'sent' || offer.status === 'waiting') {
+      if (currentStatus === 'pending' || currentStatus === 'sent' || currentStatus === 'waiting') {
         try {
           await result.collection.updateOne(
             { _id: offer._id },
             { $set: { status: 'expired', expiredAt: new Date() } }
           );
-          offer.status = 'expired';
+          currentStatus = 'expired';
         } catch (e) {}
       }
+    }
+
+    // Also check booking status — if booking is accepted, mark offer accepted
+    if (currentStatus === 'pending' && offer.bookingId) {
+      try {
+        var bookingQuery = typeof offer.bookingId === 'object'
+          ? { _id: offer.bookingId }
+          : { $or: [{ _id: toObjectId(offer.bookingId) }, { bookingId: String(offer.bookingId) }] };
+        var bookingRes = await findOneInAllDbs('bookings', bookingQuery);
+        if (bookingRes && bookingRes.doc) {
+          var bStatus = (bookingRes.doc.status || '').toLowerCase();
+          var bProviderId = String(bookingRes.doc.providerId || bookingRes.doc.provider || '');
+          var expectedProviderId = String(offer.providerId || '');
+
+          if ((bStatus === 'accepted' || bStatus === 'confirmed' || bStatus === 'in_progress' || bStatus === 'ongoing') &&
+              bProviderId && expectedProviderId && bProviderId === expectedProviderId) {
+            currentStatus = 'accepted';
+            try {
+              await result.collection.updateOne(
+                { _id: offer._id },
+                { $set: { status: 'accepted', acceptedAt: new Date(), respondedAt: new Date() } }
+              );
+            } catch (e) {}
+          } else if (bStatus === 'cancelled' || bStatus === 'rejected') {
+            currentStatus = 'rejected';
+          }
+        }
+      } catch (e) {}
     }
 
     res.json({
@@ -1215,25 +1235,178 @@ async function getOfferStatus(req, res) {
         offerId: String(offer._id),
         bookingId: String(offer.bookingId || ''),
         providerId: String(offer.providerId || ''),
-        status: offer.status,
+        status: currentStatus,
         expired: expired,
         fcmSent: offer.fcmSent || false,
         fcmError: offer.fcmError || null,
+        fcmMessageId: offer.fcmMessageId || null,
         createdAt: offer.createdAt,
         expiresAt: offer.expiresAt,
         respondedAt: offer.respondedAt || offer.acceptedAt || offer.rejectedAt || null,
         timeAgo: timeAgo(offer.createdAt),
-        dbSource: result.dbName
+        dbSource: result.dbName,
+        offer: {
+          _id: String(offer._id),
+          offerId: String(offer._id),
+          status: currentStatus,
+          bookingId: String(offer.bookingId || ''),
+          providerId: String(offer.providerId || '')
+        }
       }
     });
   } catch (error) {
     console.error('❌ getOfferStatus error:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: error.message, data: { status: 'error' } });
   }
 }
 
 // ============================================================
-// DEBUG — CRITICAL for diagnosing
+// TEST FCM — Standalone FCM test for a provider
+// ============================================================
+
+async function testFCM(req, res) {
+  try {
+    var providerId = req.params.providerId || req.query.providerId || (req.body && req.body.providerId);
+    if (!providerId) {
+      return res.status(400).json({ success: false, error: 'providerId required' });
+    }
+
+    var oid = toObjectId(providerId);
+    var providerResult = null;
+    if (oid) {
+      providerResult = await findOneInAllDbs('providers', { _id: oid });
+    }
+    if (!providerResult || !providerResult.doc) {
+      return res.status(404).json({ success: false, error: 'Provider not found' });
+    }
+
+    var provider = providerResult.doc;
+    var fcmToken = provider.fcmToken || provider.fcm_token || provider.deviceToken || provider.pushToken ||
+                   (provider.deviceInfo && (provider.deviceInfo.fcmToken || provider.deviceInfo.token)) || '';
+
+    if (!fcmToken) {
+      return res.json({
+        success: false,
+        error: 'Provider has NO FCM token',
+        data: {
+          providerId: String(provider._id),
+          providerName: provider.name || provider.fullName || 'Unknown',
+          hasToken: false,
+          tokenFields: {
+            fcmToken: !!provider.fcmToken,
+            deviceToken: !!provider.deviceToken,
+            pushToken: !!provider.pushToken
+          }
+        }
+      });
+    }
+
+    var now = new Date();
+    var testMessage = {
+      token: fcmToken,
+      notification: {
+        title: '🧪 TEST NOTIFICATION',
+        body: 'FCM test working! Time: ' + now.toLocaleTimeString()
+      },
+      data: stringifyAll({
+        type: 'test',
+        timestamp: Date.now(),
+        source: 'admin_test',
+        channelId: 'bookings_alarm',
+        _isBookingAlarm: 'true'
+      }),
+      android: {
+        priority: 'high',
+        notification: {
+          channelId: 'bookings_alarm',
+          sound: 'booking_alarm',
+          priority: 'max',
+          visibility: 'public',
+          notificationPriority: 'PRIORITY_MAX',
+          color: '#EF4444',
+          title: '🧪 TEST FCM',
+          body: 'If you see this, FCM works! ' + now.toLocaleTimeString()
+        }
+      },
+      apns: {
+        headers: { 'apns-priority': '10' },
+        payload: {
+          aps: {
+            sound: 'booking_alarm.caf',
+            'interruption-level': 'time-sensitive',
+            alert: { title: '🧪 TEST', body: 'FCM Test - ' + now.toLocaleTimeString() }
+          }
+        }
+      }
+    };
+
+    console.log('🧪 [TEST FCM] Sending to ' + (provider.name || provider.fullName) + '...');
+    console.log('   Token prefix: ' + fcmToken.substring(0, 20) + '... (length: ' + fcmToken.length + ')');
+
+    var fcmResult = null;
+    var fcmError = null;
+
+    try {
+      var firebase = getProviderFirebaseApp();
+      var messaging = firebase.messaging;
+
+      if (!messaging || typeof messaging.send !== 'function') {
+        throw new Error('Firebase messaging invalid');
+      }
+
+      fcmResult = await messaging.send(testMessage);
+      console.log('✅ [TEST FCM] SENT! messageId: ' + fcmResult);
+    } catch (err) {
+      fcmError = err.message || String(err);
+      console.error('❌ [TEST FCM] FAILED: ' + fcmError);
+      if (err.errorInfo) {
+        console.error('   errorInfo:', JSON.stringify(err.errorInfo));
+      }
+    }
+
+    return res.json({
+      success: !!fcmResult,
+      message: fcmResult
+        ? '✅ Test FCM sent! Check provider phone within 5 seconds.'
+        : '❌ Test FCM failed: ' + fcmError,
+      data: {
+        providerId: String(provider._id),
+        providerName: provider.name || provider.fullName || 'Unknown',
+        fcmTokenPrefix: fcmToken.substring(0, 20) + '...',
+        fcmTokenLength: fcmToken.length,
+        isOnline: !!(provider.isOnline || provider.online || provider.isAvailable),
+        lastActive: provider.lastActive || provider.lastSeen || 'unknown',
+        fcmResult: fcmResult,
+        fcmMessageId: fcmResult,
+        fcmError: fcmError,
+        sentAt: now.toISOString(),
+        tips: fcmResult ? [
+          '✅ Firebase accepted the FCM',
+          '📱 If popup not showing on phone, check:',
+          '  1. App is installed on phone',
+          '  2. Notification permission granted',
+          '  3. Battery optimization OFF for app',
+          '  4. FCM token might be STALE — ask provider to logout/login',
+          '  5. Internet is on phone',
+          'FCM token length: ' + fcmToken.length + ' (should be 140+ chars)'
+        ] : [
+          '❌ Firebase rejected FCM',
+          'Common causes:',
+          '  1. Invalid/expired token',
+          '  2. Wrong Firebase project',
+          '  3. Service account mismatch',
+          'Error: ' + fcmError
+        ]
+      }
+    });
+  } catch (error) {
+    console.error('❌ testFCM error:', error);
+    res.status(500).json({ success: false, error: error.message, stack: error.stack });
+  }
+}
+
+// ============================================================
+// DEBUG ENDPOINTS
 // ============================================================
 
 async function debug(req, res) {
@@ -1300,7 +1473,9 @@ async function debug(req, res) {
             _id: String(p._id),
             name: p.name || p.fullName,
             sourceDb: p._sourceDb,
-            fcmToken: p.fcmToken ? 'YES' : 'NO'
+            fcmToken: p.fcmToken ? 'YES (' + String(p.fcmToken).substring(0, 20) + '...)' : 'NO',
+            fcmTokenLength: p.fcmToken ? String(p.fcmToken).length : 0,
+            isOnline: !!(p.isOnline || p.online || p.isAvailable)
           };
         }),
         sampleBookings: bookResult.map(function(b) {
@@ -1369,6 +1544,7 @@ module.exports = {
   sendManualDispatch: send,
   dispatch: send,
   getOfferStatus: getOfferStatus,
+  testFCM: testFCM,
   debug: debug,
   debugConnections: debugConnections,
   _health: _health
