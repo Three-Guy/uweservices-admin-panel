@@ -1,6 +1,6 @@
 // backend/src/controllers/manualDispatch.controller.js
-// COMPLETE MANUAL DISPATCH CONTROLLER
-// Fixes: Multi-DB connection + Firebase messaging v12 + enrichment
+// COMPLETE MANUAL DISPATCH CONTROLLER — FINAL VERSION
+// Fix: Use mongoose.connections[] array (named connections) instead of mongoose.connection (default)
 
 const mongoose = require('mongoose');
 const path = require('path');
@@ -77,7 +77,6 @@ let _providerApp = null;
 let _providerMessaging = null;
 
 function _getMessagingFromApp(admin, app) {
-  // Method 1: admin.messaging(app) — v11 + v12
   try {
     var m1 = admin.messaging(app);
     if (m1 && typeof m1.send === 'function') {
@@ -87,8 +86,6 @@ function _getMessagingFromApp(admin, app) {
   } catch (e) {
     console.log('⚠️ admin.messaging(app) failed: ' + e.message);
   }
-
-  // Method 2: getMessaging(app) — v12 modular
   try {
     var getMessaging = require('firebase-admin/messaging').getMessaging;
     if (typeof getMessaging === 'function') {
@@ -101,8 +98,6 @@ function _getMessagingFromApp(admin, app) {
   } catch (e) {
     console.log('⚠️ getMessaging(app) failed: ' + e.message);
   }
-
-  // Method 3: getMessaging() default
   try {
     var getMessaging2 = require('firebase-admin/messaging').getMessaging;
     if (typeof getMessaging2 === 'function') {
@@ -113,8 +108,6 @@ function _getMessagingFromApp(admin, app) {
       }
     }
   } catch (e) {}
-
-  // Method 4: admin.messaging() default
   try {
     var m4 = admin.messaging();
     if (m4 && typeof m4.send === 'function') {
@@ -122,7 +115,6 @@ function _getMessagingFromApp(admin, app) {
       return m4;
     }
   } catch (e) {}
-
   console.error('❌ ALL messaging methods failed!');
   return null;
 }
@@ -134,19 +126,25 @@ function getProviderFirebaseApp() {
 
   var admin = require('firebase-admin');
 
-  // Reuse existing named app
+  // Try to find any existing initialized Firebase app for provider project
   var existingApps = admin.apps || [];
-  var found = existingApps.find(function(a) {
-    return a && a.name === 'manualDispatchProvider';
-  });
-
-  if (found) {
-    _providerApp = found;
-    _providerMessaging = _getMessagingFromApp(admin, found);
-    if (_providerMessaging) {
-      console.log('♻️ Reusing existing Firebase app + messaging');
-      return { app: _providerApp, messaging: _providerMessaging };
-    }
+  for (var i = 0; i < existingApps.length; i++) {
+    var app = existingApps[i];
+    if (!app) continue;
+    try {
+      var opts = app.options || {};
+      if (opts.projectId === 'serviceproviderapp-b7767' ||
+          app.name === 'manualDispatchProvider' ||
+          app.name === 'provider' ||
+          app.name === 'providerApp') {
+        _providerApp = app;
+        _providerMessaging = _getMessagingFromApp(admin, app);
+        if (_providerMessaging) {
+          console.log('♻️ Reusing existing Firebase app "' + app.name + '" (project: ' + opts.projectId + ')');
+          return { app: _providerApp, messaging: _providerMessaging };
+        }
+      }
+    } catch (e) {}
   }
 
   // Load service account
@@ -170,10 +168,10 @@ function getProviderFirebaseApp() {
       process.env.PROVIDER_FIREBASE_SERVICE_ACCOUNT_PATH
     ].filter(Boolean);
 
-    for (var i = 0; i < filePaths.length; i++) {
+    for (var fi = 0; fi < filePaths.length; fi++) {
       try {
-        serviceAccount = require(filePaths[i]);
-        console.log('🔑 Provider service account loaded from file: ' + filePaths[i]);
+        serviceAccount = require(filePaths[fi]);
+        console.log('🔑 Service account loaded from file: ' + filePaths[fi]);
         break;
       } catch (e) {}
     }
@@ -183,16 +181,13 @@ function getProviderFirebaseApp() {
     throw new Error('No provider Firebase service account found.');
   }
 
-  // Credential
   var credential = null;
   try {
     credential = admin.credential.cert(serviceAccount);
-    console.log('✅ Credential created via admin.credential.cert()');
   } catch (e1) {
     try {
       var certFn = require('firebase-admin/app').cert;
       credential = certFn(serviceAccount);
-      console.log('✅ Credential created via modular cert()');
     } catch (e2) {
       throw new Error('Cannot create Firebase credential: ' + e1.message + ' / ' + e2.message);
     }
@@ -204,7 +199,6 @@ function getProviderFirebaseApp() {
   }, 'manualDispatchProvider');
 
   console.log('✅ Provider Firebase app initialized (manualDispatchProvider)');
-
   _providerMessaging = _getMessagingFromApp(admin, _providerApp);
 
   if (!_providerMessaging) {
@@ -216,118 +210,89 @@ function getProviderFirebaseApp() {
 }
 
 // ============================================================
-// DATABASE — MULTI-DB CONNECTION (CRITICAL FIX)
+// DATABASE — CRITICAL FIX
+// Scan mongoose.connections[] array (named connections)
+// NOT mongoose.connection (default/global) which is empty in this project
 // ============================================================
-// Scan ALL registered connections AND try multiple DB name variants
 
-var _dbCache = {};
-
-function getConnection(dbName) {
-  // Return cached
-  if (_dbCache[dbName]) {
-    try {
-      if (_dbCache[dbName].readyState === 1) {
-        return _dbCache[dbName];
+function getAllConnections() {
+  var result = [];
+  try {
+    var conns = mongoose.connections || [];
+    for (var i = 0; i < conns.length; i++) {
+      var c = conns[i];
+      if (!c) continue;
+      // readyState: 0=disconnected, 1=connected, 2=connecting, 3=disconnecting
+      if (c.readyState === 1) {
+        var dbName = c.name || (c.db && c.db.databaseName) || 'unknown_' + i;
+        result.push({ conn: c, name: dbName });
       }
-    } catch (e) {}
-  }
-
-  var conn = mongoose.connection;
-  if (!conn || conn.readyState !== 1) {
-    throw new Error('Mongoose not connected (readyState=' + (conn && conn.readyState) + ')');
-  }
-
-  // admin_panel = main connection
-  if (dbName === 'admin_panel') {
-    _dbCache[dbName] = conn;
-    return conn;
-  }
-
-  // Try name variants
-  var variants = {
-    'provider_db': ['provider_db', 'providerDB', 'providers', 'service_provider', 'providerdb', 'provider'],
-    'user_db': ['user_db', 'userDB', 'users', 'user_database', 'userdb', 'user'],
-    'bookings_db': ['bookings_db', 'bookingsDB', 'bookings', 'booking_db', 'bookingdb', 'booking']
-  };
-
-  var tryNames = variants[dbName] || [dbName];
-
-  for (var i = 0; i < tryNames.length; i++) {
-    try {
-      var db = conn.useDb(tryNames[i], { useCache: true });
-      if (db) {
-        _dbCache[dbName] = db;
-        return db;
-      }
-    } catch (e) {
-      continue;
     }
+  } catch (e) {
+    console.error('❌ getAllConnections error: ' + e.message);
   }
-
-  // Last resort — just use dbName directly
-  var fallback = conn.useDb(dbName, { useCache: true });
-  _dbCache[dbName] = fallback;
-  return fallback;
+  return result;
 }
 
-// Scan ALL mongoose connections for a collection
-async function findInAllDbs(collectionName, query, options) {
-  query = query || {};
-  options = options || {};
-  var dbs = ['admin_panel', 'provider_db', 'user_db', 'bookings_db'];
-  var limit = options.limit || 1000;
-  var sort = options.sort || { _id: -1 };
-
-  for (var i = 0; i < dbs.length; i++) {
-    try {
-      var conn = getConnection(dbs[i]);
-      if (!conn) continue;
-      var collection = conn.collection(collectionName);
-      var count = await collection.countDocuments(query);
-      if (count > 0) {
-        var docs = await collection.find(query).sort(sort).limit(limit).toArray();
-        console.log('   ✓ Found ' + docs.length + ' in ' + dbs[i] + '.' + collectionName);
-        return { docs: docs, dbName: dbs[i], collection: collection };
-      }
-    } catch (e) {
-      console.log('   ⚠️ DB ' + dbs[i] + '.' + collectionName + ' error: ' + e.message);
-      continue;
+function getConnectionByName(targetName) {
+  var all = getAllConnections();
+  // Direct match first
+  for (var i = 0; i < all.length; i++) {
+    if (all[i].name === targetName) return all[i].conn;
+  }
+  // Case-insensitive match
+  var lower = targetName.toLowerCase();
+  for (var j = 0; j < all.length; j++) {
+    if (all[j].name.toLowerCase() === lower) return all[j].conn;
+  }
+  // Partial match
+  for (var k = 0; k < all.length; k++) {
+    if (all[k].name.toLowerCase().indexOf(lower) !== -1 ||
+        lower.indexOf(all[k].name.toLowerCase()) !== -1) {
+      return all[k].conn;
     }
   }
-  return { docs: [], dbName: null, collection: null };
+  return null;
 }
 
-// Scan ALL and collect from EVERY db (not just first match)
+// Scan ALL connected databases for a collection — aggregated
 async function findInAllDbsAggregated(collectionName, query, options) {
   query = query || {};
   options = options || {};
-  var dbs = ['admin_panel', 'provider_db', 'user_db', 'bookings_db'];
   var limit = options.limit || 1000;
   var sort = options.sort || { _id: -1 };
+
+  var all = getAllConnections();
+  if (all.length === 0) {
+    console.log('   ❌ NO connected databases found! mongoose.connections.length=' + (mongoose.connections || []).length);
+    return [];
+  }
+
+  console.log('   🔎 Scanning ' + all.length + ' DBs for "' + collectionName + '": [' + all.map(function(a) { return a.name; }).join(', ') + ']');
+
   var allDocs = [];
   var seenIds = {};
 
-  for (var i = 0; i < dbs.length; i++) {
+  for (var i = 0; i < all.length; i++) {
+    var dbName = all[i].name;
+    var conn = all[i].conn;
     try {
-      var conn = getConnection(dbs[i]);
-      if (!conn) continue;
       var collection = conn.collection(collectionName);
       var count = await collection.countDocuments(query);
       if (count > 0) {
         var docs = await collection.find(query).sort(sort).limit(limit).toArray();
-        console.log('   ✓ Found ' + docs.length + ' in ' + dbs[i] + '.' + collectionName);
+        console.log('   ✓ Found ' + docs.length + ' in ' + dbName + '.' + collectionName);
         for (var j = 0; j < docs.length; j++) {
           var idStr = String(docs[j]._id);
           if (!seenIds[idStr]) {
             seenIds[idStr] = true;
-            docs[j]._sourceDb = dbs[i];
+            docs[j]._sourceDb = dbName;
             allDocs.push(docs[j]);
           }
         }
       }
     } catch (e) {
-      console.log('   ⚠️ Aggregated scan error ' + dbs[i] + '.' + collectionName + ': ' + e.message);
-      continue;
+      // Collection doesn't exist in this DB — silent skip
     }
   }
   return allDocs;
@@ -335,38 +300,55 @@ async function findInAllDbsAggregated(collectionName, query, options) {
 
 async function findOneInAllDbs(collectionName, query) {
   query = query || {};
-  var dbs = ['admin_panel', 'provider_db', 'user_db', 'bookings_db'];
-
-  for (var i = 0; i < dbs.length; i++) {
+  var all = getAllConnections();
+  for (var i = 0; i < all.length; i++) {
     try {
-      var conn = getConnection(dbs[i]);
-      if (!conn) continue;
-      var collection = conn.collection(collectionName);
+      var collection = all[i].conn.collection(collectionName);
       var doc = await collection.findOne(query);
       if (doc) {
-        return { doc: doc, dbName: dbs[i], collection: collection };
+        return { doc: doc, dbName: all[i].name, collection: collection };
       }
-    } catch (e) {
-      continue;
-    }
+    } catch (e) {}
   }
   return { doc: null, dbName: null, collection: null };
 }
 
-async function insertInDb(dbName, collectionName, doc) {
-  var conn = getConnection(dbName);
-  var collection = conn.collection(collectionName);
-  return await collection.insertOne(doc);
+async function insertInAnyDb(collectionName, doc, preferredDbNames) {
+  preferredDbNames = preferredDbNames || [];
+  var all = getAllConnections();
+
+  // Try preferred DBs first
+  for (var pi = 0; pi < preferredDbNames.length; pi++) {
+    var pref = preferredDbNames[pi];
+    var conn = getConnectionByName(pref);
+    if (conn) {
+      try {
+        var collection = conn.collection(collectionName);
+        await collection.insertOne(doc);
+        return { success: true, dbName: pref };
+      } catch (e) {
+        console.log('   ⚠️ Insert failed in preferred ' + pref + ': ' + e.message);
+      }
+    }
+  }
+
+  // Fallback: try any connected DB
+  for (var i = 0; i < all.length; i++) {
+    try {
+      var col = all[i].conn.collection(collectionName);
+      await col.insertOne(doc);
+      return { success: true, dbName: all[i].name };
+    } catch (e) {}
+  }
+  return { success: false, dbName: null };
 }
 
 async function updateInAllDbs(collectionName, query, update) {
-  var dbs = ['admin_panel', 'provider_db', 'user_db', 'bookings_db'];
+  var all = getAllConnections();
   var total = 0;
-  for (var i = 0; i < dbs.length; i++) {
+  for (var i = 0; i < all.length; i++) {
     try {
-      var conn = getConnection(dbs[i]);
-      if (!conn) continue;
-      var collection = conn.collection(collectionName);
+      var collection = all[i].conn.collection(collectionName);
       var result = await collection.updateMany(query, update);
       total += result.modifiedCount || 0;
     } catch (e) {}
@@ -380,14 +362,12 @@ async function updateInAllDbs(collectionName, query, update) {
 
 async function loadCategoriesMap() {
   var map = {};
-  var dbs = ['admin_panel', 'user_db', 'provider_db', 'bookings_db'];
-  for (var i = 0; i < dbs.length; i++) {
+  var all = getAllConnections();
+  for (var i = 0; i < all.length; i++) {
     try {
-      var conn = getConnection(dbs[i]);
-      if (!conn) continue;
-      var docs = await conn.collection('categories').find({}).toArray();
+      var docs = await all[i].conn.collection('categories').find({}).toArray();
       if (docs.length > 0) {
-        console.log('   ✓ Found ' + docs.length + ' in ' + dbs[i] + '.categories');
+        console.log('   ✓ Found ' + docs.length + ' in ' + all[i].name + '.categories');
         for (var j = 0; j < docs.length; j++) {
           var id = String(docs[j]._id);
           if (!map[id]) {
@@ -402,14 +382,12 @@ async function loadCategoriesMap() {
 
 async function loadCitiesMap() {
   var map = {};
-  var dbs = ['admin_panel', 'provider_db', 'user_db', 'bookings_db'];
-  for (var i = 0; i < dbs.length; i++) {
+  var all = getAllConnections();
+  for (var i = 0; i < all.length; i++) {
     try {
-      var conn = getConnection(dbs[i]);
-      if (!conn) continue;
-      var docs = await conn.collection('cities').find({}).toArray();
+      var docs = await all[i].conn.collection('cities').find({}).toArray();
       if (docs.length > 0) {
-        console.log('   ✓ Found ' + docs.length + ' in ' + dbs[i] + '.cities');
+        console.log('   ✓ Found ' + docs.length + ' in ' + all[i].name + '.cities');
         for (var j = 0; j < docs.length; j++) {
           var id = String(docs[j]._id);
           if (!map[id]) {
@@ -424,14 +402,12 @@ async function loadCitiesMap() {
 
 async function loadServicesMap() {
   var map = {};
-  var dbs = ['admin_panel', 'user_db', 'provider_db', 'bookings_db'];
-  for (var i = 0; i < dbs.length; i++) {
+  var all = getAllConnections();
+  for (var i = 0; i < all.length; i++) {
     try {
-      var conn = getConnection(dbs[i]);
-      if (!conn) continue;
-      var docs = await conn.collection('services').find({}).toArray();
+      var docs = await all[i].conn.collection('services').find({}).toArray();
       if (docs.length > 0) {
-        console.log('   ✓ Found ' + docs.length + ' in ' + dbs[i] + '.services');
+        console.log('   ✓ Found ' + docs.length + ' in ' + all[i].name + '.services');
         for (var j = 0; j < docs.length; j++) {
           var id = String(docs[j]._id);
           if (!map[id]) {
@@ -451,14 +427,12 @@ async function loadServicesMap() {
 
 async function loadUsersMap() {
   var map = {};
-  var dbs = ['user_db', 'admin_panel', 'provider_db', 'bookings_db'];
-  for (var i = 0; i < dbs.length; i++) {
+  var all = getAllConnections();
+  for (var i = 0; i < all.length; i++) {
     try {
-      var conn = getConnection(dbs[i]);
-      if (!conn) continue;
-      var docs = await conn.collection('users').find({}).toArray();
+      var docs = await all[i].conn.collection('users').find({}).toArray();
       if (docs.length > 0) {
-        console.log('   ✓ Found ' + docs.length + ' in ' + dbs[i] + '.users');
+        console.log('   ✓ Found ' + docs.length + ' in ' + all[i].name + '.users');
         for (var j = 0; j < docs.length; j++) {
           var id = String(docs[j]._id);
           if (!map[id]) {
@@ -548,10 +522,8 @@ async function getOnlineProviders(req, res) {
     var categoriesMap = maps[0];
     var citiesMap = maps[1];
 
-    // FIRST: try with filter query
     var providers = await findInAllDbsAggregated('providers', query, { limit: 500, sort: { _id: -1 } });
 
-    // FALLBACK: if 0 found with filter AND not includeAll, retry with empty query to get ANY providers
     if (providers.length === 0 && !includeAll) {
       console.log('⚠️ No providers with filter — retrying with empty query');
       providers = await findInAllDbsAggregated('providers', {}, { limit: 500, sort: { _id: -1 } });
@@ -676,7 +648,6 @@ async function getDispatchableBookings(req, res) {
     var servicesMap = maps[2];
     var usersMap = maps[3];
 
-    // Get bookings from ALL databases (aggregated)
     var allBookings = await findInAllDbsAggregated('bookings', {}, { limit: 500, sort: { _id: -1 } });
 
     var enriched = allBookings.map(function(b) {
@@ -863,7 +834,7 @@ async function send(req, res) {
     }
 
     var provider = providerResult.doc;
-    console.log('👤 Provider: ' + (provider.name || provider.fullName || 'Unknown'));
+    console.log('👤 Provider: ' + (provider.name || provider.fullName || 'Unknown') + ' (from ' + providerResult.dbName + ')');
 
     var fcmToken = provider.fcmToken || provider.fcm_token || provider.deviceToken || provider.pushToken ||
                    (provider.deviceInfo && (provider.deviceInfo.fcmToken || provider.deviceInfo.token)) || '';
@@ -999,17 +970,11 @@ async function send(req, res) {
       timeout: 30
     };
 
-    var offerInserted = false;
-    var dbOptions = ['bookings_db', 'admin_panel'];
-    for (var di = 0; di < dbOptions.length; di++) {
-      try {
-        await insertInDb(dbOptions[di], 'provideroffers', offerDoc);
-        console.log('   ✅ ProviderOffer created in ' + dbOptions[di] + ': ' + offerId);
-        offerInserted = true;
-        break;
-      } catch (e) {
-        console.log('   ⚠️ Failed to insert offer in ' + dbOptions[di] + ': ' + e.message);
-      }
+    var offerResult = await insertInAnyDb('provideroffers', offerDoc, ['bookings_db', 'admin_panel']);
+    if (offerResult.success) {
+      console.log('   ✅ ProviderOffer created in ' + offerResult.dbName + ': ' + offerId);
+    } else {
+      console.log('   ⚠️ ProviderOffer insert failed in all DBs');
     }
 
     var dispatchJobId = new mongoose.Types.ObjectId();
@@ -1034,17 +999,12 @@ async function send(req, res) {
         timeout: 30
       };
 
-      for (var dj = 0; dj < dbOptions.length; dj++) {
-        try {
-          await insertInDb(dbOptions[dj], 'dispatchjobs', dispatchDoc);
-          console.log('   ✅ DispatchJob created in ' + dbOptions[dj] + ': ' + dispatchJobId + ' (status: ' + statusOptions[si] + ')');
-          dispatchInserted = true;
-          break;
-        } catch (e) {
-          continue;
-        }
+      var dispResult = await insertInAnyDb('dispatchjobs', dispatchDoc, ['bookings_db', 'admin_panel']);
+      if (dispResult.success) {
+        console.log('   ✅ DispatchJob created in ' + dispResult.dbName + ': ' + dispatchJobId + ' (status: ' + statusOptions[si] + ')');
+        dispatchInserted = true;
+        break;
       }
-      if (dispatchInserted) break;
     }
 
     var title = '🔔 New Booking! ₹' + totalAmount;
@@ -1129,7 +1089,7 @@ async function send(req, res) {
       var messaging = firebase.messaging;
 
       if (!messaging || typeof messaging.send !== 'function') {
-        throw new Error('Firebase messaging invalid. messaging=' + typeof messaging);
+        throw new Error('Firebase messaging invalid');
       }
 
       console.log('   ✅ messaging.send is a function, sending now...');
@@ -1194,7 +1154,7 @@ async function send(req, res) {
         expiresAt: expiresAt.toISOString(),
         timeout: 30,
         cancelledPreviousOffers: cancelledOffers,
-        offerInserted: offerInserted,
+        offerInserted: offerResult.success,
         dispatchInserted: dispatchInserted,
         message: fcmResult
           ? '✅ Dispatch sent! Provider will get Accept/Reject popup. Expires in 30s.'
@@ -1273,32 +1233,32 @@ async function getOfferStatus(req, res) {
 }
 
 // ============================================================
-// DEBUG — CRITICAL for diagnosing DB issues
+// DEBUG — CRITICAL for diagnosing
 // ============================================================
 
 async function debug(req, res) {
   try {
-    // Test each DB connection
+    var all = getAllConnections();
+
+    var connectionsInfo = all.map(function(c) {
+      return {
+        name: c.name,
+        readyState: c.conn.readyState,
+        host: c.conn.host,
+        port: c.conn.port
+      };
+    });
+
     var dbTests = {};
-    var dbs = ['admin_panel', 'provider_db', 'user_db', 'bookings_db'];
-    for (var i = 0; i < dbs.length; i++) {
-      try {
-        var conn = getConnection(dbs[i]);
-        var dbNameActual = conn.name || conn.db && conn.db.databaseName || 'unknown';
-        var providersCount = 0, bookingsCount = 0, categoriesCount = 0;
-        try { providersCount = await conn.collection('providers').countDocuments(); } catch (e) {}
-        try { bookingsCount = await conn.collection('bookings').countDocuments(); } catch (e) {}
-        try { categoriesCount = await conn.collection('categories').countDocuments(); } catch (e) {}
-        dbTests[dbs[i]] = {
-          connected: true,
-          actualDbName: dbNameActual,
-          readyState: conn.readyState,
-          providers: providersCount,
-          bookings: bookingsCount,
-          categories: categoriesCount
-        };
-      } catch (e) {
-        dbTests[dbs[i]] = { connected: false, error: e.message };
+    for (var i = 0; i < all.length; i++) {
+      var dbName = all[i].name;
+      dbTests[dbName] = {};
+      var cols = ['providers', 'bookings', 'users', 'categories', 'cities', 'services', 'provideroffers', 'dispatchjobs'];
+      for (var j = 0; j < cols.length; j++) {
+        try {
+          var count = await all[i].conn.collection(cols[j]).countDocuments();
+          if (count > 0) dbTests[dbName][cols[j]] = count;
+        } catch (e) {}
       }
     }
 
@@ -1322,8 +1282,11 @@ async function debug(req, res) {
     res.json({
       success: true,
       data: {
-        mongooseReadyState: mongoose.connection.readyState,
-        mainDbName: mongoose.connection.name || (mongoose.connection.db && mongoose.connection.db.databaseName),
+        mongooseVersion: mongoose.version,
+        mongooseConnectionsCount: (mongoose.connections || []).length,
+        connectedDbsCount: all.length,
+        connectionsInfo: connectionsInfo,
+        defaultConnectionReadyState: mongoose.connection.readyState,
         dbTests: dbTests,
         categoriesLoaded: Object.keys(maps[0]).length,
         citiesLoaded: Object.keys(maps[1]).length,
@@ -1361,28 +1324,25 @@ async function debug(req, res) {
 
 async function debugConnections(req, res) {
   try {
-    var results = {};
-    var dbs = ['admin_panel', 'provider_db', 'user_db', 'bookings_db'];
+    var all = getAllConnections();
+    var results = {
+      mongooseConnectionsArrayLength: (mongoose.connections || []).length,
+      connectedDbs: all.length,
+      dbs: {}
+    };
+
     var collections = ['providers', 'bookings', 'categories', 'cities', 'services', 'users', 'provideroffers', 'dispatchjobs'];
 
-    for (var i = 0; i < dbs.length; i++) {
-      results[dbs[i]] = { _dbInfo: null };
-      try {
-        var conn = getConnection(dbs[i]);
-        results[dbs[i]]._dbInfo = {
-          actualName: conn.name || (conn.db && conn.db.databaseName),
-          readyState: conn.readyState
-        };
-        for (var j = 0; j < collections.length; j++) {
-          try {
-            var count = await conn.collection(collections[j]).countDocuments();
-            results[dbs[i]][collections[j]] = count;
-          } catch (e) {
-            results[dbs[i]][collections[j]] = 'error: ' + e.message;
-          }
-        }
-      } catch (e) {
-        results[dbs[i]]._error = e.message;
+    for (var i = 0; i < all.length; i++) {
+      results.dbs[all[i].name] = {
+        readyState: all[i].conn.readyState,
+        host: all[i].conn.host
+      };
+      for (var j = 0; j < collections.length; j++) {
+        try {
+          var count = await all[i].conn.collection(collections[j]).countDocuments();
+          results.dbs[all[i].name][collections[j]] = count;
+        } catch (e) {}
       }
     }
     res.json({ success: true, data: results });
@@ -1392,11 +1352,12 @@ async function debugConnections(req, res) {
 }
 
 function _health(req, res) {
+  var all = getAllConnections();
   res.json({
     success: true,
     message: 'Manual Dispatch controller healthy',
     timestamp: new Date().toISOString(),
-    mongooseState: mongoose.connection.readyState,
+    connectedDbs: all.map(function(a) { return a.name; }),
     exports: Object.keys(module.exports)
   });
 }
