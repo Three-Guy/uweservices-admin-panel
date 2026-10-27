@@ -438,7 +438,8 @@ async function startServer() {
     app.use('/api/v1/admin/dispatch', dispatchRoutes);
     app.use('/api/v1/admin/provider-offers', providerOfferRoutes);
     app.use('/api/v1/admin/admin-notifications', adminNotificationRoutes);
-
+    app.use('/api/v1/admin/provider-offers', providerOfferRoutes);
+app.use('/api/v1/admin/admin-notifications', adminNotificationRoutes);
     if (adminFcmTokenRoutes) {
       app.use('/api/v1/admin/fcm', adminFcmTokenRoutes);
       console.log('✓ /api/v1/admin/fcm routes mounted');
@@ -495,7 +496,15 @@ async function startServer() {
       } catch (e) {
         logger.error(`bookingPoller start failed: ${e.message}`);
       }
-
+    // ✅ MANUAL DISPATCH ROUTES (NEW)
+try {
+  const manualDispatchRoutes = require('./routes/manualDispatch.routes');
+  app.use('/api/v1/admin/manual-dispatch', manualDispatchRoutes);
+  console.log('✅ [Routes] Manual Dispatch routes mounted at /api/v1/admin/manual-dispatch');
+} catch (e) {
+  console.error('❌ [Routes] Manual Dispatch routes load failed:', e.message);
+  console.error(e.stack);
+}
       try {
         const { startWatcher } = require('./workers/dispatchWorker');
         startWatcher();
