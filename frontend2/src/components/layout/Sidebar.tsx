@@ -41,6 +41,7 @@ import {
   Zap,
   Radar,
   Radio,
+  Target, // ✅ NEW — Manual Dispatch icon
 } from 'lucide-react';
 import { useAuth } from '../../store/AuthContext';
 import { usersApi, providersApi, bookingsApi } from '../../lib/api';
@@ -71,6 +72,7 @@ interface NavItem {
   badgeType?: string;
   isHot?: boolean;
   isPinned?: boolean;
+  isCritical?: boolean; // ✅ NEW — for emergency items
 }
 
 // ─── Hooks ───
@@ -113,6 +115,7 @@ const themes = {
     accentHover: 'hover:bg-indigo-700',
     badge: 'bg-indigo-100 text-indigo-700',
     badgeHot: 'bg-gradient-to-r from-pink-500 to-rose-500 text-white',
+    badgeCritical: 'bg-gradient-to-r from-red-600 to-orange-600 text-white',
     badgeLive: 'bg-emerald-100 text-emerald-700',
     shadow: 'shadow-xl shadow-gray-200/50',
     overlay: 'bg-black/50',
@@ -131,6 +134,7 @@ const themes = {
     accentHover: 'hover:bg-indigo-700',
     badge: 'bg-indigo-500/20 text-indigo-300',
     badgeHot: 'bg-gradient-to-r from-pink-500 to-rose-500 text-white',
+    badgeCritical: 'bg-gradient-to-r from-red-600 to-orange-600 text-white',
     badgeLive: 'bg-emerald-500/20 text-emerald-400',
     shadow: 'shadow-xl shadow-black/50',
     overlay: 'bg-black/70',
@@ -149,6 +153,7 @@ const themes = {
     accentHover: 'hover:bg-pink-600',
     badge: 'bg-pink-500/20 text-pink-200',
     badgeHot: 'bg-gradient-to-r from-pink-500 to-rose-500 text-white',
+    badgeCritical: 'bg-gradient-to-r from-red-500 to-orange-500 text-white',
     badgeLive: 'bg-emerald-500/20 text-emerald-300',
     shadow: 'shadow-xl shadow-purple-900/50',
     overlay: 'bg-purple-900/80',
@@ -167,6 +172,7 @@ const themes = {
     accentHover: 'hover:bg-cyan-600',
     badge: 'bg-cyan-500/20 text-cyan-200',
     badgeHot: 'bg-gradient-to-r from-cyan-400 to-blue-500 text-white',
+    badgeCritical: 'bg-gradient-to-r from-red-500 to-orange-500 text-white',
     badgeLive: 'bg-emerald-500/20 text-emerald-300',
     shadow: 'shadow-xl shadow-blue-900/50',
     overlay: 'bg-blue-900/80',
@@ -185,6 +191,7 @@ const themes = {
     accentHover: 'hover:bg-emerald-600',
     badge: 'bg-emerald-500/20 text-emerald-200',
     badgeHot: 'bg-gradient-to-r from-emerald-400 to-teal-500 text-white',
+    badgeCritical: 'bg-gradient-to-r from-red-500 to-orange-500 text-white',
     badgeLive: 'bg-lime-500/20 text-lime-300',
     shadow: 'shadow-xl shadow-emerald-900/50',
     overlay: 'bg-emerald-900/80',
@@ -203,6 +210,7 @@ const themes = {
     accentHover: 'hover:bg-orange-600',
     badge: 'bg-orange-500/20 text-orange-200',
     badgeHot: 'bg-gradient-to-r from-yellow-400 to-orange-500 text-white',
+    badgeCritical: 'bg-gradient-to-r from-red-600 to-pink-600 text-white',
     badgeLive: 'bg-yellow-500/20 text-yellow-300',
     shadow: 'shadow-xl shadow-orange-900/50',
     overlay: 'bg-orange-900/80',
@@ -216,8 +224,9 @@ const navigation: NavItem[] = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
   { name: 'Bookings', href: '/bookings', icon: Calendar, hasBadge: true, badgeType: 'booking', isHot: true, isPinned: true },
   { name: 'Live Tracking', href: '/tracking', icon: Radar, hasBadge: true, badgeType: 'tracking', isHot: true, isPinned: true },
-  // ✅ NEW — Dispatch System (3 items)
+  // ✅ DISPATCH SYSTEM (4 items)
   { name: 'Dispatch Monitor', href: '/dispatch', icon: Zap, isHot: true, isPinned: true },
+  { name: '🚨 Manual Dispatch', href: '/manual-dispatch', icon: Target, isCritical: true, isPinned: true }, // ✅ NEW
   { name: 'Offer History', href: '/provider-offers', icon: Send },
   { name: 'Alerts Center', href: '/notifications', icon: Radio },
   { name: 'Providers', href: '/providers', icon: Briefcase, hasBadge: true, badgeType: 'provider' },
@@ -257,7 +266,7 @@ const otherNavigation: NavItem[] = [
 const bottomNavItems: NavItem[] = [
   { name: 'Home', href: '/', icon: Home },
   { name: 'Bookings', href: '/bookings', icon: Calendar },
-  { name: 'Tracking', href: '/tracking', icon: Radar },
+  { name: 'Dispatch', href: '/manual-dispatch', icon: Target }, // ✅ Updated to Manual Dispatch
   { name: 'Providers', href: '/providers', icon: Briefcase },
 ];
 
@@ -267,13 +276,11 @@ export default function Sidebar() {
   const navigate = useNavigate();
   const isMobile = useIsMobile();
 
-  // Refs
   const navRef = useRef<HTMLElement>(null);
   const scrollPositionRef = useRef<number>(0);
   const isInitialMountRef = useRef(true);
   const preventScrollRef = useRef(false);
 
-  // State
   const [isOpen, setIsOpen] = useState(false);
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [currentTheme, setCurrentTheme] = useState<ThemeKey>('purple');
@@ -282,7 +289,6 @@ export default function Sidebar() {
   const [isSDUIMenuExpanded, setIsSDUIMenuExpanded] = useState(false);
   const [isCheckoutMenuExpanded, setIsCheckoutMenuExpanded] = useState(false);
 
-  // Stats
   const [userStats, setUserStats] = useState<UserStats | null>(null);
   const [providerStats, setProviderStats] = useState<ProviderStatsSimple | null>(null);
   const [bookingStats, setBookingStats] = useState<BookingStatsSimple | null>(null);
@@ -295,7 +301,6 @@ export default function Sidebar() {
   const isSDUIRoute = location.pathname.startsWith('/sdui');
   const isCheckoutRoute = location.pathname.startsWith('/checkout');
 
-  // ─── Theme persistence ───
   useEffect(() => {
     const savedTheme = localStorage.getItem('sidebarTheme') as ThemeKey;
     if (savedTheme && themes[savedTheme]) setCurrentTheme(savedTheme);
@@ -307,7 +312,6 @@ export default function Sidebar() {
     setShowThemePicker(false);
   };
 
-  // ─── Scroll preservation ───
   const saveScrollPosition = useCallback(() => {
     if (navRef.current) scrollPositionRef.current = navRef.current.scrollTop;
   }, []);
@@ -341,7 +345,6 @@ export default function Sidebar() {
     return () => { document.body.style.overflow = ''; };
   }, [isMobile, isOpen]);
 
-  // ─── Fetchers ───
   const fetchUserStats = async () => {
     try {
       const res = await usersApi.getStats();
@@ -452,24 +455,31 @@ export default function Sidebar() {
           ${isActive ? theme.active : `${theme.text} ${theme.hover}`}
           ${isCollapsedView ? 'justify-center' : ''}
           ${item.isPinned && !isActive ? 'bg-gradient-to-r from-pink-500/5 to-rose-500/5' : ''}
+          ${item.isCritical && !isActive ? 'bg-gradient-to-r from-red-500/10 to-orange-500/10 ring-1 ring-red-500/20' : ''}
           touch-manipulation select-none`
         }
       >
         {({ isActive }) => (
           <>
             {isActive && !isCollapsedView && (
-              <span className={`absolute left-0 top-1/2 -translate-y-1/2 w-1 h-6 rounded-r-full ${theme.accent}`} />
+              <span className={`absolute left-0 top-1/2 -translate-y-1/2 w-1 h-6 rounded-r-full ${item.isCritical ? 'bg-red-500' : theme.accent}`} />
             )}
 
             <div className={`transition-transform duration-200 flex-shrink-0 relative ${isActive ? 'scale-110' : 'group-hover:scale-105'}`}>
-              <item.icon size={compact ? 17 : 18} strokeWidth={isActive ? 2.5 : 2} />
+              <item.icon size={compact ? 17 : 18} strokeWidth={isActive ? 2.5 : 2} className={item.isCritical ? 'text-red-400' : ''} />
               {item.isHot && isCollapsedView && (
                 <span className="absolute -top-1 -right-1 flex h-2.5 w-2.5">
                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-pink-400 opacity-75" />
                   <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-pink-500" />
                 </span>
               )}
-              {item.hasBadge && badgeCount > 0 && isCollapsedView && !item.isHot && (
+              {item.isCritical && isCollapsedView && (
+                <span className="absolute -top-1 -right-1 flex h-2.5 w-2.5">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-500 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-red-600" />
+                </span>
+              )}
+              {item.hasBadge && badgeCount > 0 && isCollapsedView && !item.isHot && !item.isCritical && (
                 <span className={`absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-1 rounded-full ${theme.accent} text-white text-[9px] font-bold flex items-center justify-center`}>
                   {badgeCount > 9 ? '9+' : badgeCount}
                 </span>
@@ -478,11 +488,17 @@ export default function Sidebar() {
 
             {(!isCollapsedView || isMobile) && (
               <>
-                <span className={`flex-1 text-[13.5px] ${isActive ? 'font-semibold' : 'font-medium'}`}>
+                <span className={`flex-1 text-[13.5px] ${isActive ? 'font-semibold' : 'font-medium'} ${item.isCritical ? 'font-bold' : ''}`}>
                   {item.name}
                 </span>
 
-                {item.isHot && !badgeCount && (
+                {item.isCritical && (
+                  <span className={`px-1.5 py-0.5 rounded-md text-[9px] font-black ${theme.badgeCritical} shadow-sm uppercase tracking-wider flex-shrink-0 animate-pulse`}>
+                    SOS
+                  </span>
+                )}
+
+                {item.isHot && !badgeCount && !item.isCritical && (
                   <span className={`px-1.5 py-0.5 rounded-md text-[9px] font-black ${theme.badgeHot} shadow-sm uppercase tracking-wider flex-shrink-0`}>
                     NEW
                   </span>
@@ -505,7 +521,10 @@ export default function Sidebar() {
                 whitespace-nowrap z-[100] border ${theme.border} ${theme.shadow}`}
               >
                 <span className={`font-semibold ${theme.text}`}>{item.name}</span>
-                {item.isHot && (
+                {item.isCritical && (
+                  <span className={`ml-2 px-1.5 py-0.5 ${theme.badgeCritical} rounded-md text-[9px] font-black uppercase`}>SOS</span>
+                )}
+                {item.isHot && !item.isCritical && (
                   <span className={`ml-2 px-1.5 py-0.5 ${theme.badgeHot} rounded-md text-[9px] font-black uppercase`}>NEW</span>
                 )}
                 {item.hasBadge && badgeCount > 0 && (
@@ -609,7 +628,6 @@ export default function Sidebar() {
     );
   };
 
-  // ─── Section Divider ───
   const SectionDivider = ({ label }: { label: string }) => (
     (!isCollapsed || isMobile) ? (
       <div className="mt-4 mb-1.5 px-3">
@@ -624,7 +642,6 @@ export default function Sidebar() {
     )
   );
 
-  // ─── Mobile Hamburger ───
   const MobileMenuButton = () => {
     const pendingBookings = bookingStats?.pendingBookings || 0;
     return (
@@ -645,7 +662,6 @@ export default function Sidebar() {
     );
   };
 
-  // ─── Mobile Bottom Nav ───
   const MobileBottomNav = () => (
     <div className={`md:hidden fixed bottom-0 left-0 right-0 z-30 ${theme.sidebar} border-t ${theme.border} backdrop-blur-xl`}
       style={{ paddingBottom: 'env(safe-area-inset-bottom, 0)' }}
@@ -698,10 +714,8 @@ export default function Sidebar() {
     </div>
   );
 
-  // ─── Sidebar Content ───
   const SidebarContent = () => (
     <>
-      {/* ─── Compact Header ─── */}
       <div className={`px-3 py-3 flex items-center justify-between border-b ${theme.border} flex-shrink-0`}>
         {(!isCollapsed || isMobile) ? (
           <div className="flex items-center gap-2.5 min-w-0">
@@ -733,7 +747,44 @@ export default function Sidebar() {
         )}
       </div>
 
-      {/* ─── Compact Live Stats (Bookings prominent) ─── */}
+      {/* ─── Manual Dispatch Quick Access Card (CRITICAL) ─── */}
+      {(!isCollapsed || isMobile) && bookingStats && bookingStats.pendingBookings > 0 && (
+        <div className="px-3 pt-3 pb-1 flex-shrink-0">
+          <NavLink
+            to="/manual-dispatch"
+            onClick={handleNavClick}
+            className={`block p-2.5 rounded-xl bg-gradient-to-r from-red-500/20 to-orange-500/20 border-2 border-red-500/40 relative overflow-hidden
+              hover:scale-[1.02] transition-transform duration-200 group animate-pulse-slow`}
+          >
+            <div className="absolute -top-4 -right-4 w-20 h-20 bg-red-500 opacity-20 rounded-full blur-2xl animate-pulse" />
+            <div className="relative flex items-center gap-2.5">
+              <div className={`w-9 h-9 rounded-lg bg-gradient-to-br from-red-500 to-orange-500 flex items-center justify-center shadow-lg flex-shrink-0`}>
+                <Target className="w-5 h-5 text-white" strokeWidth={2.5} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-1.5">
+                  <p className={`text-[10px] font-bold uppercase tracking-wider text-red-200`}>🚨 Manual Dispatch</p>
+                  <span className="flex h-1.5 w-1.5">
+                    <span className="animate-ping absolute inline-flex h-1.5 w-1.5 rounded-full bg-red-400 opacity-75" />
+                    <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-red-500" />
+                  </span>
+                </div>
+                <div className="flex items-baseline gap-2 mt-0.5">
+                  <span className={`text-lg font-black text-white leading-none`}>
+                    {bookingStats.pendingBookings}
+                  </span>
+                  <span className={`text-[10px] text-red-200`}>stuck bookings</span>
+                </div>
+              </div>
+              <div className={`px-1.5 py-0.5 rounded-md bg-red-600 text-white text-[9px] font-black shadow-sm uppercase`}>
+                SOS
+              </div>
+            </div>
+          </NavLink>
+        </div>
+      )}
+
+      {/* ─── Live Bookings Card ─── */}
       {(!isCollapsed || isMobile) && bookingStats && (
         <div className="px-3 pt-3 pb-1 flex-shrink-0">
           <NavLink
@@ -821,7 +872,7 @@ export default function Sidebar() {
         </div>
       )}
 
-      {/* ─── Compact Theme Picker ─── */}
+      {/* ─── Theme Picker ─── */}
       {(!isCollapsed || isMobile) && (
         <div className="px-3 py-2 flex-shrink-0">
           <div className="relative">
@@ -852,7 +903,7 @@ export default function Sidebar() {
         </div>
       )}
 
-      {/* ─── Navigation (compact & scrollable) ─── */}
+      {/* ─── Navigation ─── */}
       <nav ref={navRef} className="flex-1 px-2 py-2 overflow-y-auto custom-scrollbar overscroll-contain" style={{ scrollBehavior: 'auto' }}>
         <SectionDivider label="Main" />
         {navigation.map((item) => renderNavItem(item))}
@@ -869,7 +920,7 @@ export default function Sidebar() {
         {otherNavigation.map((item) => renderNavItem(item))}
       </nav>
 
-      {/* ─── Compact Footer: Admin + Logout ─── */}
+      {/* ─── Footer ─── */}
       <div className={`p-2.5 border-t ${theme.border} flex-shrink-0 ${isMobile ? 'pb-5' : ''}`}>
         {(!isCollapsed || isMobile) ? (
           <div className="space-y-1.5">
@@ -975,6 +1026,13 @@ export default function Sidebar() {
         }
         .animate-pulse {
           animation: gentle-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+        @keyframes pulse-slow {
+          0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+          50% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+        }
+        .animate-pulse-slow {
+          animation: pulse-slow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
         }
       `}</style>
     </>

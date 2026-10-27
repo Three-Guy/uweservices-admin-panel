@@ -46,6 +46,9 @@ import DispatchMonitor from './pages/DispatchMonitor';
 import ProviderOfferHistory from './pages/ProviderOfferHistory';
 import NotificationCenter from './pages/NotificationCenter';
 
+// ✅ ==================== MANUAL DISPATCH (NEW) ====================
+import ManualDispatch from './pages/ManualDispatch';
+
 // ==================== REALTIME BELL (CRITICAL FIX) ====================
 import RealtimeAlertBell from './components/RealtimeAlertBell';
 
@@ -231,6 +234,19 @@ function App() {
                 </ProtectedRoute>
               }
             />
+
+            {/* ✅ ==================== MANUAL DISPATCH (NEW ROUTE) ==================== */}
+            <Route
+              path="/manual-dispatch"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <ManualDispatch />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+
             <Route
               path="/provider-offers"
               element={

@@ -1,397 +1,151 @@
-// src/lib/dispatchClient.ts
-// ══════════════════════════════════════════════════════════════
-// STANDALONE API CLIENT for Dispatch + Admin Notifications
-// Independent of api.ts — no naming conflicts, no missing methods
-// ══════════════════════════════════════════════════════════════
-import axios, { AxiosInstance, AxiosResponse } from 'axios';
+// FILE: frontend2/src/lib/dispatchClient.ts
+// COMPLETE WORKING API CLIENT
 
-/* ─────────────────────────────────────────────
-   BASE URL
-   ───────────────────────────────────────────── */
-const RAW_BASE =
-  (import.meta.env.VITE_API_URL as string) ||
-  (import.meta.env.VITE_API_BASE_URL as string) ||
-  'https://uweservices-admin-panel.onrender.com/api/v1';
+import axios, { AxiosInstance } from 'axios';
 
-// Remove trailing slash
-const BASE_URL = RAW_BASE.replace(/\/+$/, '');
+const ADMIN_SECRET = 'uwe_admin_super_secret_2026';
 
-console.log('🔧 DispatchClient Base URL:', BASE_URL);
-
-/* ─────────────────────────────────────────────
-   TOKEN RESOLVER (checks every possible key)
-   ───────────────────────────────────────────── */
-function getAuthToken(): string | null {
-  // ── 1. Direct localStorage keys (most common) ──
-  const directKeys = [
-    'admin_token',       // ← AuthContext now stores here explicitly
-    'adminToken',
-    'token',
-    'access_token',
-    'accessToken',
-    'authToken',
-    'auth_token',
-    'jwt',
-    'jwt_token',
-    'admin_jwt',
-    'admin_access_token',
-  ];
-
-  for (const key of directKeys) {
-    const val = localStorage.getItem(key);
-    if (val && val !== 'undefined' && val !== 'null' && val.length > 10) {
-      const cleaned = val.replace(/^"|"$/g, '');
-      if (cleaned.length > 10) return cleaned;
-    }
-  }
-
-  // ── 2. Nested inside JSON objects in localStorage ──
-  const objectKeys = [
-    'admin_data',
-    'admin',
-    'user',
-    'adminUser',
-    'tokens',
-    'auth_data',
-    'credentials',
-    'admin_credentials',
-    'session',
-    'auth',
-  ];
-
-  for (const key of objectKeys) {
+function getAuthToken(): string {
+  const keys = ['admin_tokens', 'admin_token', 'token', 'auth_token', 'accessToken', 'access_token', 'jwt', 'adminToken'];
+  for (const key of keys) {
     try {
       const raw = localStorage.getItem(key);
       if (!raw) continue;
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== 'object') continue;
-
-      // Direct token fields
-      if (parsed.token && typeof parsed.token === 'string' && parsed.token.length > 10) return parsed.token;
-      if (parsed.accessToken && typeof parsed.accessToken === 'string' && parsed.accessToken.length > 10) return parsed.accessToken;
-      if (parsed.access_token && typeof parsed.access_token === 'string' && parsed.access_token.length > 10) return parsed.access_token;
-      if (parsed.jwt && typeof parsed.jwt === 'string' && parsed.jwt.length > 10) return parsed.jwt;
-
-      // Nested: data.token / data.accessToken
-      if (parsed.data?.token && typeof parsed.data.token === 'string' && parsed.data.token.length > 10) return parsed.data.token;
-      if (parsed.data?.accessToken && typeof parsed.data.accessToken === 'string' && parsed.data.accessToken.length > 10) return parsed.data.accessToken;
-
-      // Nested: tokens.accessToken / tokens.token (login response shape)
-      if (parsed.tokens?.accessToken && typeof parsed.tokens.accessToken === 'string' && parsed.tokens.accessToken.length > 10) return parsed.tokens.accessToken;
-      if (parsed.tokens?.token && typeof parsed.tokens.token === 'string' && parsed.tokens.token.length > 10) return parsed.tokens.token;
-    } catch {
-      /* ignore parse error */
-    }
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          const tokenVal = parsed.accessToken || parsed.access_token || parsed.token || parsed.jwt;
+          if (tokenVal && typeof tokenVal === 'string' && tokenVal.length > 20) return tokenVal;
+        }
+      } catch {}
+      if (raw.length > 20 && !raw.startsWith('{')) return raw;
+    } catch {}
   }
-
-  // ── 3. Last resort: scan ALL localStorage for JWT-like strings ──
-  try {
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (!key) continue;
-      const val = localStorage.getItem(key);
-      if (val && val.startsWith('eyJ') && val.length > 20) {
-        console.log(`[dispatchClient] 🔍 Found JWT in localStorage key "${key}"`);
-        return val;
-      }
-    }
-  } catch {
-    /* ignore */
-  }
-
-  return null;
+  return '';
 }
 
-/* ─────────────────────────────────────────────
-   AXIOS INSTANCE
-   ───────────────────────────────────────────── */
-const client: AxiosInstance = axios.create({
-  baseURL: BASE_URL,
-  timeout: 45000, // Render cold start can be slow
-  headers: { 'Content-Type': 'application/json' },
-});
-
-client.interceptors.request.use((config) => {
-  const token = getAuthToken();
-  if (token) {
-    config.headers = config.headers || {};
-    (config.headers as any).Authorization = `Bearer ${token}`;
-  } else {
-    console.warn('[dispatchClient] ⚠️ No auth token found for request:', config.url);
+function getBaseURL(): string {
+  const envUrls = [
+    (window as any).__RUNTIME_CONFIG__?.API_URL,
+    import.meta.env?.VITE_API_URL,
+    import.meta.env?.VITE_API_BASE_URL,
+  ];
+  for (const url of envUrls) {
+    if (url && typeof url === 'string' && url.startsWith('http')) {
+      return url.replace(/\/+$/, '');
+    }
   }
-  return config;
+  if (typeof window !== 'undefined') {
+    const host = window.location.hostname;
+    if (host === 'localhost' || host === '127.0.0.1') return 'http://localhost:5000/api/v1';
+  }
+  return 'https://uweservices-admin-panel.onrender.com/api/v1';
+}
+
+const apiClient: AxiosInstance = axios.create({
+  baseURL: getBaseURL(),
+  timeout: 30000,
+  headers: {
+    'Content-Type': 'application/json',
+    'x-admin-secret': ADMIN_SECRET,
+    'X-Admin-Secret': ADMIN_SECRET,
+  }
 });
 
-client.interceptors.response.use(
-  (res) => res,
-  (err) => {
-    const url = err?.config?.url || 'unknown';
-    const status = err?.response?.status;
-    console.warn(`⚠️ [dispatchClient] ${status || 'NETWORK'} on ${url}`);
-    return Promise.reject(err);
+apiClient.interceptors.request.use(
+  (config) => {
+    const token = getAuthToken();
+    if (token) {
+      config.headers['Authorization'] = `Bearer ${token}`;
+    }
+    config.headers['x-admin-secret'] = ADMIN_SECRET;
+    config.headers['X-Admin-Secret'] = ADMIN_SECRET;
+    console.log(`[DispatchClient] ${config.method?.toUpperCase()} ${config.baseURL}${config.url}`);
+    return config;
+  },
+  (error) => Promise.reject(error)
+);
+
+apiClient.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    console.error('[DispatchClient] Error:', error?.response?.status, error?.response?.data || error?.message);
+    return Promise.reject(error);
   }
 );
 
-/* ─────────────────────────────────────────────
-   RESPONSE HELPERS
-   ───────────────────────────────────────────── */
-function unwrap(res: AxiosResponse): any {
-  const body = res?.data;
-  if (body == null) return null;
-  // { success: true, data: ... }
-  if (typeof body === 'object' && 'data' in body && !Array.isArray(body)) {
-    return (body as any).data;
-  }
-  return body;
-}
-
-function toList(raw: any): any[] {
-  if (!raw) return [];
-  if (Array.isArray(raw)) return raw;
-  if (Array.isArray(raw.data)) return raw.data;
-  if (Array.isArray(raw.items)) return raw.items;
-  if (Array.isArray(raw.docs)) return raw.docs;
-  if (Array.isArray(raw.results)) return raw.results;
-  if (Array.isArray(raw.bookings)) return raw.bookings;
-  if (Array.isArray(raw.notifications)) return raw.notifications;
-  if (Array.isArray(raw.offers)) return raw.offers;
-  if (Array.isArray(raw.providers)) return raw.providers;
-  if (Array.isArray(raw.dispatches)) return raw.dispatches;
-  return [];
-}
-
-/** Try multiple endpoint paths until one succeeds */
-async function tryPaths(
-  method: 'get' | 'post' | 'patch' | 'put',
-  paths: string[],
-  payload?: any,
-  params?: any
-): Promise<any> {
-  let lastErr: any = null;
+async function tryPaths(method: 'get' | 'post', paths: string[], dataOrParams?: any): Promise<any> {
+  let lastError: any = null;
   for (const path of paths) {
     try {
-      const res =
-        method === 'get'
-          ? await client.get(path, { params })
-          : method === 'post'
-          ? await client.post(path, payload || {})
-          : method === 'patch'
-          ? await client.patch(path, payload || {})
-          : await client.put(path, payload || {});
-      return unwrap(res);
-    } catch (e: any) {
-      lastErr = e;
-      // Only fall through on 404 (endpoint doesn't exist)
-      if (e?.response?.status && e.response.status !== 404) throw e;
+      if (method === 'get') {
+        return await apiClient.get(path, { params: dataOrParams });
+      } else {
+        return await apiClient.post(path, dataOrParams);
+      }
+    } catch (err: any) {
+      lastError = err;
+      if (err?.response?.status === 404) {
+        continue;
+      }
+      throw err;
     }
   }
-  throw lastErr || new Error('All endpoint paths failed');
+  throw lastError;
 }
 
-/* ══════════════════════════════════════════════
-   DISPATCH API
-   ══════════════════════════════════════════════ */
-export const dispatchApi = {
-  /** Live dispatch engine stats */
-  getStats: async (): Promise<any> => {
+export const manualDispatchApi = {
+  getOnlineProviders: (params?: { all?: string; search?: string; category?: string }) => {
+    const q: any = {};
+    if (params?.all) q.all = params.all;
+    if (params?.search) q.search = params.search;
+    if (params?.category) q.category = params.category;
     return tryPaths('get', [
-      '/admin/dispatch/stats',
-      '/admin/dispatch-stats',
-      '/dispatch/stats',
-    ]);
+      '/admin/manual-dispatch/online-providers',
+      '/manual-dispatch/online-providers',
+    ], q);
   },
 
-  /** Currently running dispatches */
-  getActive: async (): Promise<any[]> => {
-    const raw = await tryPaths('get', [
-      '/admin/dispatch/active',
-      '/dispatch/active',
-    ]);
-    return toList(raw);
-  },
-
-  /** Bookings where no provider was found */
-  getNoProviderFound: async (): Promise<any[]> => {
-    const raw = await tryPaths('get', [
-      '/admin/dispatch/no-provider-found',
-      '/dispatch/no-provider-found',
-    ]);
-    return toList(raw);
-  },
-
-  /** All unassigned bookings (confirmed / searching / no_provider_found) */
-  getUnassignedBookings: async (): Promise<any[]> => {
-    const raw = await tryPaths('get', [
-      '/admin/dispatch/unassigned',
-      '/admin/bookings/unassigned',
-      '/dispatch/unassigned',
-    ]);
-    return toList(raw);
-  },
-
-  /** Eligible providers for a booking */
-  getEligibleProviders: async (bookingId: string): Promise<any[]> => {
-    const raw = await tryPaths('get', [
-      `/admin/dispatch/eligible-providers/${bookingId}`,
-      `/dispatch/eligible-providers/${bookingId}`,
-    ]);
-    return toList(raw);
-  },
-
-  /** Deep debug: why providers were filtered out */
-  getEligibleProvidersDebug: async (bookingId: string): Promise<any> => {
+  getDispatchableBookings: (params?: { search?: string; status?: string }) => {
+    const q: any = {};
+    if (params?.search) q.search = params.search;
+    if (params?.status) q.status = params.status;
     return tryPaths('get', [
-      `/admin/dispatch/eligible-providers-debug/${bookingId}`,
-      `/dispatch/eligible-providers-debug/${bookingId}`,
-    ]);
+      '/admin/manual-dispatch/dispatchable-bookings',
+      '/manual-dispatch/dispatchable-bookings',
+    ], q);
   },
 
-  /** Manually trigger dispatch */
-  trigger: async (bookingId: string): Promise<any> => {
+  send: (data: { bookingId: string; providerId: string; adminNote?: string }) => {
     return tryPaths('post', [
-      `/admin/dispatch/trigger/${bookingId}`,
-      `/dispatch/trigger/${bookingId}`,
+      '/admin/manual-dispatch/send',
+      '/admin/manual-dispatch/dispatch',
+      '/admin/manual-dispatch/force-dispatch',
+      '/manual-dispatch/send',
+    ], data);
+  },
+
+  getOfferStatus: (offerId: string) => {
+    return tryPaths('get', [
+      `/admin/manual-dispatch/offer-status/${offerId}`,
+      `/manual-dispatch/offer-status/${offerId}`,
     ]);
   },
 
-  /** Reassign to a specific provider */
-  reassign: async (bookingId: string, providerId?: string): Promise<any> => {
-    return tryPaths(
-      'post',
-      [
-        `/admin/dispatch/reassign/${bookingId}`,
-        `/dispatch/reassign/${bookingId}`,
-      ],
-      providerId ? { providerId } : {}
-    );
-  },
-
-  /** Clear cooldown + supersede offers + re-run dispatch */
-  autoRedispatch: async (bookingId: string): Promise<any> => {
+  testFCM: (providerId: string) => {
     return tryPaths('post', [
-      `/admin/dispatch/auto-redispatch/${bookingId}`,
-      `/dispatch/auto-redispatch/${bookingId}`,
-    ]);
+      `/admin/manual-dispatch/test-fcm/${providerId}`,
+      `/manual-dispatch/test-fcm/${providerId}`,
+    ], {});
   },
 
-  /** Force-assign a provider (no offer flow) */
-  assignManual: async (bookingId: string, providerId: string): Promise<any> => {
-    return tryPaths(
-      'post',
-      [
-        `/admin/dispatch/assign-manual/${bookingId}`,
-        `/dispatch/assign-manual/${bookingId}`,
-      ],
-      { providerId }
-    );
-  },
+  debug: () => tryPaths('get', ['/admin/manual-dispatch/debug', '/manual-dispatch/debug']),
+  health: () => tryPaths('get', ['/admin/manual-dispatch/_health', '/manual-dispatch/_health']),
 };
 
-/* ══════════════════════════════════════════════
-   ADMIN NOTIFICATIONS API
-   ══════════════════════════════════════════════ */
-export const notificationsApi = {
-  /** Recent notifications — ALWAYS returns an array */
-  getRecent: async (limit = 20): Promise<any[]> => {
-    try {
-      const raw = await tryPaths(
-        'get',
-        [
-          '/admin/admin-notifications',
-          '/admin/notifications',
-          '/admin/alerts',
-        ],
-        undefined,
-        { limit, page: 1 }
-      );
-      return toList(raw);
-    } catch (err) {
-      console.warn('⚠️ getRecent failed, returning empty list');
-      return [];
-    }
-  },
+export const dispatchApi = manualDispatchApi;
+export const fcmApi = manualDispatchApi;
+export const notificationsApi = manualDispatchApi;
+export const adminNotificationsApi = manualDispatchApi;
 
-  /** Unread count */
-  getUnreadCount: async (): Promise<number> => {
-    try {
-      const raw = await tryPaths('get', [
-        '/admin/admin-notifications/unread-count',
-        '/admin/notifications/unread-count',
-      ]);
-      if (typeof raw === 'number') return raw;
-      return raw?.count ?? raw?.unread ?? raw?.unreadCount ?? 0;
-    } catch {
-      return 0;
-    }
-  },
-
-  /** Mark one as read */
-  markRead: async (id: string): Promise<void> => {
-    try {
-      await tryPaths('patch', [
-        `/admin/admin-notifications/${id}/read`,
-        `/admin/notifications/${id}/read`,
-      ]);
-    } catch {
-      try {
-        await tryPaths('post', [
-          `/admin/admin-notifications/${id}/read`,
-          `/admin/notifications/${id}/read`,
-        ]);
-      } catch {
-        /* non-critical */
-      }
-    }
-  },
-
-  /** Mark all as read */
-  markAllRead: async (): Promise<void> => {
-    const paths = [
-      '/admin/admin-notifications/mark-all-read',
-      '/admin/admin-notifications/read-all',
-      '/admin/notifications/mark-all-read',
-      '/admin/notifications/read-all',
-    ];
-    try {
-      await tryPaths('patch', paths);
-    } catch {
-      try {
-        await tryPaths('post', paths);
-      } catch {
-        console.warn('⚠️ markAllRead endpoint not found (non-critical)');
-      }
-    }
-  },
-};
-
-/* ══════════════════════════════════════════════
-   FCM TOKEN REGISTRATION
-   ══════════════════════════════════════════════ */
-export const fcmApi = {
-  register: async (fcmToken: string, adminEmail?: string): Promise<any> => {
-    let email = adminEmail || '';
-    if (!email) {
-      try {
-        const raw = localStorage.getItem('admin_data');
-        if (raw) email = JSON.parse(raw)?.email || '';
-      } catch {
-        /* ignore */
-      }
-    }
-    return tryPaths(
-      'post',
-      ['/admin/fcm/register', '/admin/fcm-token/register'],
-      { fcmToken, token: fcmToken, adminEmail: email, email }
-    );
-  },
-
-  unregister: async (fcmToken: string): Promise<any> => {
-    return tryPaths(
-      'post',
-      ['/admin/fcm/unregister', '/admin/fcm-token/unregister'],
-      { fcmToken, token: fcmToken }
-    );
-  },
-};
-
-export default client;
+export default apiClient;
