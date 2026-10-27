@@ -1,9 +1,8 @@
 // backend/src/controllers/manualDispatch.controller.js
-// 🚨 FORCE RE-DISPATCH: Cancel old provider → Reset booking → Send to new provider
+// 🚨 FORCE RE-DISPATCH with FIREBASE FIX (handles both old + new firebase-admin)
 const mongoose = require('mongoose');
 
 const DISPATCH_TIMEOUT_MS = parseInt(process.env.MANUAL_DISPATCH_TIMEOUT_MS || '30000', 10);
-const DISPATCHABLE_STATUSES = ['confirmed', 'searching', 'no_provider_found', 'pending', 'assigned', 'accepted', 'in_progress'];
 
 // ============================================================
 // DATABASE CONNECTIONS
@@ -83,25 +82,41 @@ function getDispatchJobModel() {
 }
 
 // ============================================================
-// 🔥 FIREBASE INIT — BULLETPROOF
+// 🔥 FIREBASE INIT — FIXES "credential is undefined" ERROR
+//
+// Problem: firebase-admin v12+ uses modular API
+//   OLD: admin.credential.cert(sa)     ← undefined in v12+
+//   NEW: cert(sa) from 'firebase-admin/app'
+//
+// This code tries ALL approaches automatically
 // ============================================================
-let firebaseAdmin = null;
+let firebaseMessaging = null;
 let firebaseReady = false;
 
 async function initFirebase() {
-  if (firebaseReady) return true;
-  try { firebaseAdmin = require('firebase-admin'); } catch (e) { console.error('❌ firebase-admin not found'); return false; }
-  if (!firebaseAdmin) return false;
+  if (firebaseReady && firebaseMessaging) return true;
 
+  // ── STEP 1: Try to use EXISTING firebase-admin (from fcmService.js) ──
   try {
-    const apps = firebaseAdmin.apps;
-    if (apps && Array.isArray(apps) && apps.length > 0) {
-      firebaseReady = true;
-      console.log('✅ Firebase already initialized');
-      return true;
+    const existingAdmin = require('firebase-admin');
+    if (existingAdmin && existingAdmin.apps && Array.isArray(existingAdmin.apps) && existingAdmin.apps.length > 0) {
+      console.log('✅ Using EXISTING Firebase app (already initialized by fcmService)');
+      try {
+        firebaseMessaging = existingAdmin.messaging();
+        if (firebaseMessaging) {
+          firebaseReady = true;
+          console.log('✅ Firebase messaging ready from existing app!');
+          return true;
+        }
+      } catch (e) {
+        console.warn('⚠️ existing app messaging() failed: ' + e.message);
+      }
     }
-  } catch (e) {}
+  } catch (e) {
+    console.log('ℹ️ No existing firebase-admin found');
+  }
 
+  // ── STEP 2: Load credentials from env ──
   let serviceAccount = null;
   const envKeys = [
     'PROVIDER_FIREBASE_SERVICE_ACCOUNT_BASE64',
@@ -110,17 +125,18 @@ async function initFirebase() {
   ];
 
   for (let i = 0; i < envKeys.length; i++) {
-    const key = envKeys[i];
     let val = null;
-    try { val = process.env[key]; } catch (e) { continue; }
+    try { val = process.env[envKeys[i]]; } catch (e) { continue; }
     if (!val || typeof val !== 'string') continue;
     val = val.trim();
     if (val.length < 10) continue;
     try {
       serviceAccount = JSON.parse(Buffer.from(val, 'base64').toString('utf8'));
-      console.log('✅ Firebase creds from ' + key);
+      console.log('✅ Firebase creds loaded from ' + envKeys[i]);
       break;
-    } catch (e) {}
+    } catch (e) {
+      console.warn('⚠️ ' + envKeys[i] + ' decode failed');
+    }
   }
 
   if (!serviceAccount) {
@@ -129,7 +145,7 @@ async function initFirebase() {
       let val = null;
       try { val = process.env[jsonKeys[i]]; } catch (e) { continue; }
       if (!val || typeof val !== 'string' || val.trim().length < 10) continue;
-      try { serviceAccount = JSON.parse(val.trim()); console.log('✅ Firebase creds from ' + jsonKeys[i]); break; } catch (e) {}
+      try { serviceAccount = JSON.parse(val.trim()); console.log('✅ Creds from ' + jsonKeys[i]); break; } catch (e) {}
     }
   }
 
@@ -140,7 +156,7 @@ async function initFirebase() {
       const fp = path.join(__dirname, '../config/serviceproviderapp-b7767-firebase-adminsdk.json');
       if (fs.existsSync(fp)) {
         serviceAccount = JSON.parse(fs.readFileSync(fp, 'utf8'));
-        console.log('✅ Firebase creds from local config file');
+        console.log('✅ Creds from local config file');
       }
     } catch (e) {}
   }
@@ -150,90 +166,115 @@ async function initFirebase() {
     return false;
   }
 
-  try {
-    firebaseAdmin.initializeApp({ credential: firebaseAdmin.credential.cert(serviceAccount) });
-    firebaseReady = true;
-    console.log('✅ Firebase initialized!');
-    return true;
-  } catch (e) {
-    if (e.message && e.message.indexOf('already exists') !== -1) {
-      firebaseReady = true;
-      return true;
-    }
-    console.error('❌ Firebase init failed: ' + e.message);
+  // ── STEP 3: Initialize with MULTIPLE approaches ──
+  let admin = null;
+  try { admin = require('firebase-admin'); } catch (e) {
+    console.error('❌ firebase-admin not installed');
     return false;
   }
+
+  // Check again if already initialized (race condition)
+  try {
+    if (admin.apps && Array.isArray(admin.apps) && admin.apps.length > 0) {
+      firebaseMessaging = admin.messaging();
+      firebaseReady = true;
+      console.log('✅ Firebase already initialized (race check)');
+      return true;
+    }
+  } catch (e) {}
+
+  // APPROACH A: admin.credential.cert() — firebase-admin v11 and below
+  try {
+    if (admin.credential && typeof admin.credential.cert === 'function') {
+      console.log('🔄 Trying Approach A: admin.credential.cert()');
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+      });
+      firebaseMessaging = admin.messaging();
+      firebaseReady = true;
+      console.log('✅ Firebase initialized via Approach A!');
+      return true;
+    } else {
+      console.log('⚠️ admin.credential.cert not available (v12+?)');
+    }
+  } catch (e) {
+    console.warn('⚠️ Approach A failed: ' + e.message);
+  }
+
+  // APPROACH B: cert() from 'firebase-admin/app' — firebase-admin v12+
+  try {
+    console.log('🔄 Trying Approach B: cert() from firebase-admin/app');
+    const appModule = require('firebase-admin/app');
+    if (appModule && typeof appModule.cert === 'function') {
+      appModule.initializeApp({
+        credential: appModule.cert(serviceAccount)
+      });
+      firebaseMessaging = appModule.getMessaging();
+      firebaseReady = true;
+      console.log('✅ Firebase initialized via Approach B!');
+      return true;
+    }
+  } catch (e) {
+    console.warn('⚠️ Approach B failed: ' + e.message);
+  }
+
+  // APPROACH C: Use applicationDefault()
+  try {
+    console.log('🔄 Trying Approach C: applicationDefault()');
+    if (admin.credential && typeof admin.credential.applicationDefault === 'function') {
+      admin.initializeApp({
+        credential: admin.credential.applicationDefault()
+      });
+      firebaseMessaging = admin.messaging();
+      firebaseReady = true;
+      console.log('✅ Firebase initialized via Approach C!');
+      return true;
+    }
+  } catch (e) {
+    console.warn('⚠️ Approach C failed: ' + e.message);
+  }
+
+  // APPROACH D: Direct serviceAccount object (some versions accept this)
+  try {
+    console.log('🔄 Trying Approach D: direct serviceAccount object');
+    admin.initializeApp({
+      credential: serviceAccount,
+      projectId: serviceAccount.project_id
+    });
+    firebaseMessaging = admin.messaging();
+    firebaseReady = true;
+    console.log('✅ Firebase initialized via Approach D!');
+    return true;
+  } catch (e) {
+    console.warn('⚠️ Approach D failed: ' + e.message);
+  }
+
+  // APPROACH E: Use existing fcmService.js as complete fallback
+  try {
+    console.log('🔄 Trying Approach E: use fcmService.js directly');
+    const fcmService = require('../services/fcmService');
+    if (fcmService && fcmService.sendBookingOfferToProvider) {
+      console.log('✅ fcmService.js available — will use as fallback for sending');
+      // Don't set firebaseReady — we'll use fcmService directly in send function
+      return false;
+    }
+  } catch (e) {
+    console.warn('⚠️ Approach E failed: ' + e.message);
+  }
+
+  console.error('❌ ALL Firebase init approaches failed!');
+  return false;
 }
 
 // ============================================================
-// 📲 DATA-ONLY FCM SENDER
+// 📲 SEND FCM — tries direct first, then fcmService fallback
 // ============================================================
-async function sendDataOnlyFCM(token, dataPayload) {
+async function sendFCMToProvider(provider, booking, offerId, expiresAt) {
+  const token = provider.fcmToken;
   if (!token || typeof token !== 'string' || token.length < 10) {
     return { success: false, error: 'No valid FCM token' };
   }
-  const ready = await initFirebase();
-  if (!ready || !firebaseAdmin) return { success: false, error: 'Firebase not initialized' };
 
-  const message = {
-    token: token,
-    data: dataPayload,
-    android: { priority: 'high', ttl: 60 },
-    apns: {
-      headers: { 'apns-priority': '10', 'apns-push-type': 'background' },
-      payload: { aps: { 'content-available': 1, sound: 'default', badge: 1 } }
-    }
-  };
-
-  try {
-    const messageId = await firebaseAdmin.messaging().send(message);
-    console.log('✅ FCM SENT! ID: ' + messageId + ' → ' + token.substring(0, 20) + '...');
-    return { success: true, messageId: messageId };
-  } catch (err) {
-    const msg = err && err.message ? err.message : String(err);
-    console.error('❌ FCM FAILED: ' + msg);
-    return { success: false, error: msg };
-  }
-}
-
-// ============================================================
-// 📲 SEND CANCELLATION TO OLD PROVIDER
-// ============================================================
-async function sendCancellationFCM(oldProvider, bookingId) {
-  if (!oldProvider || !oldProvider.fcmToken || typeof oldProvider.fcmToken !== 'string' || oldProvider.fcmToken.length < 10) {
-    console.log('⚠️ Old provider has no FCM token, skipping cancellation');
-    return;
-  }
-
-  console.log('📲 Sending CANCELLATION to old provider: ' + oldProvider.name);
-
-  const cancelPayload = {
-    type: 'booking_cancelled',
-    click_action: 'FLUTTER_NOTIFICATION_CLICK',
-    channelId: 'booking_requests',
-    bookingId: String(bookingId),
-    booking_id: String(bookingId),
-    reason: 'admin_reassigned',
-    title: 'Booking Cancelled',
-    body: 'This booking has been reassigned by admin',
-    sound: 'default',
-    priority: 'high',
-    source: 'manual_admin',
-    showPopup: 'false'
-  };
-
-  try {
-    await sendDataOnlyFCM(oldProvider.fcmToken, cancelPayload);
-    console.log('✅ Cancellation sent to ' + oldProvider.name);
-  } catch (e) {
-    console.warn('⚠️ Cancellation FCM failed: ' + e.message);
-  }
-}
-
-// ============================================================
-// 📲 SEND BOOKING REQUEST TO NEW PROVIDER
-// ============================================================
-async function sendBookingFCM(newProvider, booking, offerId, expiresAt) {
   const bookingId = String(booking._id);
   const serviceName = booking.serviceName || booking.categoryName || 'Service';
   const amount = String(booking.totalAmount || 0);
@@ -242,7 +283,8 @@ async function sendBookingFCM(newProvider, booking, offerId, expiresAt) {
   const customerPhone = booking.customerPhone || '';
   const categoryName = booking.categoryName || '';
 
-  const payload = {
+  // DATA-ONLY payload (no notification field — triggers popup in app)
+  const dataPayload = {
     type: 'booking_request',
     click_action: 'FLUTTER_NOTIFICATION_CLICK',
     channelId: 'booking_requests',
@@ -297,7 +339,101 @@ async function sendBookingFCM(newProvider, booking, offerId, expiresAt) {
     autoOpen: 'true'
   };
 
-  return await sendDataOnlyFCM(newProvider.fcmToken, payload);
+  // ── TRY 1: Direct Firebase messaging ──
+  const ready = await initFirebase();
+  if (ready && firebaseMessaging) {
+    try {
+      const message = {
+        token: token,
+        data: dataPayload,
+        android: { priority: 'high', ttl: 60 },
+        apns: {
+          headers: { 'apns-priority': '10', 'apns-push-type': 'background' },
+          payload: { aps: { 'content-available': 1, sound: 'default', badge: 1 } }
+        }
+      };
+      const messageId = await firebaseMessaging.send(message);
+      console.log('✅ DIRECT FCM SENT! ID: ' + messageId);
+      return { success: true, messageId: messageId, method: 'direct' };
+    } catch (e) {
+      console.warn('⚠️ Direct FCM failed: ' + e.message);
+    }
+  }
+
+  // ── TRY 2: Use fcmService.js (existing backend service) ──
+  console.log('🔄 Falling back to fcmService.js...');
+  try {
+    const fcmService = require('../services/fcmService');
+    if (fcmService && typeof fcmService.sendBookingOfferToProvider === 'function') {
+      const result = await fcmService.sendBookingOfferToProvider(provider, booking, {
+        offerId: offerId,
+        expiresAt: expiresAt,
+        timeoutMs: DISPATCH_TIMEOUT_MS,
+        source: 'manual_admin',
+        adminNote: 'Force dispatch'
+      });
+      if (result && result.success) {
+        console.log('✅ FCM sent via fcmService.js!');
+        return { success: true, messageId: result.messageId || 'fcmService', method: 'fcmService' };
+      } else {
+        console.warn('⚠️ fcmService returned failure: ' + JSON.stringify(result));
+      }
+    }
+  } catch (e) {
+    console.warn('⚠️ fcmService fallback error: ' + e.message);
+  }
+
+  // ── TRY 3: Use admin.messaging() from fresh require ──
+  console.log('🔄 Trying fresh firebase-admin require...');
+  try {
+    const freshAdmin = require('firebase-admin');
+    if (freshAdmin && freshAdmin.apps && Array.isArray(freshAdmin.apps) && freshAdmin.apps.length > 0) {
+      const msg = freshAdmin.messaging();
+      const messageId = await msg.send({
+        token: token,
+        data: dataPayload,
+        android: { priority: 'high', ttl: 60 }
+      });
+      console.log('✅ FCM sent via fresh require! ID: ' + messageId);
+      return { success: true, messageId: messageId, method: 'fresh_require' };
+    }
+  } catch (e) {
+    console.warn('⚠️ Fresh require failed: ' + e.message);
+  }
+
+  return { success: false, error: 'All FCM methods failed' };
+}
+
+// ============================================================
+// 📲 SEND CANCELLATION TO OLD PROVIDER
+// ============================================================
+async function sendCancellationFCM(oldProvider, bookingId) {
+  if (!oldProvider || !oldProvider.fcmToken || typeof oldProvider.fcmToken !== 'string' || oldProvider.fcmToken.length < 10) return;
+  console.log('📲 Sending CANCELLATION to ' + oldProvider.name);
+  try {
+    const ready = await initFirebase();
+    if (ready && firebaseMessaging) {
+      await firebaseMessaging.send({
+        token: oldProvider.fcmToken,
+        data: {
+          type: 'booking_cancelled',
+          click_action: 'FLUTTER_NOTIFICATION_CLICK',
+          channelId: 'booking_requests',
+          bookingId: String(bookingId),
+          booking_id: String(bookingId),
+          reason: 'admin_reassigned',
+          title: 'Booking Cancelled',
+          body: 'Reassigned by admin',
+          sound: 'default',
+          showPopup: 'false'
+        },
+        android: { priority: 'high', ttl: 30 }
+      });
+      console.log('✅ Cancellation sent to ' + oldProvider.name);
+    }
+  } catch (e) {
+    console.warn('⚠️ Cancellation FCM failed: ' + e.message);
+  }
 }
 
 // ============================================================
@@ -376,38 +512,26 @@ exports.getOnlineProviders = async (req, res) => {
 };
 
 // ============================================================
-// GET DISPATCHABLE BOOKINGS — NOW INCLUDES ASSIGNED/ACCEPTED TOO
+// GET DISPATCHABLE BOOKINGS
 // ============================================================
 exports.getDispatchableBookings = async (req, res) => {
   try {
     const Booking = getBookingModel();
     if (!Booking) return res.status(500).json({ success: false, message: 'Booking model unavailable' });
-
-    // Include ALL active bookings — even assigned ones (for force re-dispatch)
     const allStatuses = ['confirmed', 'searching', 'no_provider_found', 'pending', 'assigned', 'accepted', 'in_progress'];
     const bookings = await Booking.find({ status: { $in: allStatuses } }).sort({ createdAt: -1 }).limit(200).lean();
     const normalized = bookings.map(normalizeBooking).filter(Boolean);
-    console.log('📊 Returned ' + normalized.length + ' bookings (including assigned)');
+    console.log('📊 Returned ' + normalized.length + ' bookings');
     res.json({ success: true, count: normalized.length, bookings: normalized });
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
 // ============================================================
-// 🚨 FORCE RE-DISPATCH — THE MAIN FLOW
-//
-// Step 1: Find booking (ANY status — even assigned/accepted)
-// Step 2: Find NEW provider (admin selected)
-// Step 3: Check if booking has OLD provider assigned
-// Step 4: If yes → Cancel old provider's offer + Send cancellation FCM
-// Step 5: Cancel ALL pending offers for this booking
-// Step 6: Reset booking status → "searching"
-// Step 7: Create NEW offer for new provider
-// Step 8: Send DATA-ONLY FCM to NEW provider
-// Step 9: Set 30s timeout
+// 🚨 FORCE RE-DISPATCH
 // ============================================================
 exports.send = async (req, res) => {
   console.log('\n============================================================');
-  console.log('📨 POST /api/v1/admin/manual-dispatch/send (FORCE RE-DISPATCH)');
+  console.log('📨 FORCE RE-DISPATCH');
   console.log('📦 Body:', JSON.stringify(req.body));
   console.log('============================================================');
 
@@ -423,7 +547,7 @@ exports.send = async (req, res) => {
     const DispatchJob = getDispatchJobModel();
     if (!Booking || !Provider) return res.status(500).json({ success: false, message: 'DB models unavailable' });
 
-    // ── STEP 1: FIND BOOKING (any status) ──
+    // FIND BOOKING
     let booking = null;
     if (mongoose.Types.ObjectId.isValid(bookingId)) booking = await Booking.findById(bookingId);
     if (!booking) booking = await Booking.findOne({ $or: [{ bookingId: bookingId }, { orderId: bookingId }] });
@@ -431,104 +555,73 @@ exports.send = async (req, res) => {
 
     const oldStatus = booking.status;
     const oldProviderId = booking.providerId;
-    console.log('📋 Booking: ' + booking._id + ' | Status: ' + oldStatus + ' | Old Provider: ' + (oldProviderId || 'none'));
 
-    // ── STEP 2: FIND NEW PROVIDER (admin selected) ──
+    // FIND NEW PROVIDER
     let newProvider = null;
     if (mongoose.Types.ObjectId.isValid(providerId)) newProvider = await Provider.findById(providerId);
     if (!newProvider) newProvider = await Provider.findOne({ providerId: providerId });
-    if (!newProvider) return res.status(404).json({ success: false, message: 'Provider not found: ' + providerId });
+    if (!newProvider) return res.status(404).json({ success: false, message: 'Provider not found' });
 
-    console.log('🎯 NEW Provider: ' + newProvider.name + ' (' + newProvider.phone + ') | ID: ' + newProvider._id);
+    console.log('📋 Booking: ' + booking._id + ' | Status: ' + oldStatus);
+    console.log('🎯 Target: ' + newProvider.name + ' (' + newProvider.phone + ')');
 
     if (!newProvider.fcmToken || typeof newProvider.fcmToken !== 'string' || newProvider.fcmToken.length < 10) {
-      return res.status(400).json({ success: false, message: 'Provider ' + newProvider.name + ' has no FCM token' });
+      return res.status(400).json({ success: false, message: 'Provider has no FCM token' });
     }
 
-    // ── STEP 3: CHECK IF OLD PROVIDER EXISTS ──
-    let oldProvider = null;
-    if (oldProviderId) {
-      try {
-        oldProvider = await Provider.findById(oldProviderId);
-        if (oldProvider) {
-          console.log('⚠️ OLD Provider found: ' + oldProvider.name + ' (' + oldProvider.phone + ')');
-        }
-      } catch (e) {
-        console.warn('⚠️ Could not find old provider: ' + e.message);
-      }
-    }
-
-    // ── STEP 4: CANCEL OLD PROVIDER (if different from new) ──
+    // CANCEL OLD PROVIDER
     let oldProviderCancelled = false;
-    if (oldProvider && String(oldProvider._id) !== String(newProvider._id)) {
-      console.log('🔄 Reassigning from ' + oldProvider.name + ' → ' + newProvider.name);
-
-      // 4a: Send cancellation FCM to old provider
-      await sendCancellationFCM(oldProvider, booking._id);
-
-      // 4b: Cancel old provider's offers
-      if (Offer) {
-        try {
-          const cancelResult = await Offer.updateMany(
-            { bookingId: booking._id, providerId: oldProvider._id, status: { $in: ['pending', 'accepted', 'sent', 'dispatched'] } },
-            { $set: { status: 'cancelled', respondedAt: new Date(), response: 'admin_reassigned_to_' + newProvider.name } }
-          );
-          console.log('🔄 Cancelled ' + (cancelResult.modifiedCount || 0) + ' offers from old provider');
-        } catch (e) { console.warn('⚠️ Offer cancel failed: ' + e.message); }
-      }
-
-      // 4c: Clear old provider's currentBookingId
+    if (oldProviderId && String(oldProviderId) !== String(newProvider._id)) {
       try {
-        await Provider.findByIdAndUpdate(oldProvider._id, {
-          $set: { currentBookingId: null, isBusy: false, isAvailable: true }
-        });
-        console.log('🔄 Cleared old provider currentBookingId');
-      } catch (e) {}
-
-      oldProviderCancelled = true;
+        const oldProvider = await Provider.findById(oldProviderId);
+        if (oldProvider) {
+          console.log('🔄 Cancelling old provider: ' + oldProvider.name);
+          await sendCancellationFCM(oldProvider, booking._id);
+          if (Offer) {
+            await Offer.updateMany(
+              { bookingId: booking._id, providerId: oldProvider._id, status: { $in: ['pending', 'accepted', 'sent'] } },
+              { $set: { status: 'cancelled', respondedAt: new Date(), response: 'admin_reassigned' } }
+            );
+          }
+          await Provider.findByIdAndUpdate(oldProvider._id, { $set: { currentBookingId: null, isBusy: false, isAvailable: true } });
+          oldProviderCancelled = true;
+        }
+      } catch (e) { console.warn('⚠️ Old provider cancel: ' + e.message); }
     }
 
-    // ── STEP 5: CANCEL ALL OTHER PENDING OFFERS ──
+    // SUPERSEDE OTHER OFFERS
     if (Offer) {
       try {
-        const supResult = await Offer.updateMany(
+        await Offer.updateMany(
           { bookingId: booking._id, status: { $in: ['pending', 'sent', 'dispatched', 'waiting'] } },
-          { $set: { status: 'superseded', respondedAt: new Date(), response: 'superseded_by_force_dispatch' } }
+          { $set: { status: 'superseded', respondedAt: new Date() } }
         );
-        console.log('🔄 Superseded ' + (supResult.modifiedCount || 0) + ' other pending offers');
       } catch (e) {}
     }
 
-    // ── STEP 6: RESET BOOKING STATUS → "searching" ──
+    // RESET BOOKING
     try {
       await Booking.findByIdAndUpdate(booking._id, {
-        $set: {
-          status: 'searching',
-          providerId: newProvider._id,
-          updatedAt: new Date()
-        }
+        $set: { status: 'searching', providerId: newProvider._id, updatedAt: new Date() }
       });
-      console.log('🔄 Booking status: ' + oldStatus + ' → searching (provider → ' + newProvider.name + ')');
-    } catch (e) { console.warn('⚠️ Status reset failed: ' + e.message); }
+      console.log('🔄 Status: ' + oldStatus + ' → searching');
+    } catch (e) {}
 
-    // ── STEP 7: CREATE NEW OFFER ──
+    // CREATE OFFER
     const expiresAt = new Date(Date.now() + DISPATCH_TIMEOUT_MS);
     let offer = null;
     if (Offer) {
       try {
         offer = await Offer.create({
-          bookingId: booking._id,
-          providerId: newProvider._id,
-          status: 'pending',
-          source: 'manual_admin_force',
-          expiresAt: expiresAt,
-          adminNote: adminNote || 'Force re-dispatch by admin'
+          bookingId: booking._id, providerId: newProvider._id,
+          status: 'pending', source: 'manual_admin_force',
+          expiresAt: expiresAt, adminNote: adminNote || ''
         });
-        console.log('📝 NEW Offer: ' + offer._id);
-      } catch (e) { console.warn('⚠️ Offer create failed: ' + e.message); }
+        console.log('📝 Offer: ' + offer._id);
+      } catch (e) { console.warn('⚠️ Offer: ' + e.message); }
     }
 
-    // ── STEP 8: CREATE DISPATCH JOB ──
+    // CREATE DISPATCH JOB
     let dispatchJob = null;
     if (DispatchJob) {
       const tries = ['pending', 'active', 'dispatched', 'searching', 'sent', 'waiting'];
@@ -539,7 +632,6 @@ exports.send = async (req, res) => {
             offerId: offer ? offer._id : null, status: tries[i],
             source: 'manual_admin_force', dispatchedAt: new Date(), expiresAt: expiresAt
           });
-          console.log('📝 DispatchJob status=' + tries[i]);
           break;
         } catch (e) {
           if (e.message && e.message.indexOf('not a valid enum') !== -1) continue;
@@ -548,14 +640,10 @@ exports.send = async (req, res) => {
       }
     }
 
-    // ── STEP 9: SEND DATA-ONLY FCM TO NEW PROVIDER ──
+    // 🔥 SEND FCM (with all fallbacks)
     console.log('📲 Sending DATA-ONLY FCM to ' + newProvider.name + '...');
-    console.log('   Token: ' + newProvider.fcmToken.substring(0, 20) + '...');
-    console.log('   Format: data-only (popup trigger)');
+    const fcmResult = await sendFCMToProvider(newProvider, booking, offer ? offer._id : 'manual', expiresAt);
 
-    const fcmResult = await sendBookingFCM(newProvider, booking, offer ? offer._id : 'manual', expiresAt);
-
-    // Update dispatch job
     if (dispatchJob && DispatchJob) {
       try {
         await DispatchJob.findByIdAndUpdate(dispatchJob._id, {
@@ -564,20 +652,13 @@ exports.send = async (req, res) => {
       } catch (e) {}
     }
 
-    // ── SOCKET EMIT ──
+    // SOCKET
     emitToAdmins('manual-dispatch:sent', {
-      bookingId: String(booking._id),
-      oldProviderId: oldProvider ? String(oldProvider._id) : null,
-      oldProviderName: oldProvider ? oldProvider.name : null,
-      newProviderId: String(newProvider._id),
-      newProviderName: newProvider.name,
-      fcmSent: fcmResult.success,
-      oldProviderCancelled: oldProviderCancelled,
-      oldStatus: oldStatus,
-      newStatus: 'searching'
+      bookingId: String(booking._id), providerId: String(newProvider._id),
+      providerName: newProvider.name, fcmSent: fcmResult.success
     });
 
-    // ── 30s TIMEOUT ──
+    // TIMEOUT
     if (offer && Offer) {
       setTimeout(async () => {
         try {
@@ -589,38 +670,30 @@ exports.send = async (req, res) => {
               await Booking.findByIdAndUpdate(booking._id, { $set: { status: 'no_provider_found', providerId: null } });
             }
             emitToAdmins('manual-dispatch:timeout', { bookingId: String(booking._id) });
-            console.log('⏰ Offer ' + offer._id + ' TIMEOUT');
           }
         } catch (e) {}
       }, DISPATCH_TIMEOUT_MS + 2000);
     }
 
-    // ── RESPONSE ──
-    console.log('✅ FORCE RE-DISPATCH COMPLETE!');
-    console.log('   Old: ' + (oldProvider ? oldProvider.name : 'none') + ' → New: ' + newProvider.name);
-    console.log('   FCM: ' + (fcmResult.success ? 'SENT ✅' : 'FAILED ❌ ' + fcmResult.error));
+    console.log('✅ DONE! FCM: ' + (fcmResult.success ? 'SENT ✅ (' + fcmResult.method + ')' : 'FAILED ❌ ' + fcmResult.error));
     console.log('============================================================\n');
 
     res.json({
       success: true,
-      message: fcmResult.success
-        ? '🔔 Force dispatched to ' + newProvider.name + (oldProviderCancelled ? ' (cancelled ' + (oldProvider ? oldProvider.name : 'old') + ')' : '')
-        : 'FCM failed: ' + fcmResult.error,
+      message: fcmResult.success ? 'FCM sent via ' + fcmResult.method : 'FCM failed: ' + fcmResult.error,
       data: {
         offerId: offer ? String(offer._id) : null,
         bookingId: String(booking._id),
-        oldProvider: oldProvider ? { id: String(oldProvider._id), name: oldProvider.name, cancelled: oldProviderCancelled } : null,
-        newProvider: { id: String(newProvider._id), name: newProvider.name, phone: newProvider.phone },
+        providerName: newProvider.name,
         fcmSent: fcmResult.success,
+        fcmMethod: fcmResult.method || null,
         fcmError: fcmResult.success ? null : fcmResult.error,
-        oldStatus: oldStatus,
-        newStatus: 'searching',
+        oldStatus: oldStatus, newStatus: 'searching',
         timeoutMs: DISPATCH_TIMEOUT_MS
       }
     });
-
   } catch (err) {
-    console.error('❌ send error: ' + err.message);
+    console.error('❌ Error: ' + err.message);
     console.error(err.stack);
     res.status(500).json({ success: false, message: err.message });
   }
@@ -645,10 +718,12 @@ exports.getOfferStatus = async (req, res) => {
 exports.debugConnections = async (req, res) => {
   try {
     let fbStatus = 'not_checked';
+    let fbDetails = '';
     try {
       const a = require('firebase-admin');
       const apps = a && a.apps ? a.apps : [];
       fbStatus = apps.length > 0 ? 'initialized (' + apps.length + ' apps)' : 'no apps';
+      fbDetails = 'credential exists: ' + !!(a && a.credential) + ', cert exists: ' + !!(a && a.credential && a.credential.cert);
     } catch (e) { fbStatus = 'not installed'; }
 
     const envCheck = {};
@@ -658,6 +733,17 @@ exports.debugConnections = async (req, res) => {
       envCheck[keys[i]] = !!(v && typeof v === 'string' && v.trim().length > 50);
     }
 
-    res.json({ success: true, firebaseStatus: fbStatus, envVars: envCheck, fcmFormat: 'DATA-ONLY', timestamp: new Date().toISOString() });
+    // Check fcmService availability
+    let fcmServiceAvailable = false;
+    try {
+      const fcm = require('../services/fcmService');
+      fcmServiceAvailable = !!(fcm && fcm.sendBookingOfferToProvider);
+    } catch (e) {}
+
+    res.json({
+      success: true, firebaseStatus: fbStatus, firebaseDetails: fbDetails,
+      envVars: envCheck, fcmServiceAvailable: fcmServiceAvailable,
+      fcmFormat: 'DATA-ONLY', timestamp: new Date().toISOString()
+    });
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
