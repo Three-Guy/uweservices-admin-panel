@@ -1,332 +1,234 @@
 // backend/src/controllers/manualDispatch.controller.js
 const mongoose = require('mongoose');
 const path = require('path');
-const fs = require('fs');
-
-const DISPATCH_TIMEOUT_MS = parseInt(process.env.MANUAL_DISPATCH_TIMEOUT_MS || '30000', 10);
+const firebaseAdmin = require('firebase-admin');
 
 // ============================================================
-// DATABASE CONNECTIONS
+// FIREBASE PROVIDER APP (named app to avoid conflict)
 // ============================================================
-let providerConn, bookingConn;
-
-function getProviderConn() {
-  if (providerConn && providerConn.readyState === 1) return providerConn;
-  try { const db = require('../config/database'); providerConn = db.getProviderConnection(); if (providerConn) return providerConn; } catch (e) {}
-  for (const c of mongoose.connections) { if (c.readyState === 1 && c.name && /provider/i.test(c.name)) { providerConn = c; return c; } }
-  return mongoose.connection;
-}
-
-function getBookingConn() {
-  if (bookingConn && bookingConn.readyState === 1) return bookingConn;
-  try { const db = require('../config/database'); bookingConn = db.getBookingConnection(); if (bookingConn) return bookingConn; } catch (e) {}
-  for (const c of mongoose.connections) { if (c.readyState === 1 && c.name && /booking/i.test(c.name)) { bookingConn = c; return c; } }
-  return mongoose.connection;
-}
-
-// ============================================================
-// MODEL GETTERS
-// ============================================================
-function getProviderModel() {
-  const conn = getProviderConn();
-  try { return conn.model('Provider'); } catch (e) {}
-  try {
-    return conn.model('Provider', new mongoose.Schema({
-      name: String, providerId: String, phone: String, email: String, fcmToken: String,
-      isActive: Boolean, isAvailable: Boolean, isAcceptingJobs: Boolean, isBusy: Boolean,
-      verificationStatus: String, isVerified: Boolean, categoryId: mongoose.Schema.Types.ObjectId,
-      categoryName: String, profession: String, city: String, cityId: String,
-      rating: mongoose.Schema.Types.Mixed, completedJobs: Number, totalBookings: Number,
-      profilePicture: String, profileImage: String, profilePic: String,
-      selfieImage: mongoose.Schema.Types.Mixed, gender: String, lastOnlineAt: Date,
-      currentBookingId: mongoose.Schema.Types.ObjectId, isOnline: Boolean
-    }, { strict: false, collection: 'providers' }));
-  } catch (e) { return null; }
-}
-
-function getBookingModel() {
-  const conn = getBookingConn();
-  try { return conn.model('Booking'); } catch (e) {}
-  try {
-    return conn.model('Booking', new mongoose.Schema({
-      bookingId: String, orderId: String, customerId: mongoose.Schema.Types.ObjectId,
-      customerName: String, customerPhone: String, providerId: mongoose.Schema.Types.ObjectId,
-      serviceName: String, serviceIcon: String, categoryId: mongoose.Schema.Types.ObjectId,
-      categoryName: String, address: String, city: String, totalAmount: Number,
-      baseAmount: Number, servicePrice: String, status: String,
-      bookingType: String, scheduledDate: String, scheduledTime: String
-    }, { strict: false, collection: 'bookings' }));
-  } catch (e) { return null; }
-}
-
-function getOfferModel() {
-  const conn = getBookingConn();
-  try { return conn.model('ProviderOffer'); } catch (e) {}
-  try {
-    return conn.model('ProviderOffer', new mongoose.Schema({
-      bookingId: mongoose.Schema.Types.ObjectId, providerId: mongoose.Schema.Types.ObjectId,
-      status: String, source: String, expiresAt: Date, respondedAt: Date,
-      response: String, adminNote: String
-    }, { strict: false, collection: 'provideroffers' }));
-  } catch (e) { return null; }
-}
-
-function getDispatchJobModel() {
-  const conn = getBookingConn();
-  try { return conn.model('DispatchJob'); } catch (e) {}
-  try {
-    return conn.model('DispatchJob', new mongoose.Schema({
-      bookingId: mongoose.Schema.Types.ObjectId, providerId: mongoose.Schema.Types.ObjectId,
-      offerId: mongoose.Schema.Types.ObjectId, status: String, source: String,
-      dispatchedAt: Date, expiresAt: Date, result: String, fcmMessageId: String
-    }, { strict: false, collection: 'dispatchjobs' }));
-  } catch (e) { return null; }
-}
-
-// ============================================================
-// 🔥 BULLETPROOF FIREBASE INIT
-//
-// ROOT CAUSE: admin.credential is undefined in firebase-admin v12+
-// FIX: Try ALL possible APIs + use NAMED app to avoid conflicts
-// ============================================================
+let providerApp = null;
 let providerMessaging = null;
 
 function loadServiceAccount() {
-  const paths = [
-    path.join(__dirname, '../config/serviceproviderapp-b7767-firebase-adminsdk.json'),
-    path.join(__dirname, '../../config/serviceproviderapp-b7767-firebase-adminsdk.json'),
-    path.join(process.cwd(), 'src/config/serviceproviderapp-b7767-firebase-adminsdk.json'),
-    path.join(process.cwd(), 'config/serviceproviderapp-b7767-firebase-adminsdk.json'),
-  ];
-  if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
-    paths.unshift(path.resolve(process.cwd(), process.env.FIREBASE_SERVICE_ACCOUNT_PATH));
-  }
-  for (const fp of paths) {
+  // Try env BASE64 first
+  const b64Key = 'PROVIDER_FIREBASE_SERVICE_ACCOUNT_BASE64';
+  const b64Val = process.env[b64Key];
+  if (typeof b64Val === 'string' && b64Val.length > 100) {
     try {
-      if (fs.existsSync(fp)) {
-        const sa = JSON.parse(fs.readFileSync(fp, 'utf8'));
-        if (sa.project_id && sa.private_key) {
-          console.log('✅ SA loaded from file: ' + fp);
-          return sa;
-        }
-      }
-    } catch (e) {}
+      const json = Buffer.from(b64Val, 'base64').toString('utf8');
+      const sa = JSON.parse(json);
+      console.log('✅ SA loaded from env:', b64Key);
+      return sa;
+    } catch (e) {
+      console.error('❌ Failed parsing SA from env:', e.message);
+    }
   }
-  const b64keys = ['PROVIDER_FIREBASE_SERVICE_ACCOUNT_BASE64', 'FIREBASE_SERVICE_ACCOUNT_BASE64'];
-  for (const k of b64keys) {
+
+  // Try JSON env
+  const jsonKey = 'PROVIDER_FIREBASE_SERVICE_ACCOUNT_JSON';
+  const jsonVal = process.env[jsonKey];
+  if (typeof jsonVal === 'string' && jsonVal.length > 100) {
     try {
-      const v = process.env[k];
-      if (v && typeof v === 'string' && v.trim().length > 50) {
-        const sa = JSON.parse(Buffer.from(v.trim(), 'base64').toString('utf8'));
-        if (sa.project_id && sa.private_key) {
-          console.log('✅ SA loaded from env: ' + k);
-          return sa;
-        }
-      }
-    } catch (e) { console.warn('⚠️ ' + k + ' parse failed'); }
+      const sa = JSON.parse(jsonVal);
+      console.log('✅ SA loaded from env:', jsonKey);
+      return sa;
+    } catch (e) {
+      console.error('❌ Failed parsing SA JSON env:', e.message);
+    }
   }
+
+  // Try file
+  try {
+    const filePath = path.resolve(process.cwd(), 'src/config/serviceproviderapp-b7767-firebase-adminsdk.json');
+    const sa = require(filePath);
+    console.log('✅ SA loaded from file:', filePath);
+    return sa;
+  } catch (e) {
+    console.error('❌ No service account file:', e.message);
+  }
+
   return null;
 }
 
-async function getProviderMessaging() {
+function getProviderMessaging() {
   if (providerMessaging) return providerMessaging;
 
-  let admin;
-  try { admin = require('firebase-admin'); } catch (e) {
-    console.error('❌ firebase-admin not installed');
-    return null;
-  }
-
-  // Check if 'provider' app already exists
   try {
-    const existingApp = admin.app('provider');
-    if (existingApp) {
-      providerMessaging = admin.messaging(existingApp);
-      console.log('✅ Reusing existing "provider" Firebase app');
+    const sa = loadServiceAccount();
+    if (!sa) {
+      console.error('❌ No service account available');
+      return null;
+    }
+
+    console.log(`🔄 Initializing Firebase for provider (project: ${sa.project_id})...`);
+
+    // Check if named app already exists
+    const existingApps = Array.isArray(firebaseAdmin.apps) ? firebaseAdmin.apps : [];
+    const existing = existingApps.find(a => a && a.name === 'provider');
+    if (existing) {
+      providerApp = existing;
+      providerMessaging = providerApp.messaging();
+      console.log('✅ Reusing existing provider app');
       return providerMessaging;
     }
-  } catch (e) {
-    // App doesn't exist yet — that's fine
-  }
 
-  const sa = loadServiceAccount();
-  if (!sa) {
-    console.error('❌ No service account found!');
-    console.error('   Set PROVIDER_FIREBASE_SERVICE_ACCOUNT_BASE64 in Render');
-    return null;
-  }
-
-  console.log('🔄 Initializing Firebase for provider (project: ' + sa.project_id + ')...');
-
-  // ── APPROACH 1: admin.credential.cert() (v11 and below) ──
-  try {
-    if (admin.credential && typeof admin.credential.cert === 'function') {
-      console.log('🔄 Approach 1: admin.credential.cert()');
-      const app = admin.initializeApp({
-        credential: admin.credential.cert(sa),
-        projectId: sa.project_id,
-      }, 'provider');
-      providerMessaging = admin.messaging(app);
-      console.log('✅ Approach 1 SUCCESS');
-      return providerMessaging;
-    } else {
-      console.log('⚠️ admin.credential.cert not available');
-    }
-  } catch (e) {
-    console.warn('⚠️ Approach 1 failed: ' + e.message);
-  }
-
-  // ── APPROACH 2: modular cert() from firebase-admin/app (v12+) ──
-  try {
-    console.log('🔄 Approach 2: modular cert() from firebase-admin/app');
-    const appModule = require('firebase-admin/app');
-    if (appModule && typeof appModule.cert === 'function' && typeof appModule.initializeApp === 'function') {
-      const app = appModule.initializeApp({
-        credential: appModule.cert(sa),
-        projectId: sa.project_id,
-      }, 'provider');
-      const msgModule = require('firebase-admin/messaging');
-      if (msgModule && typeof msgModule.getMessaging === 'function') {
-        providerMessaging = msgModule.getMessaging(app);
+    // Approach 1: admin.credential.cert
+    let credential = null;
+    try {
+      if (firebaseAdmin.credential && typeof firebaseAdmin.credential.cert === 'function') {
+        credential = firebaseAdmin.credential.cert(sa);
+        console.log('✅ Approach 1 SUCCESS: admin.credential.cert');
       } else {
-        providerMessaging = admin.messaging(app);
+        console.log('⚠️ admin.credential.cert not available');
       }
-      console.log('✅ Approach 2 SUCCESS');
-      return providerMessaging;
-    } else {
-      console.log('⚠️ firebase-admin/app not available');
+    } catch (e1) {
+      console.log('⚠️ Approach 1 failed:', e1.message);
     }
-  } catch (e) {
-    console.warn('⚠️ Approach 2 failed: ' + e.message);
-  }
 
-  // ── APPROACH 3: Use default app if it matches provider project ──
-  try {
-    console.log('🔄 Approach 3: check default app');
-    if (admin.apps && admin.apps.length > 0) {
-      const defaultApp = admin.apps[0];
-      console.log('   Default app project: ' + (defaultApp.options ? defaultApp.options.projectId : 'unknown'));
-      providerMessaging = admin.messaging(defaultApp);
-      console.log('✅ Approach 3 SUCCESS (using default app)');
-      return providerMessaging;
+    // Approach 2: modular cert
+    if (!credential) {
+      try {
+        console.log('🔄 Approach 2: modular cert() from firebase-admin/app');
+        const { cert } = require('firebase-admin/app');
+        credential = cert(sa);
+        console.log('✅ Approach 2 SUCCESS');
+      } catch (e2) {
+        console.log('⚠️ Approach 2 failed:', e2.message);
+      }
     }
-  } catch (e) {
-    console.warn('⚠️ Approach 3 failed: ' + e.message);
-  }
 
-  // ── APPROACH 4: Initialize default app (no name) ──
-  try {
-    console.log('🔄 Approach 4: initialize default app');
-    const app = admin.initializeApp({
-      credential: sa,
+    if (!credential) {
+      console.error('❌ Could not create credential');
+      return null;
+    }
+
+    providerApp = firebaseAdmin.initializeApp({
+      credential,
       projectId: sa.project_id,
-    });
-    providerMessaging = admin.messaging(app);
-    console.log('✅ Approach 4 SUCCESS');
-    return providerMessaging;
-  } catch (e) {
-    if (e.message && e.message.indexOf('already exists') !== -1) {
-      providerMessaging = admin.messaging();
-      console.log('✅ Approach 4 SUCCESS (app existed)');
-      return providerMessaging;
-    }
-    console.warn('⚠️ Approach 4 failed: ' + e.message);
-  }
+    }, 'provider');
 
-  console.error('❌ ALL Firebase approaches failed!');
-  console.error('   firebase-admin version: ' + (admin.SDK_VERSION || 'unknown'));
-  console.error('   admin.credential exists: ' + !!admin.credential);
-  console.error('   admin.apps count: ' + (admin.apps ? admin.apps.length : 0));
-  return null;
+    providerMessaging = providerApp.messaging();
+    console.log('✅ Provider Firebase initialized');
+    return providerMessaging;
+  } catch (err) {
+    console.error('❌ getProviderMessaging FATAL:', err.message);
+    console.error(err.stack);
+    return null;
+  }
 }
 
 // ============================================================
-// 📲 HYBRID ALARM FCM — EXACT MATCH with provider backend
+// DB CONNECTIONS
 // ============================================================
-async function sendHybridAlarmFCM(provider, booking) {
-  const token = provider.fcmToken;
-  if (!token || typeof token !== 'string' || token.length < 10) {
-    return { success: false, error: 'No valid FCM token' };
+function getConn(name) {
+  const conns = mongoose.connections || [];
+  for (const c of conns) {
+    if (c && c.name === name) return c;
   }
+  return mongoose.connection;
+}
 
+function getModel(connName, modelName, schemaDef) {
+  const conn = getConn(connName);
+  if (!conn) return null;
+  if (conn.models && conn.models[modelName]) return conn.models[modelName];
+  const schema = new mongoose.Schema(schemaDef || {}, { strict: false, timestamps: true });
+  return conn.model(modelName, schema);
+}
+
+// ============================================================
+// STRING COERCE — Firebase data MUST be all strings
+// ============================================================
+function s(v) {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (v instanceof Date) return v.toISOString();
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+
+function stringifyAll(obj) {
+  const out = {};
+  for (const k of Object.keys(obj || {})) {
+    out[k] = s(obj[k]);
+  }
+  return out;
+}
+
+// ============================================================
+// HYBRID ALARM FCM — matches provider backend exactly
+// ============================================================
+async function sendHybridAlarmFCM(fcmToken, booking, provider) {
+  console.log('📲 Sending HYBRID ALARM FCM...');
   console.log('📲 getProviderMessaging()...');
-  const messaging = await getProviderMessaging();
+
+  const messaging = getProviderMessaging();
   if (!messaging) {
-    return { success: false, error: 'Firebase messaging not available' };
+    return { success: false, error: 'messaging not initialized' };
   }
 
-  // ── Format price (exact match) ──
-  let exactPrice = 0;
-  let priceDisplay = '';
-  if (booking.totalAmount && !isNaN(parseFloat(String(booking.totalAmount)))) {
-    exactPrice = parseFloat(String(booking.totalAmount));
-  } else if (booking.baseAmount && !isNaN(parseFloat(String(booking.baseAmount)))) {
-    exactPrice = parseFloat(String(booking.baseAmount));
-  }
-  if (exactPrice > 0) {
-    priceDisplay = exactPrice % 1 === 0 ? '₹' + exactPrice.toFixed(0) : '₹' + exactPrice.toFixed(2);
-  } else if (booking.servicePrice) {
-    priceDisplay = String(booking.servicePrice);
-  } else {
-    priceDisplay = 'Price TBD';
-  }
+  const bookingId = String(booking._id);
+  const serviceName = booking.serviceName || booking.service?.name || booking.categoryName || 'Service';
+  const customerName = booking.customerName || booking.user?.name || booking.userName || 'Customer';
+  const totalAmount = Number(booking.totalAmount || booking.amount || booking.price || 0);
+  const baseAmount = Number(booking.baseAmount || booking.servicePrice || totalAmount);
+  const address = booking.address?.full || booking.address?.street || booking.address || 'Address not available';
+  const city = booking.address?.city || booking.city || '';
+  const scheduledTime = booking.scheduledTime || booking.timeSlot || '';
+  const scheduledDate = booking.scheduledDate || booking.date || '';
 
-  const serviceName = booking.serviceName || 'Service';
-  const address = booking.address || '';
-  const shortAddress = address.length > 50 ? address.substring(0, 47) + '...' : address;
-  const scheduledTime = booking.scheduledTime || '';
-  const bookingIdStr = String(booking._id);
+  const title = `🔔 New Booking! ₹${totalAmount}`;
+  const body = `${serviceName} • ₹${totalAmount} • ${scheduledTime}\n📍 ${String(address).substring(0, 80)}`;
 
-  let body = serviceName + ' • ' + priceDisplay;
-  if (scheduledTime) body += ' • ' + scheduledTime;
-  if (shortAddress) body += '\n📍 ' + shortAddress;
-
-  const fcmTitle = '🔔 New Booking! ' + priceDisplay;
-  const fcmBody = body;
-
-  // ── EXACT data fields from fcmService.sendNewBookingNotification ──
-  const stringData = {
+  // ALL data values MUST be strings
+  const dataPayload = stringifyAll({
     type: 'booking_request',
-    bookingId: bookingIdStr,
-    bookingObjectId: bookingIdStr,
-    actionUrl: '/booking-detail?bookingId=' + bookingIdStr,
+    bookingId: bookingId,
+    bookingObjectId: bookingId,
+    actionUrl: `/booking-detail?bookingId=${bookingId}`,
     serviceName: serviceName,
-    serviceIcon: booking.serviceIcon || '🔧',
-    categoryName: booking.categoryName || '',
-    customerName: booking.customerName || 'Customer',
-    totalAmount: String(exactPrice || 0),
-    baseAmount: String(booking.baseAmount || 0),
-    servicePrice: booking.servicePrice || '',
-    priceDisplay: priceDisplay,
+    serviceIcon: '🔧',
+    categoryName: booking.categoryName || serviceName,
+    customerName: customerName,
+    totalAmount: totalAmount,
+    baseAmount: baseAmount,
+    servicePrice: baseAmount,
+    priceDisplay: `₹${totalAmount}`,
     scheduledTime: scheduledTime,
-    scheduledDate: booking.scheduledDate || '',
+    scheduledDate: scheduledDate,
     address: address,
-    city: booking.city || '',
+    city: city,
     priority: 'high',
     channelId: 'bookings_alarm',
     category: 'booking_request',
     clickAction: 'OPEN_BOOKING',
-    timeout: String(Math.floor(DISPATCH_TIMEOUT_MS / 1000)),
-    expiresAt: String(Date.now() + DISPATCH_TIMEOUT_MS),
+    timeout: 30,
+    expiresAt: Date.now() + 30000,
     isExclusive: 'true',
     source: 'manual_admin',
     _isBookingAlarm: 'true',
     _source: 'fcm',
-    _sentAt: String(Date.now()),
+    _sentAt: Date.now(),
     sound: 'booking_alarm',
-    title: fcmTitle,
-    body: fcmBody,
-  };
+    title: title,
+    body: body,
+  });
 
-  // ── HYBRID message (notification + data + android.notification) ──
   const message = {
-    token: token,
-    notification: { title: fcmTitle, body: fcmBody },
-    data: stringData,
+    token: fcmToken,
+    notification: {
+      title: title,
+      body: body,
+    },
+    data: dataPayload,
     android: {
       priority: 'high',
       ttl: 120000,
-      collapseKey: 'booking_' + bookingIdStr,
+      collapseKey: `booking_${bookingId}`,
       notification: {
         channelId: 'bookings_alarm',
         sound: 'booking_alarm',
@@ -337,9 +239,9 @@ async function sendHybridAlarmFCM(provider, booking) {
         vibrateTimingsMillis: [0, 1000, 500, 1000, 500, 1000],
         notificationPriority: 'PRIORITY_MAX',
         color: '#EF4444',
-        title: fcmTitle,
-        body: fcmBody,
-      }
+        title: title,
+        body: body,
+      },
     },
     apns: {
       headers: {
@@ -350,93 +252,72 @@ async function sendHybridAlarmFCM(provider, booking) {
         aps: {
           sound: 'booking_alarm.caf',
           'interruption-level': 'time-sensitive',
-          alert: { title: fcmTitle, body: fcmBody }
-        }
-      }
-    }
+          alert: {
+            title: title,
+            body: body,
+          },
+        },
+      },
+    },
   };
 
   try {
     console.log('📲 Sending FCM via messaging.send()...');
-    const messageId = await messaging.send(message);
-    console.log('✅ HYBRID ALARM FCM SENT! ID: ' + messageId);
-    return { success: true, messageId: messageId, method: 'hybrid_alarm' };
+    console.log('📲 Payload data keys:', Object.keys(dataPayload).join(', '));
+    const response = await messaging.send(message);
+    console.log('✅ HYBRID ALARM FCM SENT! messageId:', response);
+    return { success: true, messageId: response };
   } catch (err) {
-    const msg = err && err.message ? err.message : String(err);
-    console.error('❌ FCM FAILED: ' + msg);
-    return { success: false, error: msg };
+    console.error('❌ FCM send() failed:', err.message);
+    console.error('❌ Error code:', err.code);
+    if (err.errorInfo) console.error('❌ ErrorInfo:', JSON.stringify(err.errorInfo));
+    return { success: false, error: err.message, code: err.code };
   }
 }
 
 // ============================================================
-// 📲 CANCELLATION FCM to old provider
+// CANCEL OLD PROVIDER FCM (silent data-only)
 // ============================================================
-async function sendCancellationFCM(oldProvider, bookingId) {
-  if (!oldProvider || !oldProvider.fcmToken || typeof oldProvider.fcmToken !== 'string' || oldProvider.fcmToken.length < 10) return;
-  const messaging = await getProviderMessaging();
-  if (!messaging) return;
+async function sendCancellationFCM(fcmToken, bookingId, reason) {
+  const messaging = getProviderMessaging();
+  if (!messaging) return { success: false };
+
+  const message = {
+    token: fcmToken,
+    data: stringifyAll({
+      type: 'booking_cancelled_by_admin',
+      bookingId: String(bookingId),
+      reason: reason || 'Admin re-assigned',
+      _source: 'fcm',
+      _sentAt: Date.now(),
+    }),
+    android: { priority: 'high' },
+  };
+
   try {
-    await messaging.send({
-      token: oldProvider.fcmToken,
-      notification: { title: '❌ Booking Cancelled', body: 'Reassigned by admin' },
-      data: {
-        type: 'booking_cancelled', bookingId: String(bookingId),
-        reason: 'admin_reassigned', channelId: 'default',
-        _source: 'fcm', _sentAt: String(Date.now()),
-        title: '❌ Booking Cancelled', body: 'Reassigned by admin',
-      },
-      android: { priority: 'high', ttl: 30000 },
-    });
-    console.log('✅ Cancellation sent to ' + oldProvider.name);
-  } catch (e) { console.warn('⚠️ Cancel FCM: ' + e.message); }
+    const res = await messaging.send(message);
+    console.log('✅ Cancellation FCM sent:', res);
+    return { success: true };
+  } catch (e) {
+    console.error('⚠️ Cancellation FCM failed:', e.message);
+    return { success: false, error: e.message };
+  }
 }
 
 // ============================================================
-// HELPERS
+// MODELS
 // ============================================================
-function emitToAdmins(event, data) {
-  try { const le = require('../services/liveEmitter'); if (le && le.emitToAdmins) { le.emitToAdmins(event, data); return; } } catch (e) {}
-  try { const le = require('../utils/liveEmitter'); if (le && le.emitToAdmins) { le.emitToAdmins(event, data); return; } } catch (e) {}
-  try { const io = require('../socket'); const inst = io.getIO ? io.getIO() : io; if (inst && inst.to) inst.to('admins').emit(event, data); } catch (e) {}
+function Bookings() {
+  return getModel('bookings_db', 'Booking', {}) || getModel('user_db', 'Booking', {});
 }
-
-function normalizeProvider(doc) {
-  if (!doc) return null;
-  const p = doc.toObject ? doc.toObject() : doc;
-  const r = p.rating;
-  let rating = 0, rc = 0;
-  if (r && typeof r === 'object') { rating = r.average || r.rating || 0; rc = r.count || 0; }
-  else if (typeof r === 'number') { rating = r; }
-  let img = p.profilePicture || p.profileImage || p.profilePic || '';
-  if (!img && p.selfieImage) img = typeof p.selfieImage === 'string' ? p.selfieImage : (p.selfieImage.url || '');
-  return {
-    _id: String(p._id), providerId: p.providerId || '', name: p.name || 'Unknown',
-    phone: p.phone || '', email: p.email || '', profession: p.profession || p.categoryName || '',
-    categoryName: p.categoryName || '', categoryId: p.categoryId ? String(p.categoryId) : '',
-    city: p.city || '', isAvailable: p.isAvailable !== false,
-    isAcceptingJobs: p.isAcceptingJobs !== false, isBusy: p.isBusy === true,
-    isOnline: p.isOnline !== false, verificationStatus: p.verificationStatus || 'pending',
-    isVerified: p.isVerified === true || p.verificationStatus === 'approved',
-    rating: Math.round(rating * 10) / 10, ratingCount: rc,
-    completedJobs: p.completedJobs || 0, profileImage: img,
-    hasFcmToken: !!(p.fcmToken && typeof p.fcmToken === 'string' && p.fcmToken.length > 10),
-    gender: p.gender || ''
-  };
+function Providers() {
+  return getModel('admin_panel', 'Provider', {}) || getModel('provider_db', 'Provider', {});
 }
-
-function normalizeBooking(doc) {
-  if (!doc) return null;
-  const b = doc.toObject ? doc.toObject() : doc;
-  return {
-    _id: String(b._id), bookingId: b.bookingId || String(b._id),
-    customerName: b.customerName || b.customerPhone || 'Customer',
-    customerPhone: b.customerPhone || '', serviceName: b.serviceName || '',
-    categoryName: b.categoryName || '', address: b.address || '',
-    city: b.city || '', totalAmount: b.totalAmount || 0,
-    status: b.status || 'unknown', bookingType: b.bookingType || 'regular',
-    scheduledDate: b.scheduledDate || '', scheduledTime: b.scheduledTime || '',
-    createdAt: b.createdAt || new Date(), providerId: b.providerId ? String(b.providerId) : null
-  };
+function ProviderOffers() {
+  return getModel('bookings_db', 'ProviderOffer', {}) || getModel('admin_panel', 'ProviderOffer', {});
+}
+function DispatchJobs() {
+  return getModel('bookings_db', 'DispatchJob', {}) || getModel('admin_panel', 'DispatchJob', {});
 }
 
 // ============================================================
@@ -444,20 +325,36 @@ function normalizeBooking(doc) {
 // ============================================================
 exports.getOnlineProviders = async (req, res) => {
   try {
-    const Provider = getProviderModel();
-    if (!Provider) return res.status(500).json({ success: false, message: 'Provider model unavailable' });
-    const showAll = req.query.all === '1' || req.query.all === 'true';
-    const search = (req.query.search || '').trim().toLowerCase();
+    const Provider = Providers();
+    if (!Provider) return res.json({ success: true, providers: [] });
+
+    const includeAll = req.query.all === '1' || req.query.all === 'true';
+    const search = (req.query.search || '').trim();
     const category = (req.query.category || '').trim();
-    const query = { isActive: { $ne: false } };
-    if (!showAll) query.$or = [{ isAvailable: true }, { isOnline: true }, { isAcceptingJobs: true }];
-    if (search) { query.$and = query.$and || []; query.$and.push({ $or: [{ name: { $regex: search, $options: 'i' } }, { phone: { $regex: search, $options: 'i' } }, { providerId: { $regex: search, $options: 'i' } }] }); }
-    if (category) { query.$and = query.$and || []; query.$and.push({ $or: [{ categoryName: { $regex: category, $options: 'i' } }, { profession: { $regex: category, $options: 'i' } }] }); }
-    const providers = await Provider.find(query).sort({ isAvailable: -1, lastOnlineAt: -1 }).limit(200).lean();
-    const normalized = providers.map(normalizeProvider).filter(Boolean);
-    console.log('📊 Returned ' + normalized.length + ' providers');
-    res.json({ success: true, count: normalized.length, providers: normalized });
-  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+
+    const q = {};
+    if (!includeAll) {
+      q.$or = [
+        { isOnline: true },
+        { online: true },
+        { isAvailable: true },
+      ];
+    }
+    if (search) {
+      const rx = new RegExp(search, 'i');
+      q.$and = [{ $or: [{ name: rx }, { phone: rx }, { email: rx }, { providerId: rx }] }];
+    }
+    if (category) {
+      q.$and = (q.$and || []).concat([{ $or: [{ profession: new RegExp(category, 'i') }, { category: new RegExp(category, 'i') }] }]);
+    }
+
+    const docs = await Provider.find(q).limit(500).lean();
+    console.log(`📊 Returned ${docs.length} providers`);
+    return res.json({ success: true, providers: docs });
+  } catch (err) {
+    console.error('❌ getOnlineProviders:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
 };
 
 // ============================================================
@@ -465,157 +362,275 @@ exports.getOnlineProviders = async (req, res) => {
 // ============================================================
 exports.getDispatchableBookings = async (req, res) => {
   try {
-    const Booking = getBookingModel();
-    if (!Booking) return res.status(500).json({ success: false, message: 'Booking model unavailable' });
-    const bookings = await Booking.find({ status: { $in: ['confirmed', 'searching', 'no_provider_found', 'pending', 'assigned', 'accepted', 'in_progress'] } }).sort({ createdAt: -1 }).limit(200).lean();
-    const normalized = bookings.map(normalizeBooking).filter(Boolean);
-    console.log('📊 Returned ' + normalized.length + ' bookings');
-    res.json({ success: true, count: normalized.length, bookings: normalized });
-  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
-};
+    const Booking = Bookings();
+    if (!Booking) return res.json({ success: true, bookings: [] });
 
-// ============================================================
-// 🚨 FORCE RE-DISPATCH
-// ============================================================
-exports.send = async (req, res) => {
-  console.log('\n' + '='.repeat(60));
-  console.log('📨 FORCE RE-DISPATCH');
-  console.log('📦 Body:', JSON.stringify(req.body));
-  console.log('='.repeat(60));
+    const docs = await Booking.find({
+      status: { $nin: ['completed', 'cancelled', 'cancelled_by_user'] },
+    })
+      .sort({ createdAt: -1 })
+      .limit(200)
+      .lean();
 
-  try {
-    const { bookingId, providerId, adminNote } = req.body;
-    if (!bookingId || !providerId) return res.status(400).json({ success: false, message: 'bookingId and providerId required' });
-
-    const Booking = getBookingModel();
-    const Provider = getProviderModel();
-    const Offer = getOfferModel();
-    const DispatchJob = getDispatchJobModel();
-    if (!Booking || !Provider) return res.status(500).json({ success: false, message: 'DB models unavailable' });
-
-    let booking = null;
-    if (mongoose.Types.ObjectId.isValid(bookingId)) booking = await Booking.findById(bookingId);
-    if (!booking) booking = await Booking.findOne({ $or: [{ bookingId: bookingId }, { orderId: bookingId }] });
-    if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
-
-    const oldStatus = booking.status;
-    const oldProviderId = booking.providerId;
-
-    let newProvider = null;
-    if (mongoose.Types.ObjectId.isValid(providerId)) newProvider = await Provider.findById(providerId);
-    if (!newProvider) newProvider = await Provider.findOne({ providerId: providerId });
-    if (!newProvider) return res.status(404).json({ success: false, message: 'Provider not found' });
-
-    console.log('📋 Booking: ' + booking._id + ' | Status: ' + oldStatus);
-    console.log('🎯 Target: ' + newProvider.name + ' | FCM token: ' + (newProvider.fcmToken ? newProvider.fcmToken.substring(0, 15) + '...' : 'NONE'));
-
-    if (!newProvider.fcmToken || typeof newProvider.fcmToken !== 'string' || newProvider.fcmToken.length < 10) {
-      return res.status(400).json({ success: false, message: 'Provider has no FCM token' });
-    }
-
-    // CANCEL OLD PROVIDER
-    if (oldProviderId && String(oldProviderId) !== String(newProvider._id)) {
-      try {
-        const oldP = await Provider.findById(oldProviderId);
-        if (oldP) {
-          console.log('🔄 Cancelling old: ' + oldP.name);
-          await sendCancellationFCM(oldP, booking._id);
-          if (Offer) await Offer.updateMany({ bookingId: booking._id, providerId: oldP._id, status: { $in: ['pending', 'accepted', 'sent'] } }, { $set: { status: 'cancelled', respondedAt: new Date() } });
-          await Provider.findByIdAndUpdate(oldP._id, { $set: { currentBookingId: null, isBusy: false, isAvailable: true } });
-        }
-      } catch (e) { console.warn('⚠️ Cancel old: ' + e.message); }
-    }
-
-    // SUPERSEDE
-    if (Offer) { try { await Offer.updateMany({ bookingId: booking._id, status: { $in: ['pending', 'sent', 'dispatched'] } }, { $set: { status: 'superseded', respondedAt: new Date() } }); } catch (e) {} }
-
-    // RESET BOOKING
-    try {
-      await Booking.findByIdAndUpdate(booking._id, { $set: { status: 'searching', providerId: newProvider._id, updatedAt: new Date() } });
-      console.log('🔄 Status: ' + oldStatus + ' → searching');
-    } catch (e) {}
-
-    // CREATE OFFER
-    const expiresAt = new Date(Date.now() + DISPATCH_TIMEOUT_MS);
-    let offer = null;
-    if (Offer) { try { offer = await Offer.create({ bookingId: booking._id, providerId: newProvider._id, status: 'pending', source: 'manual_admin', expiresAt: expiresAt }); console.log('📝 Offer: ' + offer._id); } catch (e) {} }
-
-    // CREATE JOB
-    let dispatchJob = null;
-    if (DispatchJob) {
-      for (const s of ['pending', 'active', 'dispatched', 'searching', 'sent']) {
-        try { dispatchJob = await DispatchJob.create({ bookingId: booking._id, providerId: newProvider._id, offerId: offer ? offer._id : null, status: s, source: 'manual_admin', dispatchedAt: new Date(), expiresAt: expiresAt }); break; } catch (e) { if (e.message && e.message.indexOf('enum') !== -1) continue; break; }
-      }
-    }
-
-    // 🔥 SEND HYBRID ALARM FCM
-    console.log('📲 Sending HYBRID ALARM FCM...');
-    const fcmResult = await sendHybridAlarmFCM(newProvider, booking);
-
-    if (dispatchJob && DispatchJob) { try { await DispatchJob.findByIdAndUpdate(dispatchJob._id, { $set: { fcmMessageId: fcmResult.messageId || '', result: fcmResult.success ? 'sent' : 'fcm_failed' } }); } catch (e) {} }
-
-    emitToAdmins('manual-dispatch:sent', { bookingId: String(booking._id), providerName: newProvider.name, fcmSent: fcmResult.success });
-
-    if (offer && Offer) {
-      setTimeout(async () => {
-        try {
-          const cur = await Offer.findById(offer._id);
-          if (cur && cur.status === 'pending') {
-            await Offer.findByIdAndUpdate(offer._id, { $set: { status: 'timeout', respondedAt: new Date() } });
-            const cb = await Booking.findById(booking._id);
-            if (cb && cb.status === 'searching') await Booking.findByIdAndUpdate(booking._id, { $set: { status: 'no_provider_found', providerId: null } });
-            emitToAdmins('manual-dispatch:timeout', { bookingId: String(booking._id) });
-          }
-        } catch (e) {}
-      }, DISPATCH_TIMEOUT_MS + 2000);
-    }
-
-    console.log('✅ FCM: ' + (fcmResult.success ? 'SENT ✅' : 'FAILED ❌ ' + fcmResult.error));
-    console.log('='.repeat(60) + '\n');
-
-    res.json({
-      success: true,
-      message: fcmResult.success ? 'Hybrid alarm sent!' : 'FCM failed: ' + fcmResult.error,
-      data: { offerId: offer ? String(offer._id) : null, bookingId: String(booking._id), providerName: newProvider.name, fcmSent: fcmResult.success, fcmError: fcmResult.success ? null : fcmResult.error, oldStatus: oldStatus, newStatus: 'searching' }
-    });
+    console.log(`📊 Returned ${docs.length} bookings`);
+    return res.json({ success: true, bookings: docs });
   } catch (err) {
-    console.error('❌ Error: ' + err.message, err.stack);
-    res.status(500).json({ success: false, message: err.message });
+    console.error('❌ getDispatchableBookings:', err);
+    return res.status(500).json({ success: false, error: err.message });
   }
 };
 
-exports.getOfferStatus = async (req, res) => {
+// ============================================================
+// SEND / FORCE RE-DISPATCH
+// ============================================================
+exports.send = async (req, res) => {
+  console.log('\n============================================================');
+  console.log('📨 FORCE RE-DISPATCH');
+  console.log('📦 Body:', JSON.stringify(req.body));
+  console.log('============================================================');
+
   try {
-    const Offer = getOfferModel();
-    if (!Offer) return res.status(500).json({ success: false, message: 'Offer model unavailable' });
-    const offer = await Offer.findById(req.params.offerId).lean();
-    if (!offer) return res.status(404).json({ success: false, message: 'Offer not found' });
-    res.json({ success: true, offer: { _id: String(offer._id), status: offer.status, respondedAt: offer.respondedAt, expiresAt: offer.expiresAt } });
-  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+    const { bookingId, providerId, adminNote } = req.body || {};
+    if (!bookingId || !providerId) {
+      return res.status(400).json({ success: false, error: 'bookingId and providerId required' });
+    }
+
+    const Booking = Bookings();
+    const Provider = Providers();
+    const Offer = ProviderOffers();
+    const Job = DispatchJobs();
+
+    // Find booking
+    let booking = null;
+    try {
+      booking = await Booking.findById(bookingId).lean();
+    } catch {
+      booking = await Booking.findOne({ _id: bookingId }).lean();
+    }
+    if (!booking) {
+      return res.status(404).json({ success: false, error: 'Booking not found' });
+    }
+
+    // Find provider — try multiple identifiers
+    let provider = null;
+    try {
+      if (mongoose.Types.ObjectId.isValid(providerId)) {
+        provider = await Provider.findById(providerId).lean();
+      }
+    } catch {}
+    if (!provider) {
+      provider = await Provider.findOne({
+        $or: [{ providerId }, { phone: providerId }, { email: providerId }],
+      }).lean();
+    }
+    if (!provider) {
+      return res.status(404).json({ success: false, error: 'Provider not found' });
+    }
+
+    const fcmToken = provider.fcmToken || provider.deviceToken || provider.token || '';
+    console.log(`📋 Booking: ${booking._id} | Status: ${booking.status}`);
+    console.log(`🎯 Target: ${provider.name || provider.providerId} | FCM token: ${fcmToken ? fcmToken.substring(0, 15) + '...' : 'MISSING'}`);
+
+    if (!fcmToken) {
+      return res.status(400).json({ success: false, error: 'Target provider has no FCM token' });
+    }
+
+    // Cancel old provider if assigned
+    const oldProviderId = booking.providerId || booking.assignedProvider || booking.provider;
+    if (oldProviderId && String(oldProviderId) !== String(provider._id)) {
+      try {
+        const oldProvider = await Provider.findOne({
+          $or: [{ _id: oldProviderId }, { providerId: oldProviderId }],
+        }).lean();
+        if (oldProvider && oldProvider.fcmToken) {
+          await sendCancellationFCM(oldProvider.fcmToken, bookingId, 'Admin re-assigned to another provider');
+        }
+      } catch (e) {
+        console.error('⚠️ Could not cancel old provider:', e.message);
+      }
+    }
+
+    // Supersede existing offers
+    try {
+      await Offer.updateMany(
+        { bookingId: booking._id, status: { $in: ['pending', 'sent', 'active'] } },
+        { $set: { status: 'superseded', supersededAt: new Date() } }
+      );
+      console.log('🔄 Superseded old offers');
+    } catch (e) {
+      console.error('⚠️ Supersede failed:', e.message);
+    }
+
+    // Reset booking to searching
+    try {
+      await Booking.updateOne(
+        { _id: booking._id },
+        {
+          $set: {
+            status: 'searching',
+            dispatchMode: 'manual_admin',
+            lastManualDispatchAt: new Date(),
+          },
+          $unset: { providerId: '', assignedProvider: '', provider: '' },
+        }
+      );
+    } catch (e) {
+      console.error('⚠️ Booking reset failed:', e.message);
+    }
+
+    // Create new offer
+    const expiresAt = new Date(Date.now() + 30 * 1000);
+    const offer = await Offer.create({
+      bookingId: booking._id,
+      providerId: provider._id,
+      providerCode: provider.providerId,
+      status: 'pending',
+      source: 'manual_admin',
+      adminNote: adminNote || '',
+      expiresAt,
+      createdAt: new Date(),
+    });
+    console.log(`📝 Offer: ${offer._id}`);
+
+    // Create dispatch job
+    const jobStatuses = ['pending', 'active', 'dispatched', 'searching', 'sent', 'waiting'];
+    let job = null;
+    for (const st of jobStatuses) {
+      try {
+        job = await Job.create({
+          bookingId: booking._id,
+          providerId: provider._id,
+          status: st,
+          source: 'manual_admin',
+          expiresAt,
+          createdAt: new Date(),
+        });
+        console.log(`📝 DispatchJob status=${st}`);
+        break;
+      } catch (e) {
+        // try next
+      }
+    }
+
+    // Send FCM
+    const fcmResult = await sendHybridAlarmFCM(fcmToken, booking, provider);
+
+    // Socket emit
+    try {
+      const io = req.app.get('io');
+      if (io) {
+        const payload = {
+          offerId: offer._id,
+          bookingId: booking._id,
+          providerId: provider._id,
+          providerName: provider.name,
+          fcm: fcmResult,
+        };
+        const room = io.sockets.adapter.rooms.get('admins');
+        const n = room ? room.size : 0;
+        console.log(`📡 [LiveEmitter] Emitting "manual-dispatch:sent" to room "admins" (${n} sockets)`);
+        io.to('admins').emit('manual-dispatch:sent', payload);
+        const total = io.sockets.sockets.size;
+        console.log(`📡 [LiveEmitter] Emitting "manual-dispatch:sent" GLOBALLY (${total} total sockets)`);
+        io.emit('manual-dispatch:sent', payload);
+      }
+    } catch (e) {
+      console.error('⚠️ Socket emit failed:', e.message);
+    }
+
+    // Setup 30s timeout
+    setTimeout(async () => {
+      try {
+        const current = await Offer.findById(offer._id).lean();
+        if (current && current.status === 'pending') {
+          await Offer.updateOne({ _id: offer._id }, { $set: { status: 'timeout', timedOutAt: new Date() } });
+          if (job) {
+            await Job.updateOne({ _id: job._id }, { $set: { status: 'timeout' } });
+          }
+          await Booking.updateOne(
+            { _id: booking._id, status: 'searching' },
+            { $set: { status: 'no_provider_found' } }
+          );
+          console.log(`⏰ Offer ${offer._id} TIMEOUT`);
+
+          try {
+            const io = req.app.get('io');
+            if (io) io.emit('manual-dispatch:timeout', { offerId: offer._id, bookingId: booking._id });
+          } catch {}
+        }
+      } catch (e) {
+        console.error('⚠️ Timeout handler failed:', e.message);
+      }
+    }, 30 * 1000);
+
+    console.log(`✅ FCM: ${fcmResult.success ? 'SENT ✅ ' + fcmResult.messageId : 'FAILED ❌ ' + fcmResult.error}`);
+    console.log('============================================================\n');
+
+    return res.json({
+      success: true,
+      offer: {
+        _id: offer._id,
+        bookingId: booking._id,
+        providerId: provider._id,
+        expiresAt,
+      },
+      fcm: fcmResult,
+    });
+  } catch (err) {
+    console.error('❌ send fatal:', err);
+    console.error(err.stack);
+    return res.status(500).json({ success: false, error: err.message });
+  }
 };
 
-exports.debugConnections = async (req, res) => {
+// ============================================================
+// OFFER STATUS POLL
+// ============================================================
+exports.getOfferStatus = async (req, res) => {
   try {
-    let fbInfo = { status: 'not_checked', version: 'unknown', apps: 0, credentialExists: false };
-    try {
-      const a = require('firebase-admin');
-      fbInfo.version = a.SDK_VERSION || 'unknown';
-      fbInfo.apps = a.apps ? a.apps.length : 0;
-      fbInfo.credentialExists = !!(a.credential);
-      fbInfo.status = fbInfo.apps > 0 ? 'initialized' : 'no apps';
-    } catch (e) { fbInfo.status = 'not installed'; }
+    const { offerId } = req.params;
+    const Offer = ProviderOffers();
+    if (!Offer) return res.json({ success: true, offer: null });
 
-    const sa = loadServiceAccount();
-    const messaging = await getProviderMessaging();
+    const offer = await Offer.findById(offerId).lean();
+    if (!offer) return res.json({ success: true, offer: null });
 
-    res.json({
-      success: true, firebase: fbInfo,
-      serviceAccountFound: !!sa,
-      serviceAccountProject: sa ? sa.project_id : 'none',
-      messagingReady: !!messaging,
-      fcmFormat: 'HYBRID ALARM',
-      channelId: 'bookings_alarm', sound: 'booking_alarm',
-      timestamp: new Date().toISOString()
-    });
-  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+    return res.json({ success: true, offer });
+  } catch (err) {
+    console.error('❌ getOfferStatus:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+};
+
+// ============================================================
+// DEBUG
+// ============================================================
+exports.debug = async (req, res) => {
+  const info = {
+    env: {
+      hasB64: !!process.env.PROVIDER_FIREBASE_SERVICE_ACCOUNT_BASE64,
+      hasJSON: !!process.env.PROVIDER_FIREBASE_SERVICE_ACCOUNT_JSON,
+    },
+    firebase: {
+      appsCount: Array.isArray(firebaseAdmin.apps) ? firebaseAdmin.apps.length : 0,
+      appNames: Array.isArray(firebaseAdmin.apps) ? firebaseAdmin.apps.map(a => a && a.name) : [],
+      hasCredentialCert: !!(firebaseAdmin.credential && firebaseAdmin.credential.cert),
+    },
+    db: {
+      connections: mongoose.connections.map(c => ({ name: c.name, readyState: c.readyState })),
+    },
+  };
+
+  // Try to init
+  const messaging = getProviderMessaging();
+  info.messagingInitialized = !!messaging;
+
+  return res.json(info);
+};
+
+// ============================================================
+// HEALTH
+// ============================================================
+exports._health = async (req, res) => {
+  return res.json({ ok: true, time: new Date().toISOString() });
 };
