@@ -6,56 +6,76 @@
 
 const mongoose = require('mongoose');
 const admin = require('firebase-admin');
-const { cert } = require('firebase-admin/app');
+
+// Try to import modular cert (firebase-admin v12+)
+let modularCert = null;
+try {
+  const mod = require('firebase-admin/app');
+  modularCert = mod.cert;
+} catch (e) {}
 
 // ═══════════════════════════════════════════════════════════════
 // 🔧 DB CONNECTIONS HELPER
 // ═══════════════════════════════════════════════════════════════
 function getAllConnections() {
   const connections = [];
+  const seen = new Set();
+
+  // Try database config exports
   try {
     const dbConfig = require('../config/database');
-    const dbNames = [
-      'admin_panel',
-      'provider_db',
-      'user_db',
-      'bookings_db',
-      'tracking_db',
-      'trackingprovider_db',
+    const getterNames = [
+      'getAdminConnection',
+      'getProviderConnection',
+      'getUserConnection',
+      'getBookingConnection',
+      'getTrackingConnection',
+      'getTrackingProviderConnection',
     ];
-    for (const name of dbNames) {
+    const nameMap = {
+      getAdminConnection: 'admin_panel',
+      getProviderConnection: 'provider_db',
+      getUserConnection: 'user_db',
+      getBookingConnection: 'bookings_db',
+      getTrackingConnection: 'tracking_db',
+      getTrackingProviderConnection: 'trackingprovider_db',
+    };
+    for (const getter of getterNames) {
       try {
-        const getterName = `get${name.charAt(0).toUpperCase() + name.slice(1).replace(/_([a-z])/g, (_, c) => c.toUpperCase())}Connection`;
-        if (typeof dbConfig[getterName] === 'function') {
-          const conn = dbConfig[getterName]();
-          if (conn?.db) connections.push({ name, conn });
+        if (typeof dbConfig[getter] === 'function') {
+          const conn = dbConfig[getter]();
+          if (conn?.db && !seen.has(conn)) {
+            seen.add(conn);
+            connections.push({ name: nameMap[getter] || conn.name || 'unknown', conn });
+          }
         }
       } catch (e) {}
     }
   } catch (e) {}
 
   // Fallback: scan mongoose.connections
-  if (connections.length === 0) {
+  try {
     for (const conn of mongoose.connections) {
-      if (conn?.db && conn?.name) {
-        connections.push({ name: conn.name, conn });
+      if (conn?.db && !seen.has(conn)) {
+        seen.add(conn);
+        connections.push({ name: conn.name || 'default', conn });
       }
     }
-  }
+  } catch (e) {}
 
-  // Also include default connection
-  if (mongoose.connection?.db) {
-    const exists = connections.some((c) => c.conn === mongoose.connection);
-    if (!exists) {
+  // Default connection
+  try {
+    if (mongoose.connection?.db && !seen.has(mongoose.connection)) {
+      seen.add(mongoose.connection);
       connections.push({ name: mongoose.connection.name || 'default', conn: mongoose.connection });
     }
-  }
+  } catch (e) {}
 
   return connections;
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 🔍 FIND IN ALL DBs (with sort + limit support)
+// 🔍 FIND IN ALL DBs (with sort + limit)
 // ═══════════════════════════════════════════════════════════════
 async function findInAllDbs(collectionNames, query = {}, options = {}) {
   const connections = getAllConnections();
@@ -87,7 +107,7 @@ async function findInAllDbs(collectionNames, query = {}, options = {}) {
           }
         }
       } catch (e) {
-        // collection doesn't exist in this db, skip
+        // collection doesn't exist in this db
       }
     }
   }
@@ -158,7 +178,7 @@ async function updateInAllDbs(collectionNames, query, update) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 🔥 FIREBASE PROVIDER APP (for sending FCM to providers)
+// 🔥 FIREBASE PROVIDER APP
 // ═══════════════════════════════════════════════════════════════
 let providerApp = null;
 
@@ -166,7 +186,7 @@ function getProviderFirebaseApp() {
   if (providerApp) return providerApp;
 
   try {
-    const existing = admin.apps.find((a) => a?.name === 'provider');
+    const existing = admin.apps.find((a) => a && a.name === 'provider');
     if (existing) {
       providerApp = existing;
       return providerApp;
@@ -180,33 +200,31 @@ function getProviderFirebaseApp() {
       process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
 
     if (base64) {
-      console.log('✅ Loading Firebase credentials from PROVIDER_FIREBASE_SERVICE_ACCOUNT_BASE64 (base64)');
       const jsonStr = Buffer.from(base64, 'base64').toString('utf-8');
       serviceAccount = JSON.parse(jsonStr);
     } else {
-      const path = process.env.PROVIDER_FIREBASE_SERVICE_ACCOUNT_PATH;
-      if (path) {
-        serviceAccount = require(path);
-      }
+      const p = process.env.PROVIDER_FIREBASE_SERVICE_ACCOUNT_PATH;
+      if (p) serviceAccount = require(p);
     }
 
     if (!serviceAccount) {
-      throw new Error('No Firebase service account found');
+      console.warn('⚠️ No Firebase provider service account found');
+      return null;
     }
 
-    // Try two approaches — admin.credential first, then modular cert()
     let credential;
     try {
       credential = admin.credential.cert(serviceAccount);
-    } catch (e) {
-      credential = cert(serviceAccount);
+    } catch (e1) {
+      if (modularCert) {
+        credential = modularCert(serviceAccount);
+      } else {
+        throw e1;
+      }
     }
 
     providerApp = admin.initializeApp(
-      {
-        credential,
-        projectId: serviceAccount.project_id,
-      },
+      { credential, projectId: serviceAccount.project_id },
       'provider'
     );
 
@@ -219,7 +237,7 @@ function getProviderFirebaseApp() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 🛠️ STRINGIFY ALL (FCM data must be string-only)
+// 🛠️ STRINGIFY ALL (FCM data must be strings)
 // ═══════════════════════════════════════════════════════════════
 function stringifyAll(obj) {
   const out = {};
@@ -228,7 +246,7 @@ function stringifyAll(obj) {
     if (val === null || val === undefined) {
       out[key] = '';
     } else if (typeof val === 'object') {
-      out[key] = JSON.stringify(val);
+      try { out[key] = JSON.stringify(val); } catch { out[key] = ''; }
     } else {
       out[key] = String(val);
     }
@@ -237,14 +255,13 @@ function stringifyAll(obj) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 📡 GET ONLINE PROVIDERS (sorted by recent — newest first)
+// 📡 GET ONLINE PROVIDERS
 // ═══════════════════════════════════════════════════════════════
 exports.getOnlineProviders = async (req, res) => {
   try {
     const { all, search, category } = req.query;
     const includeAll = all === '1' || all === 'true';
 
-    // Build base query
     let query = {};
     if (!includeAll) {
       query = {
@@ -258,7 +275,6 @@ exports.getOnlineProviders = async (req, res) => {
       };
     }
 
-    // Category filter (only non-empty string)
     if (category && typeof category === 'string' && category.trim().length > 0) {
       const catRegex = new RegExp(category.trim(), 'i');
       const catFilter = {
@@ -272,65 +288,42 @@ exports.getOnlineProviders = async (req, res) => {
       query = includeAll ? catFilter : { $and: [query, catFilter] };
     }
 
-    console.log(
-      `🔍 [getOnlineProviders] Query:`,
-      JSON.stringify(query),
-      'includeAll:',
-      includeAll
-    );
+    console.log(`🔍 [getOnlineProviders] Query:`, JSON.stringify(query), 'includeAll:', includeAll);
 
-    // ✅ SORT BY RECENT: createdAt DESC first
-    const providers = await findInAllDbs(
+    let providers = await findInAllDbs(
       ['providers', 'serviceproviders', 'provider'],
       query,
-      {
-        sort: { createdAt: -1, updatedAt: -1, lastSeen: -1, _id: -1 },
-        limit: 500,
-      }
+      { sort: { createdAt: -1, updatedAt: -1, lastSeen: -1, _id: -1 }, limit: 500 }
     );
 
-    // Fallback: if 0 results with filter, retry empty
-    let finalProviders = providers;
     if (!includeAll && providers.length === 0) {
-      console.log('⚠️ No online providers found, retrying with empty query...');
-      finalProviders = await findInAllDbs(
+      console.log('⚠️ No online providers — retrying with empty query...');
+      providers = await findInAllDbs(
         ['providers', 'serviceproviders', 'provider'],
         {},
-        {
-          sort: { createdAt: -1, updatedAt: -1, _id: -1 },
-          limit: 500,
-        }
+        { sort: { createdAt: -1, updatedAt: -1, _id: -1 }, limit: 500 }
       );
     }
 
-    // Search filter (in-memory)
-    let filtered = finalProviders;
+    let filtered = providers;
     if (search && typeof search === 'string' && search.trim().length > 0) {
       const s = search.trim().toLowerCase();
-      filtered = finalProviders.filter((p) => {
+      filtered = providers.filter((p) => {
         const name = (p.name || p.fullName || p.providerName || '').toLowerCase();
         const phone = (p.phone || p.mobile || p.phoneNumber || '').toLowerCase();
         const email = (p.email || '').toLowerCase();
-        const pid = (p.providerId || p.providerCode || p.id || '').toString().toLowerCase();
+        const pid = String(p.providerId || p.providerCode || p.id || '').toLowerCase();
         const prof = (p.profession || p.category || p.categoryName || '').toLowerCase();
-        return (
-          name.includes(s) ||
-          phone.includes(s) ||
-          email.includes(s) ||
-          pid.includes(s) ||
-          prof.includes(s)
-        );
+        return name.includes(s) || phone.includes(s) || email.includes(s) || pid.includes(s) || prof.includes(s);
       });
     }
 
-    // ✅ RE-SORT in-memory (safety net — handles missing createdAt)
     filtered.sort((a, b) => {
-      const aTime = new Date(a.createdAt || a.updatedAt || a.lastSeen || 0).getTime();
-      const bTime = new Date(b.createdAt || b.updatedAt || b.lastSeen || 0).getTime();
-      return bTime - aTime; // DESC = newest first
+      const aT = new Date(a.createdAt || a.updatedAt || a.lastSeen || 0).getTime();
+      const bT = new Date(b.createdAt || b.updatedAt || b.lastSeen || 0).getTime();
+      return bT - aT;
     });
 
-    // Format response
     const formatted = filtered.map((p) => ({
       _id: p._id,
       id: p._id,
@@ -340,7 +333,7 @@ exports.getOnlineProviders = async (req, res) => {
       email: p.email || '',
       profession: p.profession || p.category || p.categoryName || '',
       category: p.category || p.profession || '',
-      city: p.city || p.address?.city || '',
+      city: p.city || (p.address && p.address.city) || '',
       isOnline: !!(p.isOnline || p.online || p.isAvailable || p.status === 'online'),
       isApproved: !!(p.isApproved || p.approved || p.status === 'approved'),
       rating: p.rating || p.avgRating || 0,
@@ -371,63 +364,57 @@ exports.getOnlineProviders = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// 📡 GET DISPATCHABLE BOOKINGS (sorted by recent — newest first)
+// 📡 GET DISPATCHABLE BOOKINGS
 // ═══════════════════════════════════════════════════════════════
 exports.getDispatchableBookings = async (req, res) => {
   try {
     const { search, status, limit } = req.query;
     const maxLimit = Math.min(parseInt(limit) || 300, 500);
 
-    // ✅ SORT BY RECENT first
-    const bookings = await findInAllDbs(
+    let bookings = await findInAllDbs(
       ['bookings', 'Booking'],
       {},
       {
         sort: { createdAt: -1, updatedAt: -1, scheduledDate: -1, _id: -1 },
-        limit: maxLimit * 2, // extra for dedup
+        limit: maxLimit * 2,
       }
     );
 
-    // Status filter
     let filtered = bookings;
     if (status && typeof status === 'string' && status.trim().length > 0) {
       const s = status.trim().toLowerCase();
       filtered = bookings.filter((b) => (b.status || '').toLowerCase() === s);
     }
 
-    // Search filter
     if (search && typeof search === 'string' && search.trim().length > 0) {
       const q = search.trim().toLowerCase();
       filtered = filtered.filter((b) => {
-        const bid = (b.bookingId || b._id || '').toString().toLowerCase();
-        const customer = (b.customerName || b.userName || b.user?.name || '').toLowerCase();
-        const service = (b.serviceName || b.service?.name || '').toLowerCase();
-        const phone = (b.customerPhone || b.phone || b.user?.phone || '').toLowerCase();
+        const bid = String(b.bookingId || b._id || '').toLowerCase();
+        const customer = (b.customerName || b.userName || (b.user && b.user.name) || '').toLowerCase();
+        const service = (b.serviceName || (b.service && b.service.name) || '').toLowerCase();
+        const phone = (b.customerPhone || b.phone || (b.user && b.user.phone) || '').toLowerCase();
         return bid.includes(q) || customer.includes(q) || service.includes(q) || phone.includes(q);
       });
     }
 
-    // ✅ RE-SORT in-memory (safety)
     filtered.sort((a, b) => {
-      const aTime = new Date(a.createdAt || a.updatedAt || a.scheduledDate || 0).getTime();
-      const bTime = new Date(b.createdAt || b.updatedAt || b.scheduledDate || 0).getTime();
-      return bTime - aTime;
+      const aT = new Date(a.createdAt || a.updatedAt || a.scheduledDate || 0).getTime();
+      const bT = new Date(b.createdAt || b.updatedAt || b.scheduledDate || 0).getTime();
+      return bT - aT;
     });
 
-    // Limit final
     filtered = filtered.slice(0, maxLimit);
 
-    // Format
     const formatted = filtered.map((b) => ({
       _id: b._id,
       id: b._id,
       bookingId: b.bookingId || b._id,
-      serviceName: b.serviceName || b.service?.name || 'Service',
+      serviceName: b.serviceName || (b.service && b.service.name) || 'Service',
       serviceIcon: b.serviceIcon || '🔧',
-      categoryName: b.categoryName || b.category?.name || '',
-      customerName: b.customerName || b.userName || b.user?.name || 'Customer',
-      customerPhone: b.customerPhone || b.phone || b.user?.phone || '',
-      customerId: b.customerId || b.userId || b.user?._id || '',
+      categoryName: b.categoryName || (b.category && b.category.name) || '',
+      customerName: b.customerName || b.userName || (b.user && b.user.name) || 'Customer',
+      customerPhone: b.customerPhone || b.phone || (b.user && b.user.phone) || '',
+      customerId: b.customerId || b.userId || (b.user && b.user._id) || '',
       address: b.address || b.serviceAddress || '',
       city: b.city || '',
       totalAmount: b.totalAmount || b.price || b.amount || 0,
@@ -466,12 +453,12 @@ exports.getDispatchableBookings = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// 🚀 SEND MANUAL DISPATCH (FORCE RE-DISPATCH)
+// 🚀 SEND MANUAL DISPATCH
 // ═══════════════════════════════════════════════════════════════
-exports.sendManualDispatch = async (req, res) => {
+exports.send = async (req, res) => {
   const startTime = Date.now();
   try {
-    const { bookingId, providerId, adminNote } = req.body;
+    const { bookingId, providerId, adminNote } = req.body || {};
 
     console.log('\n' + '='.repeat(60));
     console.log('📨 FORCE RE-DISPATCH');
@@ -485,23 +472,18 @@ exports.sendManualDispatch = async (req, res) => {
       });
     }
 
-    // ───────────────────────────────────────────────────────
     // 1. FIND BOOKING
-    // ───────────────────────────────────────────────────────
     const bookingQuery = mongoose.Types.ObjectId.isValid(bookingId)
       ? { $or: [{ _id: new mongoose.Types.ObjectId(bookingId) }, { bookingId: bookingId }] }
       : { bookingId: bookingId };
 
     const bookingResult = await findOneInAllDbs(['bookings', 'Booking'], bookingQuery);
     const booking = bookingResult.doc;
-
     if (!booking) {
       return res.status(404).json({ success: false, message: 'Booking not found' });
     }
 
-    // ───────────────────────────────────────────────────────
     // 2. FIND PROVIDER
-    // ───────────────────────────────────────────────────────
     const providerQuery = mongoose.Types.ObjectId.isValid(providerId)
       ? {
           $or: [
@@ -517,7 +499,6 @@ exports.sendManualDispatch = async (req, res) => {
       providerQuery
     );
     const provider = providerResult.doc;
-
     if (!provider) {
       return res.status(404).json({ success: false, message: 'Provider not found' });
     }
@@ -526,18 +507,14 @@ exports.sendManualDispatch = async (req, res) => {
     if (!fcmToken) {
       return res.status(400).json({
         success: false,
-        message: 'Provider ke paas FCM token nahi hai — notification nahi ja sakti',
+        message: 'Provider ke paas FCM token nahi hai',
       });
     }
 
-    // ───────────────────────────────────────────────────────
-    // 3. CANCEL OLD PROVIDER OFFER (if any)
-    // ───────────────────────────────────────────────────────
+    // 3. CANCEL OLD PROVIDER
     const oldProviderId = booking.assignedProvider || booking.providerId;
     if (oldProviderId && String(oldProviderId) !== String(provider._id)) {
       console.log(`🔄 Cancelling old provider: ${oldProviderId}`);
-
-      // Mark old offers as cancelled
       await updateInAllDbs(
         ['provideroffers', 'ProviderOffer'],
         {
@@ -554,20 +531,19 @@ exports.sendManualDispatch = async (req, res) => {
         }
       );
 
-      // Send cancellation FCM to old provider
       try {
-        const oldProviderResult = await findOneInAllDbs(
+        const oldProvResult = await findOneInAllDbs(
           ['providers', 'serviceproviders', 'provider'],
           mongoose.Types.ObjectId.isValid(oldProviderId)
             ? { _id: new mongoose.Types.ObjectId(oldProviderId) }
             : { providerId: oldProviderId }
         );
-        const oldProvider = oldProviderResult.doc;
-        if (oldProvider?.fcmToken) {
+        const oldProv = oldProvResult.doc;
+        if (oldProv && oldProv.fcmToken) {
           const app = getProviderFirebaseApp();
           if (app) {
             await admin.messaging(app).send({
-              token: oldProvider.fcmToken,
+              token: oldProv.fcmToken,
               data: stringifyAll({
                 type: 'booking_cancelled',
                 bookingId: String(booking._id),
@@ -585,9 +561,7 @@ exports.sendManualDispatch = async (req, res) => {
       }
     }
 
-    // ───────────────────────────────────────────────────────
-    // 4. RESET BOOKING TO SEARCHING
-    // ───────────────────────────────────────────────────────
+    // 4. RESET BOOKING
     await updateInAllDbs(
       ['bookings', 'Booking'],
       { _id: booking._id },
@@ -603,9 +577,7 @@ exports.sendManualDispatch = async (req, res) => {
       }
     );
 
-    // ───────────────────────────────────────────────────────
-    // 5. CREATE PROVIDER OFFER
-    // ───────────────────────────────────────────────────────
+    // 5. CREATE OFFER
     const offerId = new mongoose.Types.ObjectId();
     const expiresAt = new Date(Date.now() + 30 * 1000);
 
@@ -630,13 +602,11 @@ exports.sendManualDispatch = async (req, res) => {
       try {
         await insertInDb('admin_panel', 'provideroffers', offerDoc);
       } catch (e2) {
-        console.warn('⚠️ Offer insert failed in both DBs:', e2.message);
+        console.warn('⚠️ Offer insert failed:', e2.message);
       }
     }
 
-    // ───────────────────────────────────────────────────────
-    // 6. CREATE DISPATCH JOB (try multiple status enums)
-    // ───────────────────────────────────────────────────────
+    // 6. CREATE DISPATCH JOB
     const jobDoc = {
       bookingId: booking._id,
       providerId: provider._id,
@@ -654,26 +624,21 @@ exports.sendManualDispatch = async (req, res) => {
         break;
       } catch (e) {
         if (st === statusCandidates[statusCandidates.length - 1]) {
-          console.warn('⚠️ DispatchJob insert failed all statuses:', e.message);
+          console.warn('⚠️ DispatchJob insert failed:', e.message);
         }
       }
     }
 
-    // ───────────────────────────────────────────────────────
-    // 7. SEND HYBRID ALARM FCM TO NEW PROVIDER
-    // ───────────────────────────────────────────────────────
+    // 7. SEND HYBRID ALARM FCM
     const app = getProviderFirebaseApp();
     if (!app) {
-      return res.status(500).json({
-        success: false,
-        message: 'Firebase not initialized',
-      });
+      return res.status(500).json({ success: false, message: 'Firebase not initialized' });
     }
 
-    const serviceName = booking.serviceName || booking.service?.name || 'Service';
+    const serviceName = booking.serviceName || (booking.service && booking.service.name) || 'Service';
     const totalAmount = booking.totalAmount || booking.price || booking.amount || 0;
     const baseAmount = booking.baseAmount || booking.servicePrice || totalAmount;
-    const customerName = booking.customerName || booking.userName || booking.user?.name || 'Customer';
+    const customerName = booking.customerName || booking.userName || (booking.user && booking.user.name) || 'Customer';
     const address = booking.address || booking.serviceAddress || '';
     const city = booking.city || '';
     const scheduledTime = booking.scheduledTime || booking.time || 'ASAP';
@@ -685,27 +650,24 @@ exports.sendManualDispatch = async (req, res) => {
 
     const fcmMessage = {
       token: fcmToken,
-      notification: {
-        title: title,
-        body: body,
-      },
+      notification: { title, body },
       data: stringifyAll({
         type: 'booking_request',
         bookingId: String(booking._id),
         bookingObjectId: String(booking._id),
         actionUrl: `/booking-detail?bookingId=${booking._id}`,
-        serviceName: serviceName,
+        serviceName,
         serviceIcon: '🔧',
-        categoryName: booking.categoryName || booking.category?.name || '',
-        customerName: customerName,
-        totalAmount: totalAmount,
-        baseAmount: baseAmount,
+        categoryName: booking.categoryName || (booking.category && booking.category.name) || '',
+        customerName,
+        totalAmount,
+        baseAmount,
         servicePrice: baseAmount,
-        priceDisplay: priceDisplay,
-        scheduledTime: scheduledTime,
-        scheduledDate: scheduledDate,
-        address: address,
-        city: city,
+        priceDisplay,
+        scheduledTime,
+        scheduledDate,
+        address,
+        city,
         priority: 'high',
         channelId: 'bookings_alarm',
         category: 'booking_request',
@@ -718,8 +680,8 @@ exports.sendManualDispatch = async (req, res) => {
         _source: 'fcm',
         _sentAt: Date.now(),
         sound: 'booking_alarm',
-        title: title,
-        body: body,
+        title,
+        body,
       }),
       android: {
         priority: 'high',
@@ -735,8 +697,8 @@ exports.sendManualDispatch = async (req, res) => {
           vibrateTimingsMillis: [0, 1000, 500, 1000, 500, 1000],
           notificationPriority: 'PRIORITY_MAX',
           color: '#EF4444',
-          title: title,
-          body: body,
+          title,
+          body,
         },
       },
       apns: {
@@ -748,10 +710,7 @@ exports.sendManualDispatch = async (req, res) => {
           aps: {
             sound: 'booking_alarm.caf',
             'interruption-level': 'time-sensitive',
-            alert: {
-              title: title,
-              body: body,
-            },
+            alert: { title, body },
           },
         },
       },
@@ -766,13 +725,11 @@ exports.sendManualDispatch = async (req, res) => {
       return res.status(500).json({
         success: false,
         message: `FCM failed: ${fcmErr.message}`,
-        offerId: offerId,
+        offerId,
       });
     }
 
-    // ───────────────────────────────────────────────────────
-    // 8. SOCKET EMIT (if available)
-    // ───────────────────────────────────────────────────────
+    // 8. SOCKET EMIT
     try {
       const io = req.app.get('io');
       if (io) {
@@ -781,7 +738,7 @@ exports.sendManualDispatch = async (req, res) => {
           bookingId: String(booking._id),
           providerId: String(provider._id),
           providerName: provider.name || provider.fullName,
-          expiresAt: expiresAt,
+          expiresAt,
         });
       }
     } catch (e) {}
@@ -796,18 +753,19 @@ exports.sendManualDispatch = async (req, res) => {
       bookingId: String(booking._id),
       providerId: String(provider._id),
       providerName: provider.name || provider.fullName,
-      expiresAt: expiresAt,
+      expiresAt,
       fcmMessageId: fcmResult,
       elapsed: `${elapsed}ms`,
     });
   } catch (err) {
-    console.error('❌ [sendManualDispatch] Error:', err);
-    return res.status(500).json({
-      success: false,
-      message: err.message || 'Dispatch failed',
-    });
+    console.error('❌ [send] Error:', err);
+    return res.status(500).json({ success: false, message: err.message || 'Dispatch failed' });
   }
 };
+
+// Aliases
+exports.sendManualDispatch = exports.send;
+exports.dispatch = exports.send;
 
 // ═══════════════════════════════════════════════════════════════
 // 📊 GET OFFER STATUS
@@ -838,7 +796,7 @@ exports.getOfferStatus = async (req, res) => {
         providerId: offer.providerId,
         sentAt: offer.sentAt,
         expiresAt: offer.expiresAt,
-        remainingSec: remainingSec,
+        remainingSec,
         acceptedAt: offer.acceptedAt,
         rejectedAt: offer.rejectedAt,
         cancelledAt: offer.cancelledAt,
@@ -851,7 +809,7 @@ exports.getOfferStatus = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// 🩺 DEBUG — Shows where providers/bookings live
+// 🩺 DEBUG
 // ═══════════════════════════════════════════════════════════════
 async function debugHandler(req, res) {
   try {
@@ -894,7 +852,7 @@ exports.debug = debugHandler;
 exports.debugConnections = debugHandler;
 
 // ═══════════════════════════════════════════════════════════════
-// 🏥 HEALTH CHECK
+// 🏥 HEALTH
 // ═══════════════════════════════════════════════════════════════
 exports._health = (req, res) => {
   return res.json({
