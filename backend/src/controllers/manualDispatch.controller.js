@@ -1,6 +1,10 @@
 // backend/src/controllers/manualDispatch.controller.js
-// 🚨 FORCE RE-DISPATCH with FIREBASE FIX (handles both old + new firebase-admin)
+// 🚨 FORCE RE-DISPATCH — EXACT MATCH with Provider Backend FCM Format
+// Matches: fcmService.sendNewBookingNotification() HYBRID ALARM mode
+// Channel: bookings_alarm | Sound: booking_alarm | isBookingAlarm: true
 const mongoose = require('mongoose');
+const path = require('path');
+const fs = require('fs');
 
 const DISPATCH_TIMEOUT_MS = parseInt(process.env.MANUAL_DISPATCH_TIMEOUT_MS || '30000', 10);
 
@@ -50,9 +54,11 @@ function getBookingModel() {
     return conn.model('Booking', new mongoose.Schema({
       bookingId: String, orderId: String, customerId: mongoose.Schema.Types.ObjectId,
       customerName: String, customerPhone: String, providerId: mongoose.Schema.Types.ObjectId,
-      serviceName: String, categoryId: mongoose.Schema.Types.ObjectId, categoryName: String,
-      address: String, city: String, totalAmount: Number, status: String,
-      bookingType: String, scheduledDate: String, scheduledTime: String
+      serviceName: String, serviceIcon: String, categoryId: mongoose.Schema.Types.ObjectId,
+      categoryName: String, address: String, city: String, totalAmount: Number,
+      baseAmount: Number, servicePrice: String, status: String,
+      bookingType: String, scheduledDate: String, scheduledTime: String,
+      scheduledDateTime: Date, latitude: Number, longitude: Number
     }, { strict: false, collection: 'bookings' }));
   } catch (e) { return null; }
 }
@@ -82,355 +88,337 @@ function getDispatchJobModel() {
 }
 
 // ============================================================
-// 🔥 FIREBASE INIT — FIXES "credential is undefined" ERROR
+// 🔥 FIREBASE INIT — EXACT COPY of provider backend logic
 //
-// Problem: firebase-admin v12+ uses modular API
-//   OLD: admin.credential.cert(sa)     ← undefined in v12+
-//   NEW: cert(sa) from 'firebase-admin/app'
-//
-// This code tries ALL approaches automatically
+// Provider backend uses: admin.credential.cert(serviceAccount)
+// from config/firebase.config.js with local JSON file.
+// We do the SAME thing here.
 // ============================================================
-let firebaseMessaging = null;
+let firebaseAdmin = null;
 let firebaseReady = false;
 
-async function initFirebase() {
-  if (firebaseReady && firebaseMessaging) return true;
-
-  // ── STEP 1: Try to use EXISTING firebase-admin (from fcmService.js) ──
-  try {
-    const existingAdmin = require('firebase-admin');
-    if (existingAdmin && existingAdmin.apps && Array.isArray(existingAdmin.apps) && existingAdmin.apps.length > 0) {
-      console.log('✅ Using EXISTING Firebase app (already initialized by fcmService)');
-      try {
-        firebaseMessaging = existingAdmin.messaging();
-        if (firebaseMessaging) {
-          firebaseReady = true;
-          console.log('✅ Firebase messaging ready from existing app!');
-          return true;
-        }
-      } catch (e) {
-        console.warn('⚠️ existing app messaging() failed: ' + e.message);
-      }
-    }
-  } catch (e) {
-    console.log('ℹ️ No existing firebase-admin found');
-  }
-
-  // ── STEP 2: Load credentials from env ──
-  let serviceAccount = null;
-  const envKeys = [
-    'PROVIDER_FIREBASE_SERVICE_ACCOUNT_BASE64',
-    'FIREBASE_SERVICE_ACCOUNT_BASE64',
-    'FIREBASE_ADMIN_BASE64'
+function loadServiceAccount() {
+  // Try multiple locations for the service account JSON
+  const possiblePaths = [
+    path.join(__dirname, '../config/serviceproviderapp-b7767-firebase-adminsdk.json'),
+    path.join(__dirname, '../../config/serviceproviderapp-b7767-firebase-adminsdk.json'),
+    path.join(process.cwd(), 'src/config/serviceproviderapp-b7767-firebase-adminsdk.json'),
+    path.join(process.cwd(), 'config/serviceproviderapp-b7767-firebase-adminsdk.json'),
   ];
 
-  for (let i = 0; i < envKeys.length; i++) {
-    let val = null;
-    try { val = process.env[envKeys[i]]; } catch (e) { continue; }
-    if (!val || typeof val !== 'string') continue;
-    val = val.trim();
-    if (val.length < 10) continue;
-    try {
-      serviceAccount = JSON.parse(Buffer.from(val, 'base64').toString('utf8'));
-      console.log('✅ Firebase creds loaded from ' + envKeys[i]);
-      break;
-    } catch (e) {
-      console.warn('⚠️ ' + envKeys[i] + ' decode failed');
-    }
+  // Also try env var path
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
+    possiblePaths.unshift(path.resolve(process.cwd(), process.env.FIREBASE_SERVICE_ACCOUNT_PATH));
   }
 
-  if (!serviceAccount) {
-    const jsonKeys = ['PROVIDER_FIREBASE_SERVICE_ACCOUNT', 'FIREBASE_SERVICE_ACCOUNT'];
-    for (let i = 0; i < jsonKeys.length; i++) {
-      let val = null;
-      try { val = process.env[jsonKeys[i]]; } catch (e) { continue; }
-      if (!val || typeof val !== 'string' || val.trim().length < 10) continue;
-      try { serviceAccount = JSON.parse(val.trim()); console.log('✅ Creds from ' + jsonKeys[i]); break; } catch (e) {}
-    }
-  }
-
-  if (!serviceAccount) {
+  for (const fp of possiblePaths) {
     try {
-      const path = require('path');
-      const fs = require('fs');
-      const fp = path.join(__dirname, '../config/serviceproviderapp-b7767-firebase-adminsdk.json');
       if (fs.existsSync(fp)) {
-        serviceAccount = JSON.parse(fs.readFileSync(fp, 'utf8'));
-        console.log('✅ Creds from local config file');
+        const sa = JSON.parse(fs.readFileSync(fp, 'utf8'));
+        if (sa.project_id && sa.private_key && sa.client_email) {
+          console.log('✅ Service account loaded from: ' + fp);
+          return sa;
+        }
       }
     } catch (e) {}
   }
 
-  if (!serviceAccount) {
-    console.error('❌ NO Firebase credentials found!');
-    return false;
+  // Try base64 env var
+  const b64Keys = ['PROVIDER_FIREBASE_SERVICE_ACCOUNT_BASE64', 'FIREBASE_SERVICE_ACCOUNT_BASE64'];
+  for (const key of b64Keys) {
+    try {
+      const val = process.env[key];
+      if (val && typeof val === 'string' && val.trim().length > 50) {
+        const sa = JSON.parse(Buffer.from(val.trim(), 'base64').toString('utf8'));
+        if (sa.project_id && sa.private_key && sa.client_email) {
+          console.log('✅ Service account loaded from env: ' + key);
+          return sa;
+        }
+      }
+    } catch (e) {}
   }
 
-  // ── STEP 3: Initialize with MULTIPLE approaches ──
-  let admin = null;
-  try { admin = require('firebase-admin'); } catch (e) {
+  return null;
+}
+
+async function initFirebase() {
+  if (firebaseReady && firebaseAdmin) return true;
+
+  try {
+    firebaseAdmin = require('firebase-admin');
+  } catch (e) {
     console.error('❌ firebase-admin not installed');
     return false;
   }
 
-  // Check again if already initialized (race condition)
+  // Check if already initialized
   try {
-    if (admin.apps && Array.isArray(admin.apps) && admin.apps.length > 0) {
-      firebaseMessaging = admin.messaging();
+    if (firebaseAdmin.apps && Array.isArray(firebaseAdmin.apps) && firebaseAdmin.apps.length > 0) {
       firebaseReady = true;
-      console.log('✅ Firebase already initialized (race check)');
+      console.log('✅ Firebase already initialized (' + firebaseAdmin.apps.length + ' apps)');
       return true;
     }
   } catch (e) {}
 
-  // APPROACH A: admin.credential.cert() — firebase-admin v11 and below
-  try {
-    if (admin.credential && typeof admin.credential.cert === 'function') {
-      console.log('🔄 Trying Approach A: admin.credential.cert()');
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-      });
-      firebaseMessaging = admin.messaging();
-      firebaseReady = true;
-      console.log('✅ Firebase initialized via Approach A!');
-      return true;
-    } else {
-      console.log('⚠️ admin.credential.cert not available (v12+?)');
-    }
-  } catch (e) {
-    console.warn('⚠️ Approach A failed: ' + e.message);
+  // Load service account
+  const serviceAccount = loadServiceAccount();
+  if (!serviceAccount) {
+    console.error('❌ No service account found!');
+    return false;
   }
 
-  // APPROACH B: cert() from 'firebase-admin/app' — firebase-admin v12+
+  // Initialize — try multiple approaches
+  // APPROACH 1: admin.credential.cert() — same as provider backend
   try {
-    console.log('🔄 Trying Approach B: cert() from firebase-admin/app');
+    if (firebaseAdmin.credential && typeof firebaseAdmin.credential.cert === 'function') {
+      firebaseAdmin.initializeApp({
+        credential: firebaseAdmin.credential.cert(serviceAccount),
+        projectId: serviceAccount.project_id,
+      });
+      firebaseReady = true;
+      console.log('✅ Firebase initialized via admin.credential.cert()');
+      return true;
+    }
+  } catch (e) {
+    if (e.message && e.message.indexOf('already exists') !== -1) {
+      firebaseReady = true;
+      return true;
+    }
+    console.warn('⚠️ Approach 1 failed: ' + e.message);
+  }
+
+  // APPROACH 2: modular cert()
+  try {
     const appModule = require('firebase-admin/app');
     if (appModule && typeof appModule.cert === 'function') {
       appModule.initializeApp({
-        credential: appModule.cert(serviceAccount)
+        credential: appModule.cert(serviceAccount),
+        projectId: serviceAccount.project_id,
       });
-      firebaseMessaging = appModule.getMessaging();
       firebaseReady = true;
-      console.log('✅ Firebase initialized via Approach B!');
+      console.log('✅ Firebase initialized via modular cert()');
       return true;
     }
   } catch (e) {
-    console.warn('⚠️ Approach B failed: ' + e.message);
-  }
-
-  // APPROACH C: Use applicationDefault()
-  try {
-    console.log('🔄 Trying Approach C: applicationDefault()');
-    if (admin.credential && typeof admin.credential.applicationDefault === 'function') {
-      admin.initializeApp({
-        credential: admin.credential.applicationDefault()
-      });
-      firebaseMessaging = admin.messaging();
+    if (e.message && e.message.indexOf('already exists') !== -1) {
       firebaseReady = true;
-      console.log('✅ Firebase initialized via Approach C!');
       return true;
     }
-  } catch (e) {
-    console.warn('⚠️ Approach C failed: ' + e.message);
+    console.warn('⚠️ Approach 2 failed: ' + e.message);
   }
 
-  // APPROACH D: Direct serviceAccount object (some versions accept this)
+  // APPROACH 3: direct object
   try {
-    console.log('🔄 Trying Approach D: direct serviceAccount object');
-    admin.initializeApp({
+    firebaseAdmin.initializeApp({
       credential: serviceAccount,
-      projectId: serviceAccount.project_id
+      projectId: serviceAccount.project_id,
     });
-    firebaseMessaging = admin.messaging();
     firebaseReady = true;
-    console.log('✅ Firebase initialized via Approach D!');
+    console.log('✅ Firebase initialized via direct object');
     return true;
   } catch (e) {
-    console.warn('⚠️ Approach D failed: ' + e.message);
-  }
-
-  // APPROACH E: Use existing fcmService.js as complete fallback
-  try {
-    console.log('🔄 Trying Approach E: use fcmService.js directly');
-    const fcmService = require('../services/fcmService');
-    if (fcmService && fcmService.sendBookingOfferToProvider) {
-      console.log('✅ fcmService.js available — will use as fallback for sending');
-      // Don't set firebaseReady — we'll use fcmService directly in send function
-      return false;
+    if (e.message && e.message.indexOf('already exists') !== -1) {
+      firebaseReady = true;
+      return true;
     }
-  } catch (e) {
-    console.warn('⚠️ Approach E failed: ' + e.message);
+    console.warn('⚠️ Approach 3 failed: ' + e.message);
   }
 
-  console.error('❌ ALL Firebase init approaches failed!');
+  console.error('❌ All Firebase init approaches failed');
   return false;
 }
 
 // ============================================================
-// 📲 SEND FCM — tries direct first, then fcmService fallback
+// 📲 HYBRID ALARM FCM — EXACT MATCH with provider backend
+//
+// This matches fcmService.sendNewBookingNotification() +
+// firebase.config.js sendToDevice() with isBookingAlarm: true
+//
+// KEY FIELDS that trigger popup in provider app:
+// - notification.title + notification.body (OS renders in bg)
+// - data._isBookingAlarm = 'true' (JS handler shows modal)
+// - data.channelId = 'bookings_alarm' (alarm sound channel)
+// - data.clickAction = 'OPEN_BOOKING' (opens booking screen)
+// - android.notification.channelId = 'bookings_alarm'
+// - android.notification.sound = 'booking_alarm'
+// - android.notification.priority = 'max'
 // ============================================================
-async function sendFCMToProvider(provider, booking, offerId, expiresAt) {
+async function sendHybridAlarmFCM(provider, booking) {
   const token = provider.fcmToken;
   if (!token || typeof token !== 'string' || token.length < 10) {
     return { success: false, error: 'No valid FCM token' };
   }
 
-  const bookingId = String(booking._id);
-  const serviceName = booking.serviceName || booking.categoryName || 'Service';
-  const amount = String(booking.totalAmount || 0);
-  const address = booking.address || '';
-  const customerName = booking.customerName || booking.customerPhone || 'Customer';
-  const customerPhone = booking.customerPhone || '';
-  const categoryName = booking.categoryName || '';
+  const ready = await initFirebase();
+  if (!ready || !firebaseAdmin) {
+    return { success: false, error: 'Firebase not initialized' };
+  }
 
-  // DATA-ONLY payload (no notification field — triggers popup in app)
-  const dataPayload = {
+  // ── Format price (EXACT match with provider backend) ──
+  let exactPrice = 0;
+  let priceDisplay = '';
+
+  if (booking.totalAmount && !isNaN(parseFloat(String(booking.totalAmount)))) {
+    exactPrice = parseFloat(String(booking.totalAmount));
+  } else if (booking.baseAmount && !isNaN(parseFloat(String(booking.baseAmount)))) {
+    exactPrice = parseFloat(String(booking.baseAmount));
+  }
+
+  if (exactPrice > 0) {
+    priceDisplay = exactPrice % 1 === 0 ? '₹' + exactPrice.toFixed(0) : '₹' + exactPrice.toFixed(2);
+  } else if (booking.servicePrice && typeof booking.servicePrice === 'string') {
+    priceDisplay = booking.servicePrice;
+  } else {
+    priceDisplay = 'Price TBD';
+  }
+
+  const serviceName = booking.serviceName || 'Service';
+  const address = booking.address || '';
+  const shortAddress = address.length > 50 ? address.substring(0, 47) + '...' : address;
+  const scheduledTime = booking.scheduledTime || '';
+  const bookingIdStr = String(booking._id);
+
+  // ── Notification block (OS renders when killed/background) ──
+  let body = serviceName + ' • ' + priceDisplay;
+  if (scheduledTime) body += ' • ' + scheduledTime;
+  if (shortAddress) body += '\n📍 ' + shortAddress;
+
+  const fcmTitle = '🔔 New Booking! ' + priceDisplay;
+  const fcmBody = body;
+
+  // ── Data block (JS handler reads when foreground) ──
+  // EXACT match with fcmService.sendNewBookingNotification data fields
+  const stringData = {
     type: 'booking_request',
-    click_action: 'FLUTTER_NOTIFICATION_CLICK',
-    channelId: 'booking_requests',
-    channel_id: 'booking_requests',
-    isBookingAlarm: 'true',
-    is_booking_alarm: 'true',
-    bookingId: bookingId,
-    booking_id: bookingId,
-    id: bookingId,
-    offerId: String(offerId),
-    offer_id: String(offerId),
+    bookingId: bookingIdStr,
+    bookingObjectId: bookingIdStr,
+    actionUrl: '/booking-detail?bookingId=' + bookingIdStr,
     serviceName: serviceName,
-    service_name: serviceName,
-    service: serviceName,
-    categoryName: categoryName,
-    category_name: categoryName,
-    category: categoryName,
-    customerName: customerName,
-    customer_name: customerName,
-    userName: customerName,
-    customerPhone: customerPhone,
-    customer_phone: customerPhone,
-    phone: customerPhone,
-    totalAmount: amount,
-    total_amount: amount,
-    amount: amount,
-    price: amount,
+    serviceIcon: booking.serviceIcon || '🔧',
+    categoryName: booking.categoryName || '',
+    customerName: booking.customerName || 'Customer',
+    totalAmount: String(exactPrice || 0),
+    baseAmount: String(booking.baseAmount || 0),
+    servicePrice: booking.servicePrice || '',
+    priceDisplay: priceDisplay,
+    scheduledTime: scheduledTime,
+    scheduledDate: booking.scheduledDate || '',
     address: address,
     city: booking.city || '',
-    location: address,
-    scheduledDate: booking.scheduledDate || '',
-    scheduled_date: booking.scheduledDate || '',
-    date: booking.scheduledDate || '',
-    scheduledTime: booking.scheduledTime || '',
-    scheduled_time: booking.scheduledTime || '',
-    time: booking.scheduledTime || '',
-    title: 'New Booking Request!',
-    body: serviceName + ' - Rs.' + amount + ' - ' + address.substring(0, 40),
-    sound: 'default',
-    priority: 'max',
-    importance: 'max',
-    source: 'manual_admin',
-    timeoutMs: String(DISPATCH_TIMEOUT_MS),
+    priority: 'high',
+    channelId: 'bookings_alarm',
+    category: 'booking_request',
+    clickAction: 'OPEN_BOOKING',
     timeout: String(Math.floor(DISPATCH_TIMEOUT_MS / 1000)),
-    expiresAt: String(expiresAt.getTime()),
-    dispatchedAt: String(Date.now()),
-    isUrgent: 'true',
-    showPopup: 'true',
-    show_popup: 'true',
-    fullScreen: 'true',
-    full_screen: 'true',
-    autoOpen: 'true'
+    expiresAt: String(Date.now() + DISPATCH_TIMEOUT_MS),
+    isExclusive: 'true',
+    source: 'manual_admin',
+
+    // ── HYBRID ALARM FLAGS (these trigger the popup!) ──
+    _isBookingAlarm: 'true',
+    _source: 'fcm',
+    _sentAt: String(Date.now()),
+    sound: 'booking_alarm',
+    title: fcmTitle,
+    body: fcmBody,
   };
 
-  // ── TRY 1: Direct Firebase messaging ──
-  const ready = await initFirebase();
-  if (ready && firebaseMessaging) {
-    try {
-      const message = {
-        token: token,
-        data: dataPayload,
-        android: { priority: 'high', ttl: 60 },
-        apns: {
-          headers: { 'apns-priority': '10', 'apns-push-type': 'background' },
-          payload: { aps: { 'content-available': 1, sound: 'default', badge: 1 } }
-        }
-      };
-      const messageId = await firebaseMessaging.send(message);
-      console.log('✅ DIRECT FCM SENT! ID: ' + messageId);
-      return { success: true, messageId: messageId, method: 'direct' };
-    } catch (e) {
-      console.warn('⚠️ Direct FCM failed: ' + e.message);
-    }
-  }
+  // ── Build message EXACTLY like firebase.config.js sendToDevice() ──
+  const message = {
+    token: token,
 
-  // ── TRY 2: Use fcmService.js (existing backend service) ──
-  console.log('🔄 Falling back to fcmService.js...');
-  try {
-    const fcmService = require('../services/fcmService');
-    if (fcmService && typeof fcmService.sendBookingOfferToProvider === 'function') {
-      const result = await fcmService.sendBookingOfferToProvider(provider, booking, {
-        offerId: offerId,
-        expiresAt: expiresAt,
-        timeoutMs: DISPATCH_TIMEOUT_MS,
-        source: 'manual_admin',
-        adminNote: 'Force dispatch'
-      });
-      if (result && result.success) {
-        console.log('✅ FCM sent via fcmService.js!');
-        return { success: true, messageId: result.messageId || 'fcmService', method: 'fcmService' };
-      } else {
-        console.warn('⚠️ fcmService returned failure: ' + JSON.stringify(result));
+    // ✅ notification block — OS renders when app killed/background
+    notification: {
+      title: fcmTitle,
+      body: fcmBody,
+    },
+
+    // ✅ data block — JS handler reads when app foreground
+    data: stringData,
+
+    // ✅ Android config — alarm channel + sound
+    android: {
+      priority: 'high',
+      ttl: 120000,
+      collapseKey: 'booking_' + bookingIdStr,
+      notification: {
+        channelId: 'bookings_alarm',
+        sound: 'booking_alarm',
+        priority: 'max',
+        visibility: 'public',
+        defaultSound: false,
+        defaultVibrateTimings: false,
+        vibrateTimingsMillis: [0, 1000, 500, 1000, 500, 1000],
+        notificationPriority: 'PRIORITY_MAX',
+        color: '#EF4444',
+        title: fcmTitle,
+        body: fcmBody,
+      }
+    },
+
+    // ✅ iOS config — time-sensitive alarm
+    apns: {
+      headers: {
+        'apns-priority': '10',
+        'apns-expiration': String(Math.floor(Date.now() / 1000) + 120),
+        'apns-collapse-id': 'booking_' + bookingIdStr,
+      },
+      payload: {
+        aps: {
+          sound: 'booking_alarm.caf',
+          'interruption-level': 'time-sensitive',
+          alert: {
+            title: fcmTitle,
+            body: fcmBody,
+          }
+        }
       }
     }
-  } catch (e) {
-    console.warn('⚠️ fcmService fallback error: ' + e.message);
-  }
+  };
 
-  // ── TRY 3: Use admin.messaging() from fresh require ──
-  console.log('🔄 Trying fresh firebase-admin require...');
   try {
-    const freshAdmin = require('firebase-admin');
-    if (freshAdmin && freshAdmin.apps && Array.isArray(freshAdmin.apps) && freshAdmin.apps.length > 0) {
-      const msg = freshAdmin.messaging();
-      const messageId = await msg.send({
-        token: token,
-        data: dataPayload,
-        android: { priority: 'high', ttl: 60 }
-      });
-      console.log('✅ FCM sent via fresh require! ID: ' + messageId);
-      return { success: true, messageId: messageId, method: 'fresh_require' };
-    }
-  } catch (e) {
-    console.warn('⚠️ Fresh require failed: ' + e.message);
+    const messaging = firebaseAdmin.messaging();
+    const messageId = await messaging.send(message);
+    console.log('✅ HYBRID ALARM FCM SENT!');
+    console.log('   messageId: ' + messageId);
+    console.log('   token: ' + token.substring(0, 20) + '...');
+    console.log('   title: ' + fcmTitle);
+    console.log('   channelId: bookings_alarm');
+    console.log('   sound: booking_alarm');
+    console.log('   isBookingAlarm: true');
+    return { success: true, messageId: messageId, method: 'hybrid_alarm' };
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    console.error('❌ FCM FAILED: ' + msg);
+    return { success: false, error: msg };
   }
-
-  return { success: false, error: 'All FCM methods failed' };
 }
 
 // ============================================================
-// 📲 SEND CANCELLATION TO OLD PROVIDER
+// 📲 CANCELLATION FCM to old provider
 // ============================================================
 async function sendCancellationFCM(oldProvider, bookingId) {
   if (!oldProvider || !oldProvider.fcmToken || typeof oldProvider.fcmToken !== 'string' || oldProvider.fcmToken.length < 10) return;
-  console.log('📲 Sending CANCELLATION to ' + oldProvider.name);
+  const ready = await initFirebase();
+  if (!ready || !firebaseAdmin) return;
+
   try {
-    const ready = await initFirebase();
-    if (ready && firebaseMessaging) {
-      await firebaseMessaging.send({
-        token: oldProvider.fcmToken,
-        data: {
-          type: 'booking_cancelled',
-          click_action: 'FLUTTER_NOTIFICATION_CLICK',
-          channelId: 'booking_requests',
-          bookingId: String(bookingId),
-          booking_id: String(bookingId),
-          reason: 'admin_reassigned',
-          title: 'Booking Cancelled',
-          body: 'Reassigned by admin',
-          sound: 'default',
-          showPopup: 'false'
-        },
-        android: { priority: 'high', ttl: 30 }
-      });
-      console.log('✅ Cancellation sent to ' + oldProvider.name);
-    }
+    await firebaseAdmin.messaging().send({
+      token: oldProvider.fcmToken,
+      notification: { title: '❌ Booking Cancelled', body: 'This booking has been reassigned by admin' },
+      data: {
+        type: 'booking_cancelled',
+        bookingId: String(bookingId),
+        reason: 'admin_reassigned',
+        channelId: 'default',
+        _source: 'fcm',
+        _sentAt: String(Date.now()),
+        title: '❌ Booking Cancelled',
+        body: 'Reassigned by admin',
+      },
+      android: { priority: 'high', ttl: 30000 },
+    });
+    console.log('✅ Cancellation sent to ' + oldProvider.name);
   } catch (e) {
     console.warn('⚠️ Cancellation FCM failed: ' + e.message);
   }
@@ -512,7 +500,7 @@ exports.getOnlineProviders = async (req, res) => {
 };
 
 // ============================================================
-// GET DISPATCHABLE BOOKINGS
+// GET DISPATCHABLE BOOKINGS — ALL active statuses
 // ============================================================
 exports.getDispatchableBookings = async (req, res) => {
   try {
@@ -527,13 +515,21 @@ exports.getDispatchableBookings = async (req, res) => {
 };
 
 // ============================================================
-// 🚨 FORCE RE-DISPATCH
+// 🚨 FORCE RE-DISPATCH — MAIN FLOW
+//
+// 1. Find booking (ANY status — even assigned/accepted)
+// 2. Find NEW provider
+// 3. If old provider exists → cancel their offer + FCM
+// 4. Reset booking → "searching"
+// 5. Create new offer
+// 6. Send HYBRID ALARM FCM (exact match with provider backend)
+// 7. 30s timeout
 // ============================================================
 exports.send = async (req, res) => {
-  console.log('\n============================================================');
-  console.log('📨 FORCE RE-DISPATCH');
+  console.log('\n' + '='.repeat(60));
+  console.log('📨 FORCE RE-DISPATCH (HYBRID ALARM FCM)');
   console.log('📦 Body:', JSON.stringify(req.body));
-  console.log('============================================================');
+  console.log('='.repeat(60));
 
   try {
     const { bookingId, providerId, adminNote } = req.body;
@@ -547,7 +543,7 @@ exports.send = async (req, res) => {
     const DispatchJob = getDispatchJobModel();
     if (!Booking || !Provider) return res.status(500).json({ success: false, message: 'DB models unavailable' });
 
-    // FIND BOOKING
+    // ── FIND BOOKING (any status) ──
     let booking = null;
     if (mongoose.Types.ObjectId.isValid(bookingId)) booking = await Booking.findById(bookingId);
     if (!booking) booking = await Booking.findOne({ $or: [{ bookingId: bookingId }, { orderId: bookingId }] });
@@ -555,21 +551,21 @@ exports.send = async (req, res) => {
 
     const oldStatus = booking.status;
     const oldProviderId = booking.providerId;
+    console.log('📋 Booking: ' + booking._id + ' | Status: ' + oldStatus + ' | Old Provider: ' + (oldProviderId || 'none'));
 
-    // FIND NEW PROVIDER
+    // ── FIND NEW PROVIDER ──
     let newProvider = null;
     if (mongoose.Types.ObjectId.isValid(providerId)) newProvider = await Provider.findById(providerId);
     if (!newProvider) newProvider = await Provider.findOne({ providerId: providerId });
-    if (!newProvider) return res.status(404).json({ success: false, message: 'Provider not found' });
+    if (!newProvider) return res.status(404).json({ success: false, message: 'Provider not found: ' + providerId });
 
-    console.log('📋 Booking: ' + booking._id + ' | Status: ' + oldStatus);
-    console.log('🎯 Target: ' + newProvider.name + ' (' + newProvider.phone + ')');
+    console.log('🎯 NEW Provider: ' + newProvider.name + ' (' + newProvider.phone + ')');
 
     if (!newProvider.fcmToken || typeof newProvider.fcmToken !== 'string' || newProvider.fcmToken.length < 10) {
-      return res.status(400).json({ success: false, message: 'Provider has no FCM token' });
+      return res.status(400).json({ success: false, message: 'Provider ' + newProvider.name + ' has no FCM token' });
     }
 
-    // CANCEL OLD PROVIDER
+    // ── CANCEL OLD PROVIDER (if different) ──
     let oldProviderCancelled = false;
     if (oldProviderId && String(oldProviderId) !== String(newProvider._id)) {
       try {
@@ -585,11 +581,12 @@ exports.send = async (req, res) => {
           }
           await Provider.findByIdAndUpdate(oldProvider._id, { $set: { currentBookingId: null, isBusy: false, isAvailable: true } });
           oldProviderCancelled = true;
+          console.log('✅ Old provider ' + oldProvider.name + ' cancelled');
         }
       } catch (e) { console.warn('⚠️ Old provider cancel: ' + e.message); }
     }
 
-    // SUPERSEDE OTHER OFFERS
+    // ── SUPERSEDE OTHER PENDING OFFERS ──
     if (Offer) {
       try {
         await Offer.updateMany(
@@ -599,15 +596,15 @@ exports.send = async (req, res) => {
       } catch (e) {}
     }
 
-    // RESET BOOKING
+    // ── RESET BOOKING → searching ──
     try {
       await Booking.findByIdAndUpdate(booking._id, {
         $set: { status: 'searching', providerId: newProvider._id, updatedAt: new Date() }
       });
       console.log('🔄 Status: ' + oldStatus + ' → searching');
-    } catch (e) {}
+    } catch (e) { console.warn('⚠️ Status reset: ' + e.message); }
 
-    // CREATE OFFER
+    // ── CREATE OFFER ──
     const expiresAt = new Date(Date.now() + DISPATCH_TIMEOUT_MS);
     let offer = null;
     if (Offer) {
@@ -615,13 +612,13 @@ exports.send = async (req, res) => {
         offer = await Offer.create({
           bookingId: booking._id, providerId: newProvider._id,
           status: 'pending', source: 'manual_admin_force',
-          expiresAt: expiresAt, adminNote: adminNote || ''
+          expiresAt: expiresAt, adminNote: adminNote || 'Force re-dispatch'
         });
         console.log('📝 Offer: ' + offer._id);
       } catch (e) { console.warn('⚠️ Offer: ' + e.message); }
     }
 
-    // CREATE DISPATCH JOB
+    // ── CREATE DISPATCH JOB ──
     let dispatchJob = null;
     if (DispatchJob) {
       const tries = ['pending', 'active', 'dispatched', 'searching', 'sent', 'waiting'];
@@ -640,9 +637,13 @@ exports.send = async (req, res) => {
       }
     }
 
-    // 🔥 SEND FCM (with all fallbacks)
-    console.log('📲 Sending DATA-ONLY FCM to ' + newProvider.name + '...');
-    const fcmResult = await sendFCMToProvider(newProvider, booking, offer ? offer._id : 'manual', expiresAt);
+    // ── 🔥 SEND HYBRID ALARM FCM (EXACT MATCH with provider backend) ──
+    console.log('📲 Sending HYBRID ALARM FCM to ' + newProvider.name + '...');
+    console.log('   Format: notification + data + android.notification');
+    console.log('   Channel: bookings_alarm | Sound: booking_alarm');
+    console.log('   isBookingAlarm: true');
+
+    const fcmResult = await sendHybridAlarmFCM(newProvider, booking);
 
     if (dispatchJob && DispatchJob) {
       try {
@@ -652,13 +653,14 @@ exports.send = async (req, res) => {
       } catch (e) {}
     }
 
-    // SOCKET
+    // ── SOCKET ──
     emitToAdmins('manual-dispatch:sent', {
       bookingId: String(booking._id), providerId: String(newProvider._id),
-      providerName: newProvider.name, fcmSent: fcmResult.success
+      providerName: newProvider.name, fcmSent: fcmResult.success,
+      oldProviderCancelled: oldProviderCancelled
     });
 
-    // TIMEOUT
+    // ── 30s TIMEOUT ──
     if (offer && Offer) {
       setTimeout(async () => {
         try {
@@ -670,21 +672,25 @@ exports.send = async (req, res) => {
               await Booking.findByIdAndUpdate(booking._id, { $set: { status: 'no_provider_found', providerId: null } });
             }
             emitToAdmins('manual-dispatch:timeout', { bookingId: String(booking._id) });
+            console.log('⏰ Offer ' + offer._id + ' TIMEOUT');
           }
         } catch (e) {}
       }, DISPATCH_TIMEOUT_MS + 2000);
     }
 
-    console.log('✅ DONE! FCM: ' + (fcmResult.success ? 'SENT ✅ (' + fcmResult.method + ')' : 'FAILED ❌ ' + fcmResult.error));
-    console.log('============================================================\n');
+    console.log('✅ DONE! FCM: ' + (fcmResult.success ? 'SENT ✅' : 'FAILED ❌ ' + fcmResult.error));
+    console.log('='.repeat(60) + '\n');
 
     res.json({
       success: true,
-      message: fcmResult.success ? 'FCM sent via ' + fcmResult.method : 'FCM failed: ' + fcmResult.error,
+      message: fcmResult.success
+        ? '🔔 Hybrid alarm sent to ' + newProvider.name + (oldProviderCancelled ? ' (old provider cancelled)' : '')
+        : 'FCM failed: ' + fcmResult.error,
       data: {
         offerId: offer ? String(offer._id) : null,
         bookingId: String(booking._id),
-        providerName: newProvider.name,
+        newProvider: { id: String(newProvider._id), name: newProvider.name },
+        oldProviderCancelled: oldProviderCancelled,
         fcmSent: fcmResult.success,
         fcmMethod: fcmResult.method || null,
         fcmError: fcmResult.success ? null : fcmResult.error,
@@ -718,32 +724,24 @@ exports.getOfferStatus = async (req, res) => {
 exports.debugConnections = async (req, res) => {
   try {
     let fbStatus = 'not_checked';
-    let fbDetails = '';
     try {
       const a = require('firebase-admin');
       const apps = a && a.apps ? a.apps : [];
       fbStatus = apps.length > 0 ? 'initialized (' + apps.length + ' apps)' : 'no apps';
-      fbDetails = 'credential exists: ' + !!(a && a.credential) + ', cert exists: ' + !!(a && a.credential && a.credential.cert);
     } catch (e) { fbStatus = 'not installed'; }
 
-    const envCheck = {};
-    const keys = ['PROVIDER_FIREBASE_SERVICE_ACCOUNT_BASE64', 'FIREBASE_SERVICE_ACCOUNT_BASE64'];
-    for (let i = 0; i < keys.length; i++) {
-      const v = process.env[keys[i]];
-      envCheck[keys[i]] = !!(v && typeof v === 'string' && v.trim().length > 50);
-    }
-
-    // Check fcmService availability
-    let fcmServiceAvailable = false;
-    try {
-      const fcm = require('../services/fcmService');
-      fcmServiceAvailable = !!(fcm && fcm.sendBookingOfferToProvider);
-    } catch (e) {}
+    const sa = loadServiceAccount();
 
     res.json({
-      success: true, firebaseStatus: fbStatus, firebaseDetails: fbDetails,
-      envVars: envCheck, fcmServiceAvailable: fcmServiceAvailable,
-      fcmFormat: 'DATA-ONLY', timestamp: new Date().toISOString()
+      success: true,
+      firebaseStatus: fbStatus,
+      serviceAccountFound: !!sa,
+      serviceAccountProject: sa ? sa.project_id : 'none',
+      fcmFormat: 'HYBRID ALARM (notification + data + android.notification)',
+      channelId: 'bookings_alarm',
+      sound: 'booking_alarm',
+      isBookingAlarm: true,
+      timestamp: new Date().toISOString()
     });
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
