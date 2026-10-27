@@ -1,6 +1,6 @@
 // backend/src/controllers/manualDispatch.controller.js
 // COMPLETE MANUAL DISPATCH CONTROLLER
-// Firebase fix: uses getMessaging(app) instead of app.messaging()
+// Fixes: Multi-DB connection + Firebase messaging v12 + enrichment
 
 const mongoose = require('mongoose');
 const path = require('path');
@@ -10,8 +10,10 @@ const path = require('path');
 // ============================================================
 
 function stringifyAll(obj) {
-  const result = {};
-  for (const [key, value] of Object.entries(obj)) {
+  var result = {};
+  for (var key in obj) {
+    if (!obj.hasOwnProperty(key)) continue;
+    var value = obj[key];
     if (value === null || value === undefined) {
       result[key] = '';
     } else if (typeof value === 'object') {
@@ -36,14 +38,14 @@ function safeStr(val) {
 
 function safeNum(val) {
   if (!val) return 0;
-  const n = Number(val);
+  var n = Number(val);
   return isNaN(n) ? 0 : n;
 }
 
 function toObjectId(id) {
   try {
     if (!id) return null;
-    const str = typeof id === 'object' && id._id ? String(id._id) : String(id);
+    var str = typeof id === 'object' && id._id ? String(id._id) : String(id);
     if (/^[0-9a-fA-F]{24}$/.test(str)) {
       return new mongoose.Types.ObjectId(str);
     }
@@ -55,48 +57,92 @@ function toObjectId(id) {
 
 function timeAgo(date) {
   if (!date) return '';
-  const now = new Date();
-  const d = new Date(date);
-  const diffMs = now - d;
-  const diffMins = Math.floor(diffMs / 60000);
+  var now = new Date();
+  var d = new Date(date);
+  var diffMs = now - d;
+  var diffMins = Math.floor(diffMs / 60000);
   if (diffMins < 1) return 'just now';
   if (diffMins < 60) return diffMins + 'm ago';
-  const diffHrs = Math.floor(diffMins / 60);
+  var diffHrs = Math.floor(diffMins / 60);
   if (diffHrs < 24) return diffHrs + 'h ago';
-  const diffDays = Math.floor(diffHrs / 24);
+  var diffDays = Math.floor(diffHrs / 24);
   return diffDays + 'd ago';
 }
 
 // ============================================================
-// FIREBASE — CRITICAL FIX SECTION
+// FIREBASE — v12 safe messaging
 // ============================================================
-// Problem: firebase-admin v12+ does NOT have app.messaging()
-// Solution: use getMessaging(app) from 'firebase-admin/messaging'
-//           OR admin.messaging(app) — both work, app.messaging() does NOT
 
 let _providerApp = null;
 let _providerMessaging = null;
 
+function _getMessagingFromApp(admin, app) {
+  // Method 1: admin.messaging(app) — v11 + v12
+  try {
+    var m1 = admin.messaging(app);
+    if (m1 && typeof m1.send === 'function') {
+      console.log('✅ Messaging via admin.messaging(app)');
+      return m1;
+    }
+  } catch (e) {
+    console.log('⚠️ admin.messaging(app) failed: ' + e.message);
+  }
+
+  // Method 2: getMessaging(app) — v12 modular
+  try {
+    var getMessaging = require('firebase-admin/messaging').getMessaging;
+    if (typeof getMessaging === 'function') {
+      var m2 = getMessaging(app);
+      if (m2 && typeof m2.send === 'function') {
+        console.log('✅ Messaging via getMessaging(app)');
+        return m2;
+      }
+    }
+  } catch (e) {
+    console.log('⚠️ getMessaging(app) failed: ' + e.message);
+  }
+
+  // Method 3: getMessaging() default
+  try {
+    var getMessaging2 = require('firebase-admin/messaging').getMessaging;
+    if (typeof getMessaging2 === 'function') {
+      var m3 = getMessaging2();
+      if (m3 && typeof m3.send === 'function') {
+        console.log('✅ Messaging via getMessaging() default');
+        return m3;
+      }
+    }
+  } catch (e) {}
+
+  // Method 4: admin.messaging() default
+  try {
+    var m4 = admin.messaging();
+    if (m4 && typeof m4.send === 'function') {
+      console.log('✅ Messaging via admin.messaging() default');
+      return m4;
+    }
+  } catch (e) {}
+
+  console.error('❌ ALL messaging methods failed!');
+  return null;
+}
+
 function getProviderFirebaseApp() {
-  // If already initialized and messaging is ready, return cached
   if (_providerApp && _providerMessaging) {
     return { app: _providerApp, messaging: _providerMessaging };
   }
 
-  const admin = require('firebase-admin');
+  var admin = require('firebase-admin');
 
-  // Check if app with our name already exists
-  const existingApps = admin.apps || [];
-  const found = existingApps.find(function(a) {
+  // Reuse existing named app
+  var existingApps = admin.apps || [];
+  var found = existingApps.find(function(a) {
     return a && a.name === 'manualDispatchProvider';
   });
 
   if (found) {
     _providerApp = found;
-    // Get messaging from existing app — DO NOT use found.messaging()
-    if (!_providerMessaging) {
-      _providerMessaging = _getMessagingFromApp(admin, found);
-    }
+    _providerMessaging = _getMessagingFromApp(admin, found);
     if (_providerMessaging) {
       console.log('♻️ Reusing existing Firebase app + messaging');
       return { app: _providerApp, messaging: _providerMessaging };
@@ -111,9 +157,9 @@ function getProviderFirebaseApp() {
     try {
       var json = Buffer.from(base64, 'base64').toString('utf8');
       serviceAccount = JSON.parse(json);
-      console.log('🔑 Provider service account loaded from BASE64, project:', serviceAccount.project_id);
+      console.log('🔑 Provider service account loaded from BASE64, project: ' + serviceAccount.project_id);
     } catch (e) {
-      console.error('❌ Failed to parse PROVIDER_FIREBASE_SERVICE_ACCOUNT_BASE64:', e.message);
+      console.error('❌ Failed to parse PROVIDER_FIREBASE_SERVICE_ACCOUNT_BASE64: ' + e.message);
     }
   }
 
@@ -127,19 +173,17 @@ function getProviderFirebaseApp() {
     for (var i = 0; i < filePaths.length; i++) {
       try {
         serviceAccount = require(filePaths[i]);
-        console.log('🔑 Provider service account loaded from file:', filePaths[i]);
+        console.log('🔑 Provider service account loaded from file: ' + filePaths[i]);
         break;
-      } catch (e) {
-        // continue to next path
-      }
+      } catch (e) {}
     }
   }
 
   if (!serviceAccount) {
-    throw new Error('No provider Firebase service account found. Set PROVIDER_FIREBASE_SERVICE_ACCOUNT_BASE64 env var.');
+    throw new Error('No provider Firebase service account found.');
   }
 
-  // Create credential — try multiple methods
+  // Credential
   var credential = null;
   try {
     credential = admin.credential.cert(serviceAccount);
@@ -154,7 +198,6 @@ function getProviderFirebaseApp() {
     }
   }
 
-  // Initialize app
   _providerApp = admin.initializeApp({
     credential: credential,
     projectId: serviceAccount.project_id
@@ -162,7 +205,6 @@ function getProviderFirebaseApp() {
 
   console.log('✅ Provider Firebase app initialized (manualDispatchProvider)');
 
-  // Get messaging — THIS IS THE CRITICAL FIX
   _providerMessaging = _getMessagingFromApp(admin, _providerApp);
 
   if (!_providerMessaging) {
@@ -173,76 +215,62 @@ function getProviderFirebaseApp() {
   return { app: _providerApp, messaging: _providerMessaging };
 }
 
-// Helper: Get messaging from app — tries ALL known methods
-// NEVER calls app.messaging() — that does not exist in firebase-admin v12+
-function _getMessagingFromApp(admin, app) {
-  // Method 1: admin.messaging(app) — works in v11 and v12
-  try {
-    var m1 = admin.messaging(app);
-    if (m1 && typeof m1.send === 'function') {
-      console.log('✅ Messaging via admin.messaging(app)');
-      return m1;
-    }
-  } catch (e) {
-    console.log('⚠️ admin.messaging(app) failed:', e.message);
-  }
-
-  // Method 2: getMessaging(app) from firebase-admin/messaging — v12+ modular
-  try {
-    var getMessaging = require('firebase-admin/messaging').getMessaging;
-    if (typeof getMessaging === 'function') {
-      var m2 = getMessaging(app);
-      if (m2 && typeof m2.send === 'function') {
-        console.log('✅ Messaging via getMessaging(app)');
-        return m2;
-      }
-    }
-  } catch (e) {
-    console.log('⚠️ getMessaging(app) failed:', e.message);
-  }
-
-  // Method 3: getMessaging() without app arg (uses default app)
-  try {
-    var getMessaging2 = require('firebase-admin/messaging').getMessaging;
-    if (typeof getMessaging2 === 'function') {
-      var m3 = getMessaging2();
-      if (m3 && typeof m3.send === 'function') {
-        console.log('✅ Messaging via getMessaging() default');
-        return m3;
-      }
-    }
-  } catch (e) {
-    console.log('⚠️ getMessaging() default failed:', e.message);
-  }
-
-  // Method 4: admin.messaging() without app arg (uses default app)
-  try {
-    var m4 = admin.messaging();
-    if (m4 && typeof m4.send === 'function') {
-      console.log('✅ Messaging via admin.messaging() default');
-      return m4;
-    }
-  } catch (e) {
-    console.log('⚠️ admin.messaging() default failed:', e.message);
-  }
-
-  console.error('❌ ALL messaging methods failed!');
-  return null;
-}
-
 // ============================================================
-// DATABASE HELPERS
+// DATABASE — MULTI-DB CONNECTION (CRITICAL FIX)
 // ============================================================
+// Scan ALL registered connections AND try multiple DB name variants
+
+var _dbCache = {};
 
 function getConnection(dbName) {
+  // Return cached
+  if (_dbCache[dbName]) {
+    try {
+      if (_dbCache[dbName].readyState === 1) {
+        return _dbCache[dbName];
+      }
+    } catch (e) {}
+  }
+
   var conn = mongoose.connection;
   if (!conn || conn.readyState !== 1) {
-    throw new Error('Mongoose not connected');
+    throw new Error('Mongoose not connected (readyState=' + (conn && conn.readyState) + ')');
   }
-  if (dbName === 'admin_panel') return conn;
-  return conn.useDb(dbName, { useCache: true });
+
+  // admin_panel = main connection
+  if (dbName === 'admin_panel') {
+    _dbCache[dbName] = conn;
+    return conn;
+  }
+
+  // Try name variants
+  var variants = {
+    'provider_db': ['provider_db', 'providerDB', 'providers', 'service_provider', 'providerdb', 'provider'],
+    'user_db': ['user_db', 'userDB', 'users', 'user_database', 'userdb', 'user'],
+    'bookings_db': ['bookings_db', 'bookingsDB', 'bookings', 'booking_db', 'bookingdb', 'booking']
+  };
+
+  var tryNames = variants[dbName] || [dbName];
+
+  for (var i = 0; i < tryNames.length; i++) {
+    try {
+      var db = conn.useDb(tryNames[i], { useCache: true });
+      if (db) {
+        _dbCache[dbName] = db;
+        return db;
+      }
+    } catch (e) {
+      continue;
+    }
+  }
+
+  // Last resort — just use dbName directly
+  var fallback = conn.useDb(dbName, { useCache: true });
+  _dbCache[dbName] = fallback;
+  return fallback;
 }
 
+// Scan ALL mongoose connections for a collection
 async function findInAllDbs(collectionName, query, options) {
   query = query || {};
   options = options || {};
@@ -253,6 +281,7 @@ async function findInAllDbs(collectionName, query, options) {
   for (var i = 0; i < dbs.length; i++) {
     try {
       var conn = getConnection(dbs[i]);
+      if (!conn) continue;
       var collection = conn.collection(collectionName);
       var count = await collection.countDocuments(query);
       if (count > 0) {
@@ -261,10 +290,47 @@ async function findInAllDbs(collectionName, query, options) {
         return { docs: docs, dbName: dbs[i], collection: collection };
       }
     } catch (e) {
+      console.log('   ⚠️ DB ' + dbs[i] + '.' + collectionName + ' error: ' + e.message);
       continue;
     }
   }
   return { docs: [], dbName: null, collection: null };
+}
+
+// Scan ALL and collect from EVERY db (not just first match)
+async function findInAllDbsAggregated(collectionName, query, options) {
+  query = query || {};
+  options = options || {};
+  var dbs = ['admin_panel', 'provider_db', 'user_db', 'bookings_db'];
+  var limit = options.limit || 1000;
+  var sort = options.sort || { _id: -1 };
+  var allDocs = [];
+  var seenIds = {};
+
+  for (var i = 0; i < dbs.length; i++) {
+    try {
+      var conn = getConnection(dbs[i]);
+      if (!conn) continue;
+      var collection = conn.collection(collectionName);
+      var count = await collection.countDocuments(query);
+      if (count > 0) {
+        var docs = await collection.find(query).sort(sort).limit(limit).toArray();
+        console.log('   ✓ Found ' + docs.length + ' in ' + dbs[i] + '.' + collectionName);
+        for (var j = 0; j < docs.length; j++) {
+          var idStr = String(docs[j]._id);
+          if (!seenIds[idStr]) {
+            seenIds[idStr] = true;
+            docs[j]._sourceDb = dbs[i];
+            allDocs.push(docs[j]);
+          }
+        }
+      }
+    } catch (e) {
+      console.log('   ⚠️ Aggregated scan error ' + dbs[i] + '.' + collectionName + ': ' + e.message);
+      continue;
+    }
+  }
+  return allDocs;
 }
 
 async function findOneInAllDbs(collectionName, query) {
@@ -274,6 +340,7 @@ async function findOneInAllDbs(collectionName, query) {
   for (var i = 0; i < dbs.length; i++) {
     try {
       var conn = getConnection(dbs[i]);
+      if (!conn) continue;
       var collection = conn.collection(collectionName);
       var doc = await collection.findOne(query);
       if (doc) {
@@ -298,12 +365,11 @@ async function updateInAllDbs(collectionName, query, update) {
   for (var i = 0; i < dbs.length; i++) {
     try {
       var conn = getConnection(dbs[i]);
+      if (!conn) continue;
       var collection = conn.collection(collectionName);
       var result = await collection.updateMany(query, update);
       total += result.modifiedCount || 0;
-    } catch (e) {
-      continue;
-    }
+    } catch (e) {}
   }
   return total;
 }
@@ -314,99 +380,98 @@ async function updateInAllDbs(collectionName, query, update) {
 
 async function loadCategoriesMap() {
   var map = {};
-  try {
-    var conn = getConnection('admin_panel');
-    var docs = await conn.collection('categories').find({}).toArray();
-    console.log('   ✓ Found ' + docs.length + ' in admin_panel.categories');
-    for (var i = 0; i < docs.length; i++) {
-      map[String(docs[i]._id)] = safeStr(docs[i].name || docs[i].categoryName || docs[i].title || docs[i]);
-    }
-  } catch (e) {}
-  try {
-    var conn2 = getConnection('user_db');
-    var docs2 = await conn2.collection('categories').find({}).toArray();
-    console.log('   ✓ Found ' + docs2.length + ' in user_db.categories');
-    for (var j = 0; j < docs2.length; j++) {
-      if (!map[String(docs2[j]._id)]) {
-        map[String(docs2[j]._id)] = safeStr(docs2[j].name || docs2[j].categoryName || docs2[j].title || docs2[j]);
+  var dbs = ['admin_panel', 'user_db', 'provider_db', 'bookings_db'];
+  for (var i = 0; i < dbs.length; i++) {
+    try {
+      var conn = getConnection(dbs[i]);
+      if (!conn) continue;
+      var docs = await conn.collection('categories').find({}).toArray();
+      if (docs.length > 0) {
+        console.log('   ✓ Found ' + docs.length + ' in ' + dbs[i] + '.categories');
+        for (var j = 0; j < docs.length; j++) {
+          var id = String(docs[j]._id);
+          if (!map[id]) {
+            map[id] = safeStr(docs[j].name || docs[j].categoryName || docs[j].title || docs[j]);
+          }
+        }
       }
-    }
-  } catch (e) {}
+    } catch (e) {}
+  }
   return map;
 }
 
 async function loadCitiesMap() {
   var map = {};
-  try {
-    var conn = getConnection('admin_panel');
-    var docs = await conn.collection('cities').find({}).toArray();
-    console.log('   ✓ Found ' + docs.length + ' in admin_panel.cities');
-    for (var i = 0; i < docs.length; i++) {
-      map[String(docs[i]._id)] = safeStr(docs[i].cityName || docs[i].name || docs[i].title || docs[i]);
-    }
-  } catch (e) {}
-  try {
-    var conn2 = getConnection('provider_db');
-    var docs2 = await conn2.collection('cities').find({}).toArray();
-    if (docs2.length > 0) {
-      console.log('   ✓ Found ' + docs2.length + ' in provider_db.cities');
-      for (var j = 0; j < docs2.length; j++) {
-        if (!map[String(docs2[j]._id)]) {
-          map[String(docs2[j]._id)] = safeStr(docs2[j].cityName || docs2[j].name || docs2[j].title || docs2[j]);
+  var dbs = ['admin_panel', 'provider_db', 'user_db', 'bookings_db'];
+  for (var i = 0; i < dbs.length; i++) {
+    try {
+      var conn = getConnection(dbs[i]);
+      if (!conn) continue;
+      var docs = await conn.collection('cities').find({}).toArray();
+      if (docs.length > 0) {
+        console.log('   ✓ Found ' + docs.length + ' in ' + dbs[i] + '.cities');
+        for (var j = 0; j < docs.length; j++) {
+          var id = String(docs[j]._id);
+          if (!map[id]) {
+            map[id] = safeStr(docs[j].cityName || docs[j].name || docs[j].title || docs[j]);
+          }
         }
       }
-    }
-  } catch (e) {}
+    } catch (e) {}
+  }
   return map;
 }
 
 async function loadServicesMap() {
   var map = {};
-  try {
-    var conn = getConnection('admin_panel');
-    var docs = await conn.collection('services').find({}).toArray();
-    console.log('   ✓ Found ' + docs.length + ' in admin_panel.services');
-    for (var i = 0; i < docs.length; i++) {
-      map[String(docs[i]._id)] = {
-        name: safeStr(docs[i].name || docs[i].serviceName || docs[i].title || docs[i]),
-        icon: safeStr(docs[i].icon || docs[i].image || docs[i].imageUrl || ''),
-        category: docs[i].category || docs[i].categoryId || null,
-        price: safeNum(docs[i].price || docs[i].basePrice || docs[i].amount || 0)
-      };
-    }
-  } catch (e) {}
-  try {
-    var conn2 = getConnection('user_db');
-    var docs2 = await conn2.collection('services').find({}).toArray();
-    console.log('   ✓ Found ' + docs2.length + ' in user_db.services');
-    for (var j = 0; j < docs2.length; j++) {
-      if (!map[String(docs2[j]._id)]) {
-        map[String(docs2[j]._id)] = {
-          name: safeStr(docs2[j].name || docs2[j].serviceName || docs2[j].title || docs2[j]),
-          icon: safeStr(docs2[j].icon || docs2[j].image || docs2[j].imageUrl || ''),
-          category: docs2[j].category || docs2[j].categoryId || null,
-          price: safeNum(docs2[j].price || docs2[j].basePrice || docs2[j].amount || 0)
-        };
+  var dbs = ['admin_panel', 'user_db', 'provider_db', 'bookings_db'];
+  for (var i = 0; i < dbs.length; i++) {
+    try {
+      var conn = getConnection(dbs[i]);
+      if (!conn) continue;
+      var docs = await conn.collection('services').find({}).toArray();
+      if (docs.length > 0) {
+        console.log('   ✓ Found ' + docs.length + ' in ' + dbs[i] + '.services');
+        for (var j = 0; j < docs.length; j++) {
+          var id = String(docs[j]._id);
+          if (!map[id]) {
+            map[id] = {
+              name: safeStr(docs[j].name || docs[j].serviceName || docs[j].title || docs[j]),
+              icon: safeStr(docs[j].icon || docs[j].image || docs[j].imageUrl || ''),
+              category: docs[j].category || docs[j].categoryId || null,
+              price: safeNum(docs[j].price || docs[j].basePrice || docs[j].amount || 0)
+            };
+          }
+        }
       }
-    }
-  } catch (e) {}
+    } catch (e) {}
+  }
   return map;
 }
 
 async function loadUsersMap() {
   var map = {};
-  try {
-    var conn = getConnection('user_db');
-    var docs = await conn.collection('users').find({}).toArray();
-    console.log('   ✓ Found ' + docs.length + ' in user_db.users');
-    for (var i = 0; i < docs.length; i++) {
-      map[String(docs[i]._id)] = {
-        name: safeStr(docs[i].name || docs[i].fullName || docs[i].firstName || docs[i].displayName || 'Customer'),
-        phone: safeStr(docs[i].phone || docs[i].phoneNumber || docs[i].mobile || ''),
-        email: safeStr(docs[i].email || '')
-      };
-    }
-  } catch (e) {}
+  var dbs = ['user_db', 'admin_panel', 'provider_db', 'bookings_db'];
+  for (var i = 0; i < dbs.length; i++) {
+    try {
+      var conn = getConnection(dbs[i]);
+      if (!conn) continue;
+      var docs = await conn.collection('users').find({}).toArray();
+      if (docs.length > 0) {
+        console.log('   ✓ Found ' + docs.length + ' in ' + dbs[i] + '.users');
+        for (var j = 0; j < docs.length; j++) {
+          var id = String(docs[j]._id);
+          if (!map[id]) {
+            map[id] = {
+              name: safeStr(docs[j].name || docs[j].fullName || docs[j].firstName || docs[j].displayName || 'Customer'),
+              phone: safeStr(docs[j].phone || docs[j].phoneNumber || docs[j].mobile || ''),
+              email: safeStr(docs[j].email || '')
+            };
+          }
+        }
+      }
+    } catch (e) {}
+  }
   return map;
 }
 
@@ -483,8 +548,14 @@ async function getOnlineProviders(req, res) {
     var categoriesMap = maps[0];
     var citiesMap = maps[1];
 
-    var result = await findInAllDbs('providers', query, { limit: 500, sort: { _id: -1 } });
-    var providers = result.docs;
+    // FIRST: try with filter query
+    var providers = await findInAllDbsAggregated('providers', query, { limit: 500, sort: { _id: -1 } });
+
+    // FALLBACK: if 0 found with filter AND not includeAll, retry with empty query to get ANY providers
+    if (providers.length === 0 && !includeAll) {
+      console.log('⚠️ No providers with filter — retrying with empty query');
+      providers = await findInAllDbsAggregated('providers', {}, { limit: 500, sort: { _id: -1 } });
+    }
 
     var enriched = providers.map(function(p) {
       var categoryName = '';
@@ -497,8 +568,8 @@ async function getOnlineProviders(req, res) {
           }).filter(Boolean);
           categoryName = names.join(', ');
         } else {
-          var id = typeof catField === 'object' ? String(catField._id || catField.categoryId || catField) : String(catField);
-          categoryName = categoriesMap[id] || safeStr(catField);
+          var cid = typeof catField === 'object' ? String(catField._id || catField.categoryId || catField) : String(catField);
+          categoryName = categoriesMap[cid] || safeStr(catField);
         }
       }
 
@@ -508,8 +579,8 @@ async function getOnlineProviders(req, res) {
         if (typeof cityField === 'object' && cityField.cityName) {
           cityName = cityField.cityName;
         } else {
-          var cid = typeof cityField === 'object' ? String(cityField._id || cityField) : String(cityField);
-          cityName = citiesMap[cid] || safeStr(cityField);
+          var ciId = typeof cityField === 'object' ? String(cityField._id || cityField) : String(cityField);
+          cityName = citiesMap[ciId] || safeStr(cityField);
         }
       }
 
@@ -520,8 +591,6 @@ async function getOnlineProviders(req, res) {
       var name = safeStr(p.name || p.fullName || p.firstName || p.businessName || 'Provider');
       var phone = safeStr(p.phone || p.phoneNumber || p.mobile || '');
       var email = safeStr(p.email || '');
-      var rating = safeNum(p.rating || p.averageRating || p.avgRating || 0);
-      var totalJobs = safeNum(p.totalJobs || p.completedJobs || p.jobsCompleted || p.totalBookings || 0);
 
       return {
         _id: String(p._id),
@@ -537,13 +606,14 @@ async function getOnlineProviders(req, res) {
         isVerified: p.isVerified || p.verified || false,
         hasFCM: !!fcmToken,
         fcmToken: fcmToken,
-        rating: rating,
-        totalJobs: totalJobs,
+        rating: safeNum(p.rating || p.averageRating || p.avgRating || 0),
+        totalJobs: safeNum(p.totalJobs || p.completedJobs || p.jobsCompleted || p.totalBookings || 0),
         profileImage: safeStr(p.profileImage || p.avatar || p.photo || p.image || ''),
-        createdAt: p.createdAt || p._id.getTimestamp(),
-        timeAgo: timeAgo(p.createdAt || p._id.getTimestamp()),
+        createdAt: p.createdAt || (p._id.getTimestamp ? p._id.getTimestamp() : new Date()),
+        timeAgo: timeAgo(p.createdAt || (p._id.getTimestamp ? p._id.getTimestamp() : new Date())),
         lastActive: p.lastActive || p.lastSeen || p.updatedAt || '',
-        lastActiveAgo: timeAgo(p.lastActive || p.lastSeen || p.updatedAt || '')
+        lastActiveAgo: timeAgo(p.lastActive || p.lastSeen || p.updatedAt || ''),
+        _sourceDb: p._sourceDb || ''
       };
     });
 
@@ -606,30 +676,8 @@ async function getDispatchableBookings(req, res) {
     var servicesMap = maps[2];
     var usersMap = maps[3];
 
-    var allBookings = [];
-
-    try {
-      var conn1 = getConnection('user_db');
-      var docs1 = await conn1.collection('bookings').find({}).sort({ _id: -1 }).limit(500).toArray();
-      console.log('   ✓ Found ' + docs1.length + ' in user_db.bookings');
-      for (var i = 0; i < docs1.length; i++) {
-        docs1[i]._source = 'user_db';
-        allBookings.push(docs1[i]);
-      }
-    } catch (e) {}
-
-    try {
-      var conn2 = getConnection('bookings_db');
-      var docs2 = await conn2.collection('bookings').find({}).sort({ _id: -1 }).limit(500).toArray();
-      console.log('   ✓ Found ' + docs2.length + ' in bookings_db.bookings');
-      for (var j = 0; j < docs2.length; j++) {
-        var exists = allBookings.find(function(b) { return String(b._id) === String(docs2[j]._id); });
-        if (!exists) {
-          docs2[j]._source = 'bookings_db';
-          allBookings.push(docs2[j]);
-        }
-      }
-    } catch (e) {}
+    // Get bookings from ALL databases (aggregated)
+    var allBookings = await findInAllDbsAggregated('bookings', {}, { limit: 500, sort: { _id: -1 } });
 
     var enriched = allBookings.map(function(b) {
       var customerName = 'Customer';
@@ -731,14 +779,14 @@ async function getDispatchableBookings(req, res) {
         assignedProviderName: assignedProviderName,
         scheduledDate: scheduledDate ? String(scheduledDate) : '',
         scheduledTime: scheduledTime ? String(scheduledTime) : '',
-        createdAt: b.createdAt || b._id.getTimestamp(),
-        timeAgo: timeAgo(b.createdAt || b._id.getTimestamp()),
+        createdAt: b.createdAt || (b._id.getTimestamp ? b._id.getTimestamp() : new Date()),
+        timeAgo: timeAgo(b.createdAt || (b._id.getTimestamp ? b._id.getTimestamp() : new Date())),
         updatedAt: b.updatedAt || '',
         updatedAgo: timeAgo(b.updatedAt || ''),
         paymentMethod: safeStr(b.paymentMethod || b.paymentMode || b.paymentType || ''),
         paymentStatus: safeStr(b.paymentStatus || ''),
         otp: safeStr(b.otp || b.verificationCode || ''),
-        _source: b._source || 'unknown'
+        _source: b._sourceDb || 'unknown'
       };
     });
 
@@ -757,7 +805,7 @@ async function getDispatchableBookings(req, res) {
         stats: {
           total: enriched.length,
           active: enriched.filter(function(b) {
-            return ['searching', 'pending', 'confirmed', 'active', 'in_progress', 'accepted'].includes(b.status);
+            return ['searching', 'pending', 'confirmed', 'active', 'in_progress', 'accepted'].indexOf(b.status) !== -1;
           }).length,
           unassigned: enriched.filter(function(b) { return !b.assignedProviderId; }).length,
           completed: enriched.filter(function(b) { return b.status === 'completed'; }).length,
@@ -772,7 +820,7 @@ async function getDispatchableBookings(req, res) {
 }
 
 // ============================================================
-// SEND MANUAL DISPATCH — THE MAIN FUNCTION
+// SEND MANUAL DISPATCH
 // ============================================================
 
 async function send(req, res) {
@@ -787,7 +835,6 @@ async function send(req, res) {
 
     console.log('🚀 [DISPATCH] booking=' + bookingId + ' → provider=' + providerId);
 
-    // 1. Find booking
     var bookingOid = toObjectId(bookingId);
     var bookingResult = null;
 
@@ -805,7 +852,6 @@ async function send(req, res) {
     var bookingCollection = bookingResult.collection;
     console.log('📋 Booking found in ' + bookingResult.dbName + ': status=' + booking.status);
 
-    // 2. Find provider
     var providerOid = toObjectId(providerId);
     var providerResult = null;
 
@@ -819,7 +865,6 @@ async function send(req, res) {
     var provider = providerResult.doc;
     console.log('👤 Provider: ' + (provider.name || provider.fullName || 'Unknown'));
 
-    // 3. Get FCM token
     var fcmToken = provider.fcmToken || provider.fcm_token || provider.deviceToken || provider.pushToken ||
                    (provider.deviceInfo && (provider.deviceInfo.fcmToken || provider.deviceInfo.token)) || '';
 
@@ -831,7 +876,6 @@ async function send(req, res) {
     }
     console.log('📱 FCM Token: ' + fcmToken.substring(0, 20) + '...');
 
-    // 4. Cancel existing offers
     console.log('🔄 Cancelling existing offers for booking ' + bookingId + '...');
     var cancelledOffers = await updateInAllDbs('provideroffers',
       {
@@ -854,7 +898,6 @@ async function send(req, res) {
     );
     console.log('   ❌ Cancelled ' + cancelledOffers + ' existing offers');
 
-    // 5. Reset booking status
     try {
       await bookingCollection.updateOne(
         { _id: booking._id },
@@ -877,7 +920,6 @@ async function send(req, res) {
       console.log('   ⚠️ Could not reset booking status: ' + e.message);
     }
 
-    // 6. Enrich data for FCM
     var maps = await Promise.all([
       loadCategoriesMap(), loadCitiesMap(), loadServicesMap(), loadUsersMap()
     ]);
@@ -937,7 +979,6 @@ async function send(req, res) {
       cityName = citiesMap[ciId] || safeStr(cityField);
     }
 
-    // 7. Create ProviderOffer
     var offerId = new mongoose.Types.ObjectId();
     var now = new Date();
     var expiresAt = new Date(now.getTime() + 30000);
@@ -971,7 +1012,6 @@ async function send(req, res) {
       }
     }
 
-    // 8. Create DispatchJob
     var dispatchJobId = new mongoose.Types.ObjectId();
     var statusOptions = ['pending', 'active', 'dispatched', 'searching', 'sent', 'waiting'];
     var dispatchInserted = false;
@@ -1007,16 +1047,12 @@ async function send(req, res) {
       if (dispatchInserted) break;
     }
 
-    // 9. SEND HYBRID ALARM FCM — THE CRITICAL PART
     var title = '🔔 New Booking! ₹' + totalAmount;
     var body = serviceName + ' • ₹' + totalAmount + ' • ' + (scheduledTime || 'ASAP') + '\n📍 ' + (address || cityName || 'Service Location');
 
     var fcmMessage = {
       token: fcmToken,
-      notification: {
-        title: title,
-        body: body
-      },
+      notification: { title: title, body: body },
       data: stringifyAll({
         type: 'booking_request',
         bookingId: String(bookingOid || bookingId),
@@ -1084,20 +1120,16 @@ async function send(req, res) {
     };
 
     console.log('📤 Sending HYBRID ALARM FCM...');
-    console.log('   Token: ' + fcmToken.substring(0, 30) + '...');
-    console.log('   Title: ' + title);
 
     var fcmResult = null;
     var fcmError = null;
 
     try {
-      // THIS IS THE FIX — getProviderFirebaseApp now returns { app, messaging }
-      // where messaging is obtained via getMessaging(app) NOT app.messaging()
       var firebase = getProviderFirebaseApp();
       var messaging = firebase.messaging;
 
       if (!messaging || typeof messaging.send !== 'function') {
-        throw new Error('Firebase messaging object is invalid. messaging=' + typeof messaging + ', send=' + typeof (messaging && messaging.send));
+        throw new Error('Firebase messaging invalid. messaging=' + typeof messaging);
       }
 
       console.log('   ✅ messaging.send is a function, sending now...');
@@ -1115,10 +1147,6 @@ async function send(req, res) {
       fcmError = err.message || String(err);
       console.error('❌ FCM FAILED: ' + fcmError);
 
-      if (fcmError.includes('not-found') || fcmError.includes('UNREGISTERED') || fcmError.includes('invalid-registration-token')) {
-        console.log('   ⚠️ FCM token is invalid/expired.');
-      }
-
       try {
         await updateInAllDbs('provideroffers',
           { _id: offerId },
@@ -1127,7 +1155,6 @@ async function send(req, res) {
       } catch (e) {}
     }
 
-    // 10. Socket emit
     try {
       var io = req.app.get('io');
       if (io) {
@@ -1146,13 +1173,9 @@ async function send(req, res) {
           providerId: String(providerOid || providerId),
           status: fcmResult ? 'sent' : 'fcm_failed'
         });
-        console.log('📡 Socket events emitted to admins room');
       }
-    } catch (e) {
-      console.log('   ⚠️ Socket emit failed: ' + e.message);
-    }
+    } catch (e) {}
 
-    // 11. Response
     res.json({
       success: !!fcmResult,
       data: {
@@ -1175,7 +1198,7 @@ async function send(req, res) {
         dispatchInserted: dispatchInserted,
         message: fcmResult
           ? '✅ Dispatch sent! Provider will get Accept/Reject popup. Expires in 30s.'
-          : '❌ FCM failed: ' + fcmError + '. Offer created but notification not delivered.'
+          : '❌ FCM failed: ' + fcmError
       }
     });
 
@@ -1250,11 +1273,35 @@ async function getOfferStatus(req, res) {
 }
 
 // ============================================================
-// DEBUG
+// DEBUG — CRITICAL for diagnosing DB issues
 // ============================================================
 
 async function debug(req, res) {
   try {
+    // Test each DB connection
+    var dbTests = {};
+    var dbs = ['admin_panel', 'provider_db', 'user_db', 'bookings_db'];
+    for (var i = 0; i < dbs.length; i++) {
+      try {
+        var conn = getConnection(dbs[i]);
+        var dbNameActual = conn.name || conn.db && conn.db.databaseName || 'unknown';
+        var providersCount = 0, bookingsCount = 0, categoriesCount = 0;
+        try { providersCount = await conn.collection('providers').countDocuments(); } catch (e) {}
+        try { bookingsCount = await conn.collection('bookings').countDocuments(); } catch (e) {}
+        try { categoriesCount = await conn.collection('categories').countDocuments(); } catch (e) {}
+        dbTests[dbs[i]] = {
+          connected: true,
+          actualDbName: dbNameActual,
+          readyState: conn.readyState,
+          providers: providersCount,
+          bookings: bookingsCount,
+          categories: categoriesCount
+        };
+      } catch (e) {
+        dbTests[dbs[i]] = { connected: false, error: e.message };
+      }
+    }
+
     var maps = await Promise.all([
       loadCategoriesMap(), loadCitiesMap(), loadServicesMap(), loadUsersMap()
     ]);
@@ -1264,57 +1311,46 @@ async function debug(req, res) {
       var fb = getProviderFirebaseApp();
       firebaseStatus = fb.messaging && typeof fb.messaging.send === 'function'
         ? 'messaging ready ✅'
-        : 'messaging INVALID ❌ (type: ' + typeof fb.messaging + ')';
+        : 'messaging INVALID ❌';
     } catch (e) {
       firebaseStatus = 'error: ' + e.message;
     }
 
-    var provResult = await findInAllDbs('providers', {}, { limit: 2 });
-    var sampleProviders = provResult.docs.map(function(p) {
-      var catField = p.category || p.categoryId || p.categories;
-      var catResolved = '';
-      if (catField) {
-        if (Array.isArray(catField)) {
-          catResolved = catField.map(function(c) {
-            var id = typeof c === 'object' ? String(c._id || c) : String(c);
-            return maps[0][id] || '[unmapped:' + id + ']';
-          }).join(', ');
-        } else {
-          var id = typeof catField === 'object' ? String(catField._id || catField) : String(catField);
-          catResolved = maps[0][id] || '[unmapped:' + id + ']';
-        }
-      }
-      var cityField = p.city || p.cityId;
-      var cityResolved = '';
-      if (cityField) {
-        var cid = typeof cityField === 'object' ? String(cityField._id || cityField) : String(cityField);
-        cityResolved = maps[1][cid] || '[unmapped:' + cid + ']';
-      }
-      return {
-        _id: String(p._id),
-        name: p.name,
-        categoryRaw: catField,
-        categoryResolved: catResolved,
-        cityRaw: cityField,
-        cityResolved: cityResolved,
-        fcmToken: p.fcmToken ? String(p.fcmToken).substring(0, 20) + '...' : 'NONE'
-      };
-    });
+    var provResult = await findInAllDbsAggregated('providers', {}, { limit: 2 });
+    var bookResult = await findInAllDbsAggregated('bookings', {}, { limit: 2 });
 
     res.json({
       success: true,
       data: {
+        mongooseReadyState: mongoose.connection.readyState,
+        mainDbName: mongoose.connection.name || (mongoose.connection.db && mongoose.connection.db.databaseName),
+        dbTests: dbTests,
         categoriesLoaded: Object.keys(maps[0]).length,
         citiesLoaded: Object.keys(maps[1]).length,
         servicesLoaded: Object.keys(maps[2]).length,
         usersLoaded: Object.keys(maps[3]).length,
         firebaseStatus: firebaseStatus,
-        sampleCategories: Object.entries(maps[0]).slice(0, 5).map(function(e) { return { id: e[0], name: e[1] }; }),
-        sampleCities: Object.entries(maps[1]).slice(0, 5).map(function(e) { return { id: e[0], name: e[1] }; }),
-        sampleProviders: sampleProviders,
+        sampleProvidersFound: provResult.length,
+        sampleBookingsFound: bookResult.length,
+        sampleProviders: provResult.map(function(p) {
+          return {
+            _id: String(p._id),
+            name: p.name || p.fullName,
+            sourceDb: p._sourceDb,
+            fcmToken: p.fcmToken ? 'YES' : 'NO'
+          };
+        }),
+        sampleBookings: bookResult.map(function(b) {
+          return {
+            _id: String(b._id),
+            status: b.status,
+            sourceDb: b._sourceDb
+          };
+        }),
         envVars: {
           PROVIDER_FIREBASE_BASE64: process.env.PROVIDER_FIREBASE_SERVICE_ACCOUNT_BASE64 ? 'SET' : 'NOT SET',
-          ADMIN_SECRET: process.env.ADMIN_SECRET_KEY ? 'SET' : 'NOT SET'
+          ADMIN_SECRET: process.env.ADMIN_SECRET_KEY ? 'SET' : 'NOT SET',
+          MONGODB_URI: process.env.MONGODB_URI ? 'SET' : 'NOT SET'
         }
       }
     });
@@ -1330,13 +1366,23 @@ async function debugConnections(req, res) {
     var collections = ['providers', 'bookings', 'categories', 'cities', 'services', 'users', 'provideroffers', 'dispatchjobs'];
 
     for (var i = 0; i < dbs.length; i++) {
-      results[dbs[i]] = {};
-      for (var j = 0; j < collections.length; j++) {
-        try {
-          var conn = getConnection(dbs[i]);
-          var count = await conn.collection(collections[j]).countDocuments();
-          if (count > 0) results[dbs[i]][collections[j]] = count;
-        } catch (e) {}
+      results[dbs[i]] = { _dbInfo: null };
+      try {
+        var conn = getConnection(dbs[i]);
+        results[dbs[i]]._dbInfo = {
+          actualName: conn.name || (conn.db && conn.db.databaseName),
+          readyState: conn.readyState
+        };
+        for (var j = 0; j < collections.length; j++) {
+          try {
+            var count = await conn.collection(collections[j]).countDocuments();
+            results[dbs[i]][collections[j]] = count;
+          } catch (e) {
+            results[dbs[i]][collections[j]] = 'error: ' + e.message;
+          }
+        }
+      } catch (e) {
+        results[dbs[i]]._error = e.message;
       }
     }
     res.json({ success: true, data: results });
@@ -1350,13 +1396,10 @@ function _health(req, res) {
     success: true,
     message: 'Manual Dispatch controller healthy',
     timestamp: new Date().toISOString(),
+    mongooseState: mongoose.connection.readyState,
     exports: Object.keys(module.exports)
   });
 }
-
-// ============================================================
-// EXPORTS
-// ============================================================
 
 module.exports = {
   getOnlineProviders: getOnlineProviders,
