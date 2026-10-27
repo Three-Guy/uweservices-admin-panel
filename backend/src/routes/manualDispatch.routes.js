@@ -1,50 +1,57 @@
 // backend/src/routes/manualDispatch.routes.js
-// ══════════════════════════════════════════════════════════════
-//  MANUAL DISPATCH ROUTES
-//  - Supports BOTH JWT auth (admin panel UI) AND x-admin-secret (scripts)
-// ══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// MANUAL DISPATCH ROUTES
+// Mounted at /api/v1/admin/manual-dispatch
+// Supports JWT auth + x-admin-secret header
+// ═══════════════════════════════════════════════════════════════
 
 const express = require('express');
 const router = express.Router();
-const ctrl = require('../controllers/manualDispatch.controller');
 
-/* ─── Flexible auth: JWT OR x-admin-secret ─── */
-let authMiddleware;
-try {
-  authMiddleware = require('../middleware/authMiddleware');
-} catch (e) {
-  console.warn('[manualDispatch.routes] authMiddleware not available:', e.message);
-  authMiddleware = (req, res, next) => next();
-}
+const manualDispatchController = require('../controllers/manualDispatch.controller');
 
+/* ─────────────────────────────────────────────
+   AUTH MIDDLEWARE (JWT or admin-secret)
+   ───────────────────────────────────────────── */
 const ADMIN_SECRET = process.env.ADMIN_SECRET_KEY || 'uwe_admin_super_secret_2026';
 
-function flexibleAuth(req, res, next) {
-  // Allow x-admin-secret header to bypass JWT (for CLI / scripts / mobile dev)
-  const providedSecret = req.headers['x-admin-secret'] || req.headers['x-admin-key'];
-  if (providedSecret && String(providedSecret) === String(ADMIN_SECRET)) {
-    req.admin = { role: 'admin', source: 'admin-secret' };
-    req.user = req.admin;
+function authMiddleware(req, res, next) {
+  // Option 1: Admin secret header (bypass JWT)
+  const secret = req.headers['x-admin-secret'];
+  if (secret && secret === ADMIN_SECRET) {
+    req.admin = { email: 'secret-admin', role: 'admin', fromSecret: true };
     return next();
   }
-  // Else fall back to JWT auth
-  return authMiddleware(req, res, next);
+
+  // Option 2: JWT via existing authMiddleware
+  try {
+    const jwtAuth = require('../middleware/authMiddleware');
+    const fn =
+      jwtAuth.verifyAdmin ||
+      jwtAuth.adminAuth ||
+      jwtAuth.protect ||
+      jwtAuth.authenticate ||
+      jwtAuth;
+
+    if (typeof fn === 'function') {
+      return fn(req, res, next);
+    }
+  } catch (e) {
+    console.warn('⚠️ [ManualDispatch] JWT middleware load failed:', e.message);
+  }
+
+  return res.status(401).json({
+    success: false,
+    message: 'Unauthorized — provide JWT token or x-admin-secret header',
+  });
 }
 
-/* ─── Routes ─── */
-
-// List all online providers (filterable)
-// Query: ?all=1 (include offline) | ?search=xxx | ?category=plumbing
-router.get('/online-providers', flexibleAuth, ctrl.getOnlineProviders);
-
-// List all dispatchable bookings
-router.get('/dispatchable-bookings', flexibleAuth, ctrl.getDispatchableBookings);
-
-// Admin sends manual dispatch
-// Body: { bookingId, providerId, adminNote? }
-router.post('/send', flexibleAuth, ctrl.sendManualDispatch);
-
-// Poll offer status
-router.get('/offer-status/:offerId', flexibleAuth, ctrl.getOfferStatus);
+/* ─────────────────────────────────────────────
+   ROUTES
+   ───────────────────────────────────────────── */
+router.get('/online-providers', authMiddleware, manualDispatchController.getOnlineProviders);
+router.get('/dispatchable-bookings', authMiddleware, manualDispatchController.getDispatchableBookings);
+router.post('/send', authMiddleware, manualDispatchController.send);
+router.get('/offer-status/:offerId', authMiddleware, manualDispatchController.getOfferStatus);
 
 module.exports = router;
