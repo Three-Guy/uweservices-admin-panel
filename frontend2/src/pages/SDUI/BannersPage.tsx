@@ -27,6 +27,10 @@ import {
   Copy,
   Link,
   Star,
+  Play,
+  Film,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
 import {
   DndContext,
@@ -98,6 +102,7 @@ interface Banner {
   display: BannerDisplay;
   isActive: boolean;
   analytics: BannerAnalytics;
+  mediaType?: 'image' | 'video';
   createdAt: string;
   updatedAt: string;
 }
@@ -120,6 +125,85 @@ interface Pagination {
   hasPrev: boolean;
 }
 
+// ==================== MEDIA HELPERS ====================
+const VIDEO_EXTENSIONS = ['.webm', '.mp4', '.ogg', '.mov', '.avi', '.mkv'];
+const VIDEO_MIME_TYPES = [
+  'video/webm',
+  'video/mp4',
+  'video/ogg',
+  'video/quicktime',
+  'video/x-msvideo',
+  'video/x-matroska',
+];
+const IMAGE_MIME_TYPES = [
+  'image/png',
+  'image/jpeg',
+  'image/jpg',
+  'image/webp',
+  'image/gif',
+  'image/svg+xml',
+];
+
+// All accepted file types for the file input
+const ACCEPTED_FILE_TYPES = [...IMAGE_MIME_TYPES, ...VIDEO_MIME_TYPES].join(',');
+
+// Max file sizes
+const MAX_IMAGE_SIZE_MB = 5;
+const MAX_VIDEO_SIZE_MB = 50;
+
+/**
+ * Detect if a URL points to a video file based on extension or known patterns.
+ * Also checks the optional `mediaType` field from backend.
+ */
+const isVideoUrl = (url: string | null | undefined, mediaType?: string): boolean => {
+  if (mediaType === 'video') return true;
+  if (!url) return false;
+
+  const cleanUrl = url.split('?')[0].split('#')[0].toLowerCase();
+
+  // Check extension
+  if (VIDEO_EXTENSIONS.some((ext) => cleanUrl.endsWith(ext))) return true;
+
+  // Check for common video CDN patterns
+  if (cleanUrl.includes('/video/') || cleanUrl.includes('video/upload')) return true;
+
+  // Check for Cloudinary video resource type
+  if (cleanUrl.includes('cloudinary') && cleanUrl.includes('/video/')) return true;
+
+  return false;
+};
+
+/**
+ * Detect if a File object is a video
+ */
+const isVideoFile = (file: File): boolean => {
+  return file.type.startsWith('video/') || VIDEO_MIME_TYPES.includes(file.type);
+};
+
+/**
+ * Get a human-readable file type label
+ */
+const getMediaTypeLabel = (
+  url: string | null | undefined,
+  mediaType?: string
+): { label: string; color: string; icon: 'video' | 'image' } => {
+  if (isVideoUrl(url, mediaType)) {
+    return { label: 'Video', color: 'bg-purple-100 text-purple-700', icon: 'video' };
+  }
+  return { label: 'Image', color: 'bg-blue-100 text-blue-700', icon: 'image' };
+};
+
+/**
+ * Format file size for display
+ */
+const formatFileSize = (bytes: number): string => {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+};
+
 // ==================== API ====================
 const bannersApi = {
   getAll: async (params?: Record<string, any>) => {
@@ -137,12 +221,14 @@ const bannersApi = {
   create: async (formData: FormData) => {
     const response = await apiClient.post('/admin/sdui/banners', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 120000, // 2 min timeout for video uploads
     });
     return response.data;
   },
   update: async (id: string, formData: FormData) => {
     const response = await apiClient.put(`/admin/sdui/banners/${id}`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 120000,
     });
     return response.data;
   },
@@ -173,6 +259,121 @@ const ACTION_TYPES = [
   { value: 'promo', label: 'Promo Code' },
 ];
 
+// ==================== MEDIA PREVIEW COMPONENT ====================
+interface MediaPreviewProps {
+  url: string;
+  alt?: string;
+  mediaType?: string;
+  className?: string;
+  showControls?: boolean;
+  autoPlay?: boolean;
+  muted?: boolean;
+  loop?: boolean;
+  onError?: () => void;
+  fallbackElement?: React.ReactNode;
+}
+
+const MediaPreview: React.FC<MediaPreviewProps> = ({
+  url,
+  alt = 'Banner',
+  mediaType,
+  className = 'w-full h-full object-cover',
+  showControls = false,
+  autoPlay = false,
+  muted = true,
+  loop = true,
+  onError,
+  fallbackElement,
+}) => {
+  const [hasError, setHasError] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(autoPlay);
+  const [isMuted, setIsMuted] = useState(muted);
+  const videoRef = React.useRef<HTMLVideoElement>(null);
+
+  const handleError = () => {
+    setHasError(true);
+    onError?.();
+  };
+
+  if (hasError) {
+    return (
+      fallbackElement || (
+        <div className="w-full h-full flex items-center justify-center bg-gray-100">
+          <ImageIcon className="w-8 h-8 text-gray-400" />
+        </div>
+      )
+    );
+  }
+
+  if (isVideoUrl(url, mediaType)) {
+    return (
+      <div className="relative w-full h-full group">
+        <video
+          ref={videoRef}
+          src={url}
+          className={className}
+          autoPlay={autoPlay}
+          muted={isMuted}
+          loop={loop}
+          playsInline
+          controls={showControls}
+          onError={handleError}
+          onPlay={() => setIsPlaying(true)}
+          onPause={() => setIsPlaying(false)}
+        />
+        {/* Video overlay controls (only when showControls is false) */}
+        {!showControls && (
+          <div className="absolute inset-0 bg-black/0 group-hover:bg-black/20 transition-all flex items-center justify-center opacity-0 group-hover:opacity-100">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                if (videoRef.current) {
+                  if (isPlaying) {
+                    videoRef.current.pause();
+                  } else {
+                    videoRef.current.play();
+                  }
+                }
+              }}
+              className="p-2 bg-white/90 rounded-full shadow-lg hover:bg-white transition-colors"
+            >
+              {isPlaying ? (
+                <div className="w-4 h-4 flex items-center justify-center">
+                  <div className="flex gap-1">
+                    <div className="w-1 h-4 bg-gray-700 rounded" />
+                    <div className="w-1 h-4 bg-gray-700 rounded" />
+                  </div>
+                </div>
+              ) : (
+                <Play className="w-4 h-4 text-gray-700 ml-0.5" />
+              )}
+            </button>
+          </div>
+        )}
+        {/* Video badge */}
+        <div className="absolute top-1 left-1 px-1.5 py-0.5 bg-black/60 text-white text-[10px] font-bold rounded flex items-center gap-1">
+          <Film className="w-3 h-3" />
+          VIDEO
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <img
+      src={url}
+      alt={alt}
+      className={className}
+      onError={(e) => {
+        (e.target as HTMLImageElement).src =
+          'https://via.placeholder.com/320x200?text=Banner';
+        handleError();
+      }}
+    />
+  );
+};
+
 // ==================== BANNER CARD COMPONENT ====================
 interface BannerCardProps {
   banner: Banner;
@@ -193,9 +394,15 @@ const BannerCard: React.FC<BannerCardProps> = ({
 }) => {
   const [showMenu, setShowMenu] = useState(false);
 
-  const position = POSITIONS.find(p => p.value === banner.display?.position) || POSITIONS[0];
+  const position =
+    POSITIONS.find((p) => p.value === banner.display?.position) || POSITIONS[0];
   const isScheduled = banner.schedule?.isScheduled;
-  const isExpired = isScheduled && banner.schedule?.endDate && new Date(banner.schedule.endDate) < new Date();
+  const isExpired =
+    isScheduled &&
+    banner.schedule?.endDate &&
+    new Date(banner.schedule.endDate) < new Date();
+
+  const mediaInfo = getMediaTypeLabel(banner.image?.url, banner.mediaType);
 
   return (
     <div
@@ -215,16 +422,17 @@ const BannerCard: React.FC<BannerCardProps> = ({
             <GripVertical className="w-5 h-5 text-gray-400" />
           </div>
 
-          {/* Banner Image */}
-          <div className="w-32 h-20 rounded-lg overflow-hidden bg-gray-100 flex-shrink-0">
+          {/* Banner Image/Video */}
+          <div className="w-32 h-20 rounded-lg overflow-hidden bg-gray-100 flex-shrink-0 relative">
             {banner.image?.url ? (
-              <img
-                src={banner.image.url}
+              <MediaPreview
+                url={banner.image.url}
                 alt={banner.title}
+                mediaType={banner.mediaType}
                 className="w-full h-full object-cover"
-                onError={(e) => {
-                  (e.target as HTMLImageElement).src = 'https://via.placeholder.com/320x200?text=Banner';
-                }}
+                autoPlay={false}
+                muted={true}
+                loop={true}
               />
             ) : (
               <div className="w-full h-full flex items-center justify-center">
@@ -241,8 +449,21 @@ const BannerCard: React.FC<BannerCardProps> = ({
                   <h3 className="text-base font-semibold text-gray-900 truncate">
                     {banner.title || 'Untitled Banner'}
                   </h3>
-                  <span className={`px-2 py-0.5 text-xs font-medium rounded-full ${position.color}`}>
+                  <span
+                    className={`px-2 py-0.5 text-xs font-medium rounded-full ${position.color}`}
+                  >
                     {position.label}
+                  </span>
+                  {/* Media type badge */}
+                  <span
+                    className={`px-2 py-0.5 text-xs font-medium rounded-full ${mediaInfo.color} flex items-center gap-1`}
+                  >
+                    {mediaInfo.icon === 'video' ? (
+                      <Film className="w-3 h-3" />
+                    ) : (
+                      <ImageIcon className="w-3 h-3" />
+                    )}
+                    {mediaInfo.label}
                   </span>
                   {!banner.isActive && (
                     <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-gray-100 text-gray-600">
@@ -255,9 +476,13 @@ const BannerCard: React.FC<BannerCardProps> = ({
                     </span>
                   )}
                 </div>
-                <code className="text-xs text-gray-400 font-mono">{banner.bannerId}</code>
+                <code className="text-xs text-gray-400 font-mono">
+                  {banner.bannerId}
+                </code>
                 {banner.description && (
-                  <p className="text-sm text-gray-500 mt-1 line-clamp-1">{banner.description}</p>
+                  <p className="text-sm text-gray-500 mt-1 line-clamp-1">
+                    {banner.description}
+                  </p>
                 )}
               </div>
 
@@ -272,17 +497,26 @@ const BannerCard: React.FC<BannerCardProps> = ({
 
                 {showMenu && (
                   <>
-                    <div className="fixed inset-0 z-10" onClick={() => setShowMenu(false)} />
+                    <div
+                      className="fixed inset-0 z-10"
+                      onClick={() => setShowMenu(false)}
+                    />
                     <div className="absolute right-0 top-full mt-1 w-48 bg-white rounded-xl shadow-xl border border-gray-100 py-2 z-20">
                       <button
-                        onClick={() => { onEdit(banner); setShowMenu(false); }}
+                        onClick={() => {
+                          onEdit(banner);
+                          setShowMenu(false);
+                        }}
                         className="w-full px-4 py-2.5 text-left text-sm text-gray-700 hover:bg-gray-50 flex items-center gap-3"
                       >
                         <Edit2 className="w-4 h-4 text-gray-400" />
                         Edit Banner
                       </button>
                       <button
-                        onClick={() => { onToggleStatus(banner); setShowMenu(false); }}
+                        onClick={() => {
+                          onToggleStatus(banner);
+                          setShowMenu(false);
+                        }}
                         className="w-full px-4 py-2.5 text-left text-sm text-gray-700 hover:bg-gray-50 flex items-center gap-3"
                       >
                         {banner.isActive ? (
@@ -306,12 +540,17 @@ const BannerCard: React.FC<BannerCardProps> = ({
                           onClick={() => setShowMenu(false)}
                         >
                           <ExternalLink className="w-4 h-4 text-gray-400" />
-                          View Image
+                          {isVideoUrl(banner.image.url, banner.mediaType)
+                            ? 'View Video'
+                            : 'View Image'}
                         </a>
                       )}
                       <hr className="my-2 border-gray-100" />
                       <button
-                        onClick={() => { onDelete(banner); setShowMenu(false); }}
+                        onClick={() => {
+                          onDelete(banner);
+                          setShowMenu(false);
+                        }}
                         className="w-full px-4 py-2.5 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-3"
                       >
                         <Trash2 className="w-4 h-4" />
@@ -327,17 +566,23 @@ const BannerCard: React.FC<BannerCardProps> = ({
             <div className="flex items-center gap-4 mt-3">
               <div className="flex items-center gap-1.5 text-sm text-gray-500">
                 <Eye className="w-4 h-4 text-blue-500" />
-                <span className="font-medium text-gray-700">{(banner.analytics?.impressions || 0).toLocaleString()}</span>
+                <span className="font-medium text-gray-700">
+                  {(banner.analytics?.impressions || 0).toLocaleString()}
+                </span>
                 <span>views</span>
               </div>
               <div className="flex items-center gap-1.5 text-sm text-gray-500">
                 <MousePointer className="w-4 h-4 text-green-500" />
-                <span className="font-medium text-gray-700">{(banner.analytics?.clicks || 0).toLocaleString()}</span>
+                <span className="font-medium text-gray-700">
+                  {(banner.analytics?.clicks || 0).toLocaleString()}
+                </span>
                 <span>clicks</span>
               </div>
               <div className="flex items-center gap-1.5 text-sm text-gray-500">
                 <BarChart3 className="w-4 h-4 text-purple-500" />
-                <span className="font-medium text-gray-700">{((banner.analytics?.ctr || 0) * 100).toFixed(1)}%</span>
+                <span className="font-medium text-gray-700">
+                  {((banner.analytics?.ctr || 0) * 100).toFixed(1)}%
+                </span>
                 <span>CTR</span>
               </div>
               {isScheduled && (
@@ -360,7 +605,11 @@ const BannerCard: React.FC<BannerCardProps> = ({
               }`}
               title={banner.isActive ? 'Deactivate' : 'Activate'}
             >
-              {banner.isActive ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
+              {banner.isActive ? (
+                <Eye className="w-4 h-4" />
+              ) : (
+                <EyeOff className="w-4 h-4" />
+              )}
             </button>
             <button
               onClick={() => onEdit(banner)}
@@ -383,14 +632,8 @@ const SortableBannerItem: React.FC<{
   onDelete: (banner: Banner) => void;
   onToggleStatus: (banner: Banner) => void;
 }> = ({ banner, onEdit, onDelete, onToggleStatus }) => {
-  const {
-    attributes,
-    listeners,
-    setNodeRef,
-    transform,
-    transition,
-    isDragging,
-  } = useSortable({ id: banner._id });
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: banner._id });
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -420,7 +663,12 @@ interface BannerFormProps {
   isLoading: boolean;
 }
 
-const BannerForm: React.FC<BannerFormProps> = ({ banner, onSubmit, onClose, isLoading }) => {
+const BannerForm: React.FC<BannerFormProps> = ({
+  banner,
+  onSubmit,
+  onClose,
+  isLoading,
+}) => {
   const [formData, setFormData] = useState({
     title: banner?.title || '',
     description: banner?.description || '',
@@ -430,26 +678,105 @@ const BannerForm: React.FC<BannerFormProps> = ({ banner, onSubmit, onClose, isLo
     actionTarget: banner?.action?.target || '',
     isActive: banner?.isActive ?? true,
     isScheduled: banner?.schedule?.isScheduled || false,
-    startDate: banner?.schedule?.startDate ? banner.schedule.startDate.split('T')[0] : '',
-    endDate: banner?.schedule?.endDate ? banner.schedule.endDate.split('T')[0] : '',
+    startDate: banner?.schedule?.startDate
+      ? banner.schedule.startDate.split('T')[0]
+      : '',
+    endDate: banner?.schedule?.endDate
+      ? banner.schedule.endDate.split('T')[0]
+      : '',
     backgroundColor: banner?.display?.backgroundColor || '#FFFFFF',
     sortOrder: banner?.display?.sortOrder || 0,
   });
 
-  const [imageFile, setImageFile] = useState<File | null>(null);
-  const [imagePreview, setImagePreview] = useState<string | null>(banner?.image?.url || null);
+  const [mediaFile, setMediaFile] = useState<File | null>(null);
+  const [mediaPreview, setMediaPreview] = useState<string | null>(
+    banner?.image?.url || null
+  );
+  const [isPreviewVideo, setIsPreviewVideo] = useState<boolean>(
+    isVideoUrl(banner?.image?.url, banner?.mediaType)
+  );
+  const [uploadProgress, setUploadProgress] = useState<number>(0);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [selectedFileInfo, setSelectedFileInfo] = useState<{
+    name: string;
+    size: string;
+    type: string;
+  } | null>(null);
 
-  const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleMediaChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      setImageFile(file);
+    if (!file) return;
+
+    setFileError(null);
+
+    // Validate file type
+    const isVideo = isVideoFile(file);
+    const isImage = IMAGE_MIME_TYPES.includes(file.type);
+
+    if (!isVideo && !isImage) {
+      setFileError(
+        `Unsupported file type: ${file.type || 'unknown'}. Accepted: PNG, JPG, WebP, GIF, WebM, MP4, OGG, MOV`
+      );
+      e.target.value = '';
+      return;
+    }
+
+    // Validate file size
+    const maxSizeMB = isVideo ? MAX_VIDEO_SIZE_MB : MAX_IMAGE_SIZE_MB;
+    const fileSizeMB = file.size / (1024 * 1024);
+
+    if (fileSizeMB > maxSizeMB) {
+      setFileError(
+        `File too large: ${fileSizeMB.toFixed(1)}MB. Maximum for ${isVideo ? 'videos' : 'images'}: ${maxSizeMB}MB`
+      );
+      e.target.value = '';
+      return;
+    }
+
+    setMediaFile(file);
+    setIsPreviewVideo(isVideo);
+    setSelectedFileInfo({
+      name: file.name,
+      size: formatFileSize(file.size),
+      type: isVideo ? 'Video' : 'Image',
+    });
+
+    // Generate preview
+    if (isVideo) {
+      // For video, create object URL for preview
+      const objectUrl = URL.createObjectURL(file);
+      setMediaPreview(objectUrl);
+    } else {
+      // For image, use FileReader
       const reader = new FileReader();
       reader.onloadend = () => {
-        setImagePreview(reader.result as string);
+        setMediaPreview(reader.result as string);
       };
       reader.readAsDataURL(file);
     }
   };
+
+  const clearMedia = () => {
+    // Revoke object URL if it was a video preview
+    if (mediaPreview && isPreviewVideo && mediaFile) {
+      URL.revokeObjectURL(mediaPreview);
+    }
+    setMediaFile(null);
+    setMediaPreview(null);
+    setIsPreviewVideo(false);
+    setSelectedFileInfo(null);
+    setFileError(null);
+    setFormData({ ...formData, imageUrl: '' });
+  };
+
+  // Cleanup object URL on unmount
+  useEffect(() => {
+    return () => {
+      if (mediaPreview && isPreviewVideo && mediaFile) {
+        URL.revokeObjectURL(mediaPreview);
+      }
+    };
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -470,10 +797,21 @@ const BannerForm: React.FC<BannerFormProps> = ({ banner, onSubmit, onClose, isLo
       if (formData.endDate) submitData.append('endDate', formData.endDate);
     }
 
-    if (imageFile) {
-      submitData.append('image', imageFile);
+    if (mediaFile) {
+      // Append file under 'image' key (backend expects this field name)
+      submitData.append('image', mediaFile);
+      // Tell backend what type of media this is
+      submitData.append(
+        'mediaType',
+        isVideoFile(mediaFile) ? 'video' : 'image'
+      );
     } else if (formData.imageUrl && !banner?.image?.url) {
       submitData.append('imageUrl', formData.imageUrl);
+      // Detect media type from URL
+      submitData.append(
+        'mediaType',
+        isVideoUrl(formData.imageUrl) ? 'video' : 'image'
+      );
     }
 
     await onSubmit(submitData);
@@ -489,7 +827,9 @@ const BannerForm: React.FC<BannerFormProps> = ({ banner, onSubmit, onClose, isLo
               {banner ? 'Edit Banner' : 'Create New Banner'}
             </h2>
             <p className="text-sm text-gray-500 mt-0.5">
-              {banner ? 'Update banner details' : 'Add a new promotional banner'}
+              {banner
+                ? 'Update banner details'
+                : 'Add a new promotional banner (image or video)'}
             </p>
           </div>
           <button
@@ -511,7 +851,9 @@ const BannerForm: React.FC<BannerFormProps> = ({ banner, onSubmit, onClose, isLo
               <input
                 type="text"
                 value={formData.title}
-                onChange={(e) => setFormData({ ...formData, title: e.target.value })}
+                onChange={(e) =>
+                  setFormData({ ...formData, title: e.target.value })
+                }
                 className="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-cyan-500 focus:border-cyan-500"
                 placeholder="Banner title"
                 required
@@ -520,68 +862,178 @@ const BannerForm: React.FC<BannerFormProps> = ({ banner, onSubmit, onClose, isLo
 
             {/* Description */}
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Description</label>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Description
+              </label>
               <textarea
                 value={formData.description}
-                onChange={(e) => setFormData({ ...formData, description: e.target.value })}
+                onChange={(e) =>
+                  setFormData({ ...formData, description: e.target.value })
+                }
                 className="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-cyan-500 focus:border-cyan-500"
                 rows={2}
                 placeholder="Optional description"
               />
             </div>
 
-            {/* Image Upload */}
+            {/* Media Upload (Image OR Video) */}
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">
-                Banner Image <span className="text-red-500">*</span>
+                Banner Media <span className="text-red-500">*</span>
               </label>
+              <p className="text-xs text-gray-500 mb-2">
+                Supports images (PNG, JPG, WebP, GIF) and videos (WebM, MP4,
+                OGG, MOV)
+              </p>
+
+              {/* File error */}
+              {fileError && (
+                <div className="mb-3 bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-xl flex items-start gap-2">
+                  <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-sm font-medium">{fileError}</p>
+                  </div>
+                </div>
+              )}
+
               <div className="border-2 border-dashed border-gray-300 rounded-xl p-4 hover:border-cyan-400 transition-colors">
-                {imagePreview ? (
+                {mediaPreview ? (
                   <div className="relative">
-                    <img
-                      src={imagePreview}
-                      alt="Preview"
-                      className="w-full h-40 object-cover rounded-lg"
-                    />
+                    {isPreviewVideo ? (
+                      // Video preview
+                      <div className="relative rounded-lg overflow-hidden bg-black">
+                        <video
+                          src={mediaPreview}
+                          className="w-full h-48 object-contain bg-black"
+                          controls
+                          muted
+                          playsInline
+                          preload="metadata"
+                        />
+                        {/* Video info overlay */}
+                        <div className="absolute top-2 left-2 px-2 py-1 bg-purple-600 text-white text-xs font-bold rounded-lg flex items-center gap-1">
+                          <Film className="w-3 h-3" />
+                          VIDEO
+                        </div>
+                      </div>
+                    ) : (
+                      // Image preview
+                      <img
+                        src={mediaPreview}
+                        alt="Preview"
+                        className="w-full h-40 object-cover rounded-lg"
+                      />
+                    )}
+
+                    {/* File info bar */}
+                    {selectedFileInfo && (
+                      <div className="mt-2 flex items-center justify-between bg-gray-50 rounded-lg px-3 py-2">
+                        <div className="flex items-center gap-2 text-sm">
+                          {selectedFileInfo.type === 'Video' ? (
+                            <Film className="w-4 h-4 text-purple-500" />
+                          ) : (
+                            <ImageIcon className="w-4 h-4 text-blue-500" />
+                          )}
+                          <span className="font-medium text-gray-700 truncate max-w-[200px]">
+                            {selectedFileInfo.name}
+                          </span>
+                          <span className="text-gray-400">•</span>
+                          <span className="text-gray-500">
+                            {selectedFileInfo.size}
+                          </span>
+                          <span
+                            className={`px-1.5 py-0.5 text-xs font-medium rounded ${
+                              selectedFileInfo.type === 'Video'
+                                ? 'bg-purple-100 text-purple-700'
+                                : 'bg-blue-100 text-blue-700'
+                            }`}
+                          >
+                            {selectedFileInfo.type}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Remove button */}
                     <button
                       type="button"
-                      onClick={() => {
-                        setImageFile(null);
-                        setImagePreview(null);
-                        setFormData({ ...formData, imageUrl: '' });
-                      }}
-                      className="absolute top-2 right-2 p-1.5 bg-red-500 text-white rounded-lg hover:bg-red-600"
+                      onClick={clearMedia}
+                      className="absolute top-2 right-2 p-1.5 bg-red-500 text-white rounded-lg hover:bg-red-600 shadow-lg"
                     >
                       <X className="w-4 h-4" />
                     </button>
                   </div>
                 ) : (
                   <label className="flex flex-col items-center justify-center py-6 cursor-pointer">
-                    <ImageIcon className="w-10 h-10 text-gray-400 mb-2" />
-                    <span className="text-sm text-gray-600">Click to upload image</span>
-                    <span className="text-xs text-gray-400 mt-1">PNG, JPG, WebP up to 5MB</span>
+                    <div className="flex items-center gap-3 mb-3">
+                      <div className="p-3 bg-blue-50 rounded-xl">
+                        <ImageIcon className="w-8 h-8 text-blue-400" />
+                      </div>
+                      <div className="text-gray-300 text-2xl font-light">
+                        /
+                      </div>
+                      <div className="p-3 bg-purple-50 rounded-xl">
+                        <Film className="w-8 h-8 text-purple-400" />
+                      </div>
+                    </div>
+                    <span className="text-sm font-medium text-gray-600">
+                      Click to upload image or video
+                    </span>
+                    <div className="flex flex-col items-center mt-2 space-y-1">
+                      <span className="text-xs text-gray-400">
+                        Images: PNG, JPG, WebP, GIF — up to {MAX_IMAGE_SIZE_MB}
+                        MB
+                      </span>
+                      <span className="text-xs text-gray-400">
+                        Videos: WebM, MP4, OGG, MOV — up to {MAX_VIDEO_SIZE_MB}
+                        MB
+                      </span>
+                    </div>
                     <input
                       type="file"
-                      accept="image/*"
-                      onChange={handleImageChange}
+                      accept={ACCEPTED_FILE_TYPES}
+                      onChange={handleMediaChange}
                       className="hidden"
                     />
                   </label>
                 )}
               </div>
-              {!imagePreview && (
+
+              {/* URL fallback (only when no file is selected) */}
+              {!mediaPreview && (
                 <div className="mt-2">
-                  <label className="block text-xs text-gray-500 mb-1">Or enter image URL:</label>
+                  <label className="block text-xs text-gray-500 mb-1">
+                    Or enter media URL (image or video):
+                  </label>
                   <input
                     type="url"
                     value={formData.imageUrl}
                     onChange={(e) => {
-                      setFormData({ ...formData, imageUrl: e.target.value });
-                      if (e.target.value) setImagePreview(e.target.value);
+                      const url = e.target.value;
+                      setFormData({ ...formData, imageUrl: url });
+                      if (url) {
+                        setMediaPreview(url);
+                        setIsPreviewVideo(isVideoUrl(url));
+                        setSelectedFileInfo(null);
+                      }
                     }}
                     className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500"
-                    placeholder="https://example.com/banner.jpg"
+                    placeholder="https://example.com/banner.webm or .jpg"
                   />
+                  {formData.imageUrl && (
+                    <p className="mt-1 text-xs text-gray-400">
+                      Detected type:{' '}
+                      <span
+                        className={`font-medium ${
+                          isVideoUrl(formData.imageUrl)
+                            ? 'text-purple-600'
+                            : 'text-blue-600'
+                        }`}
+                      >
+                        {isVideoUrl(formData.imageUrl) ? '🎬 Video' : '🖼️ Image'}
+                      </span>
+                    </p>
+                  )}
                 </div>
               )}
             </div>
@@ -589,26 +1041,38 @@ const BannerForm: React.FC<BannerFormProps> = ({ banner, onSubmit, onClose, isLo
             {/* Position & Action */}
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Position</label>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Position
+                </label>
                 <select
                   value={formData.position}
-                  onChange={(e) => setFormData({ ...formData, position: e.target.value })}
+                  onChange={(e) =>
+                    setFormData({ ...formData, position: e.target.value })
+                  }
                   className="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-cyan-500"
                 >
-                  {POSITIONS.map(pos => (
-                    <option key={pos.value} value={pos.value}>{pos.label}</option>
+                  {POSITIONS.map((pos) => (
+                    <option key={pos.value} value={pos.value}>
+                      {pos.label}
+                    </option>
                   ))}
                 </select>
               </div>
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Action Type</label>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Action Type
+                </label>
                 <select
                   value={formData.actionType}
-                  onChange={(e) => setFormData({ ...formData, actionType: e.target.value })}
+                  onChange={(e) =>
+                    setFormData({ ...formData, actionType: e.target.value })
+                  }
                   className="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-cyan-500"
                 >
-                  {ACTION_TYPES.map(action => (
-                    <option key={action.value} value={action.value}>{action.label}</option>
+                  {ACTION_TYPES.map((action) => (
+                    <option key={action.value} value={action.value}>
+                      {action.label}
+                    </option>
                   ))}
                 </select>
               </div>
@@ -618,21 +1082,29 @@ const BannerForm: React.FC<BannerFormProps> = ({ banner, onSubmit, onClose, isLo
             {formData.actionType !== 'none' && (
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
-                  {formData.actionType === 'url' ? 'URL' : 
-                   formData.actionType === 'promo' ? 'Promo Code' : 
-                   formData.actionType === 'screen' ? 'Screen Name' : 
-                   'Target ID'}
+                  {formData.actionType === 'url'
+                    ? 'URL'
+                    : formData.actionType === 'promo'
+                      ? 'Promo Code'
+                      : formData.actionType === 'screen'
+                        ? 'Screen Name'
+                        : 'Target ID'}
                 </label>
                 <input
                   type="text"
                   value={formData.actionTarget}
-                  onChange={(e) => setFormData({ ...formData, actionTarget: e.target.value })}
+                  onChange={(e) =>
+                    setFormData({ ...formData, actionTarget: e.target.value })
+                  }
                   className="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-cyan-500"
                   placeholder={
-                    formData.actionType === 'url' ? 'https://example.com' :
-                    formData.actionType === 'promo' ? 'SUMMER20' :
-                    formData.actionType === 'screen' ? 'profile' :
-                    'Enter target ID'
+                    formData.actionType === 'url'
+                      ? 'https://example.com'
+                      : formData.actionType === 'promo'
+                        ? 'SUMMER20'
+                        : formData.actionType === 'screen'
+                          ? 'profile'
+                          : 'Enter target ID'
                   }
                 />
               </div>
@@ -644,32 +1116,46 @@ const BannerForm: React.FC<BannerFormProps> = ({ banner, onSubmit, onClose, isLo
                 <input
                   type="checkbox"
                   checked={formData.isScheduled}
-                  onChange={(e) => setFormData({ ...formData, isScheduled: e.target.checked })}
+                  onChange={(e) =>
+                    setFormData({ ...formData, isScheduled: e.target.checked })
+                  }
                   className="w-4 h-4 text-cyan-600 rounded"
                 />
                 <div>
-                  <span className="text-sm font-medium text-gray-700">Schedule this banner</span>
-                  <p className="text-xs text-gray-500">Set start and end dates</p>
+                  <span className="text-sm font-medium text-gray-700">
+                    Schedule this banner
+                  </span>
+                  <p className="text-xs text-gray-500">
+                    Set start and end dates
+                  </p>
                 </div>
               </label>
 
               {formData.isScheduled && (
                 <div className="grid grid-cols-2 gap-4 pt-2">
                   <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Start Date</label>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Start Date
+                    </label>
                     <input
                       type="date"
                       value={formData.startDate}
-                      onChange={(e) => setFormData({ ...formData, startDate: e.target.value })}
+                      onChange={(e) =>
+                        setFormData({ ...formData, startDate: e.target.value })
+                      }
                       className="w-full px-4 py-2 border border-gray-300 rounded-xl focus:ring-2 focus:ring-cyan-500"
                     />
                   </div>
                   <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">End Date</label>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      End Date
+                    </label>
                     <input
                       type="date"
                       value={formData.endDate}
-                      onChange={(e) => setFormData({ ...formData, endDate: e.target.value })}
+                      onChange={(e) =>
+                        setFormData({ ...formData, endDate: e.target.value })
+                      }
                       className="w-full px-4 py-2 border border-gray-300 rounded-xl focus:ring-2 focus:ring-cyan-500"
                     />
                   </div>
@@ -684,13 +1170,17 @@ const BannerForm: React.FC<BannerFormProps> = ({ banner, onSubmit, onClose, isLo
                   <input
                     type="checkbox"
                     checked={formData.isActive}
-                    onChange={(e) => setFormData({ ...formData, isActive: e.target.checked })}
+                    onChange={(e) =>
+                      setFormData({ ...formData, isActive: e.target.checked })
+                    }
                     className="sr-only peer"
                   />
                   <div className="w-10 h-6 bg-gray-200 rounded-full peer-checked:bg-green-500 transition-colors"></div>
                   <div className="absolute left-1 top-1 w-4 h-4 bg-white rounded-full shadow transition-transform peer-checked:translate-x-4"></div>
                 </div>
-                <span className="text-sm font-medium text-gray-700">Active</span>
+                <span className="text-sm font-medium text-gray-700">
+                  Active
+                </span>
               </label>
             </div>
           </div>
@@ -712,7 +1202,9 @@ const BannerForm: React.FC<BannerFormProps> = ({ banner, onSubmit, onClose, isLo
               {isLoading ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  Saving...
+                  {mediaFile && isVideoFile(mediaFile)
+                    ? 'Uploading video...'
+                    : 'Saving...'}
                 </>
               ) : (
                 <>
@@ -774,12 +1266,13 @@ const BannersPage: React.FC = () => {
       const response = await bannersApi.getAll(params);
 
       if (response.success) {
-        const bannersData = Array.isArray(response.data) 
-          ? response.data 
+        const bannersData = Array.isArray(response.data)
+          ? response.data
           : response.data?.data || response.data?.banners || [];
         setBanners(bannersData);
 
-        const paginationData = response.pagination || response.data?.pagination;
+        const paginationData =
+          response.pagination || response.data?.pagination;
         if (paginationData) setPagination(paginationData);
       }
     } catch (err: any) {
@@ -828,7 +1321,11 @@ const BannersPage: React.FC = () => {
       }
 
       if (response.success) {
-        setSuccessMessage(editingBanner ? 'Banner updated successfully!' : 'Banner created successfully!');
+        setSuccessMessage(
+          editingBanner
+            ? 'Banner updated successfully!'
+            : 'Banner created successfully!'
+        );
         setShowForm(false);
         setEditingBanner(null);
         fetchBanners();
@@ -838,7 +1335,9 @@ const BannersPage: React.FC = () => {
       }
     } catch (err: any) {
       console.error('Error saving banner:', err);
-      setError(err.response?.data?.message || err.message || 'Failed to save banner');
+      setError(
+        err.response?.data?.message || err.message || 'Failed to save banner'
+      );
     } finally {
       setSaving(false);
     }
@@ -871,7 +1370,9 @@ const BannersPage: React.FC = () => {
       const response = await bannersApi.update(banner._id, formData);
 
       if (response.success) {
-        setSuccessMessage(banner.isActive ? 'Banner deactivated!' : 'Banner activated!');
+        setSuccessMessage(
+          banner.isActive ? 'Banner deactivated!' : 'Banner activated!'
+        );
         fetchBanners();
         fetchStats();
       }
@@ -937,7 +1438,8 @@ const BannersPage: React.FC = () => {
                   Banner Management
                 </h1>
                 <p className="text-gray-500 mt-1">
-                  Create and manage promotional banners for your app
+                  Create and manage promotional banners — images & videos
+                  (WebM, MP4)
                 </p>
               </div>
             </div>
@@ -962,8 +1464,12 @@ const BannersPage: React.FC = () => {
                     <ImageIcon className="w-6 h-6 text-cyan-600" />
                   </div>
                   <div>
-                    <p className="text-3xl font-bold text-gray-900">{stats.totalBanners}</p>
-                    <p className="text-sm text-gray-500 font-medium">Total Banners</p>
+                    <p className="text-3xl font-bold text-gray-900">
+                      {stats.totalBanners}
+                    </p>
+                    <p className="text-sm text-gray-500 font-medium">
+                      Total Banners
+                    </p>
                   </div>
                 </div>
               </div>
@@ -974,7 +1480,9 @@ const BannersPage: React.FC = () => {
                     <Eye className="w-6 h-6 text-green-600" />
                   </div>
                   <div>
-                    <p className="text-3xl font-bold text-green-600">{stats.activeBanners}</p>
+                    <p className="text-3xl font-bold text-green-600">
+                      {stats.activeBanners}
+                    </p>
                     <p className="text-sm text-gray-500 font-medium">Active</p>
                   </div>
                 </div>
@@ -986,8 +1494,12 @@ const BannersPage: React.FC = () => {
                     <EyeOff className="w-6 h-6 text-gray-600" />
                   </div>
                   <div>
-                    <p className="text-3xl font-bold text-gray-600">{stats.inactiveBanners}</p>
-                    <p className="text-sm text-gray-500 font-medium">Inactive</p>
+                    <p className="text-3xl font-bold text-gray-600">
+                      {stats.inactiveBanners}
+                    </p>
+                    <p className="text-sm text-gray-500 font-medium">
+                      Inactive
+                    </p>
                   </div>
                 </div>
               </div>
@@ -998,8 +1510,12 @@ const BannersPage: React.FC = () => {
                     <Calendar className="w-6 h-6 text-orange-600" />
                   </div>
                   <div>
-                    <p className="text-3xl font-bold text-orange-600">{stats.scheduledBanners}</p>
-                    <p className="text-sm text-gray-500 font-medium">Scheduled</p>
+                    <p className="text-3xl font-bold text-orange-600">
+                      {stats.scheduledBanners}
+                    </p>
+                    <p className="text-sm text-gray-500 font-medium">
+                      Scheduled
+                    </p>
                   </div>
                 </div>
               </div>
@@ -1010,8 +1526,12 @@ const BannersPage: React.FC = () => {
                     <Clock className="w-6 h-6 text-red-600" />
                   </div>
                   <div>
-                    <p className="text-3xl font-bold text-red-600">{stats.expiredBanners}</p>
-                    <p className="text-sm text-gray-500 font-medium">Expired</p>
+                    <p className="text-3xl font-bold text-red-600">
+                      {stats.expiredBanners}
+                    </p>
+                    <p className="text-sm text-gray-500 font-medium">
+                      Expired
+                    </p>
                   </div>
                 </div>
               </div>
@@ -1047,8 +1567,10 @@ const BannersPage: React.FC = () => {
               className="px-4 py-3 bg-gray-50/80 border border-gray-200 rounded-xl focus:ring-2 focus:ring-cyan-500/20"
             >
               <option value="">All Positions</option>
-              {POSITIONS.map(pos => (
-                <option key={pos.value} value={pos.value}>{pos.label}</option>
+              {POSITIONS.map((pos) => (
+                <option key={pos.value} value={pos.value}>
+                  {pos.label}
+                </option>
               ))}
             </select>
           </div>
@@ -1076,7 +1598,10 @@ const BannersPage: React.FC = () => {
               <AlertCircle className="w-5 h-5" />
               <span className="font-medium">{error}</span>
             </div>
-            <button onClick={() => setError(null)} className="p-1 hover:bg-red-100 rounded-lg">
+            <button
+              onClick={() => setError(null)}
+              className="p-1 hover:bg-red-100 rounded-lg"
+            >
               <X className="w-5 h-5" />
             </button>
           </div>
@@ -1088,7 +1613,10 @@ const BannersPage: React.FC = () => {
               <CheckCircle className="w-5 h-5" />
               <span className="font-medium">{successMessage}</span>
             </div>
-            <button onClick={() => setSuccessMessage(null)} className="p-1 hover:bg-green-100 rounded-lg">
+            <button
+              onClick={() => setSuccessMessage(null)}
+              className="p-1 hover:bg-green-100 rounded-lg"
+            >
               <X className="w-5 h-5" />
             </button>
           </div>
@@ -1098,19 +1626,28 @@ const BannersPage: React.FC = () => {
         {loading ? (
           <div className="flex flex-col items-center justify-center py-16">
             <div className="w-16 h-16 border-4 border-cyan-200 rounded-full animate-spin border-t-cyan-600"></div>
-            <p className="mt-4 text-gray-500 font-medium">Loading banners...</p>
+            <p className="mt-4 text-gray-500 font-medium">
+              Loading banners...
+            </p>
           </div>
         ) : banners.length === 0 ? (
           <div className="bg-white/80 backdrop-blur-sm rounded-2xl border border-white/50 shadow-lg p-16 text-center">
             <div className="w-20 h-20 bg-gradient-to-br from-cyan-100 to-blue-100 rounded-full flex items-center justify-center mx-auto mb-6">
               <ImageIcon className="w-10 h-10 text-cyan-500" />
             </div>
-            <h3 className="text-xl font-bold text-gray-900 mb-2">No banners yet</h3>
+            <h3 className="text-xl font-bold text-gray-900 mb-2">
+              No banners yet
+            </h3>
             <p className="text-gray-500 mb-8 max-w-md mx-auto">
-              {hasFilters ? 'No banners match your filters.' : 'Create your first banner to promote services'}
+              {hasFilters
+                ? 'No banners match your filters.'
+                : 'Create your first banner to promote services — supports images & WebM videos'}
             </p>
             {hasFilters ? (
-              <button onClick={clearFilters} className="px-6 py-3 bg-gray-100 text-gray-700 rounded-xl hover:bg-gray-200">
+              <button
+                onClick={clearFilters}
+                className="px-6 py-3 bg-gray-100 text-gray-700 rounded-xl hover:bg-gray-200"
+              >
                 Clear Filters
               </button>
             ) : (
@@ -1131,23 +1668,38 @@ const BannersPage: React.FC = () => {
                 Drag banners to reorder • Changes are saved automatically
               </p>
               <button
-                onClick={() => { fetchBanners(); fetchStats(); }}
+                onClick={() => {
+                  fetchBanners();
+                  fetchStats();
+                }}
                 disabled={loading}
                 className="text-sm text-cyan-600 hover:text-cyan-700 flex items-center gap-2 font-medium px-3 py-1.5 rounded-lg hover:bg-cyan-50"
               >
-                <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+                <RefreshCw
+                  className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`}
+                />
                 Refresh
               </button>
             </div>
 
-            <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-              <SortableContext items={banners.map((b) => b._id)} strategy={verticalListSortingStrategy}>
+            <DndContext
+              sensors={sensors}
+              collisionDetection={closestCenter}
+              onDragEnd={handleDragEnd}
+            >
+              <SortableContext
+                items={banners.map((b) => b._id)}
+                strategy={verticalListSortingStrategy}
+              >
                 <div className="space-y-4">
                   {banners.map((banner) => (
                     <SortableBannerItem
                       key={banner._id}
                       banner={banner}
-                      onEdit={(b) => { setEditingBanner(b); setShowForm(true); }}
+                      onEdit={(b) => {
+                        setEditingBanner(b);
+                        setShowForm(true);
+                      }}
                       onDelete={(b) => setDeleteConfirm(b)}
                       onToggleStatus={handleToggleStatus}
                     />
@@ -1160,7 +1712,7 @@ const BannersPage: React.FC = () => {
             {pagination && pagination.totalPages > 1 && (
               <div className="mt-6 flex items-center justify-center gap-4">
                 <button
-                  onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                  onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
                   disabled={!pagination.hasPrev}
                   className="p-2 rounded-lg border disabled:opacity-50 hover:bg-white"
                 >
@@ -1170,7 +1722,7 @@ const BannersPage: React.FC = () => {
                   Page {pagination.page} of {pagination.totalPages}
                 </span>
                 <button
-                  onClick={() => setCurrentPage(p => p + 1)}
+                  onClick={() => setCurrentPage((p) => p + 1)}
                   disabled={!pagination.hasNext}
                   className="p-2 rounded-lg border disabled:opacity-50 hover:bg-white"
                 >
@@ -1186,7 +1738,10 @@ const BannersPage: React.FC = () => {
           <BannerForm
             banner={editingBanner}
             onSubmit={handleSubmit}
-            onClose={() => { setShowForm(false); setEditingBanner(null); }}
+            onClose={() => {
+              setShowForm(false);
+              setEditingBanner(null);
+            }}
             isLoading={saving}
           />
         )}
@@ -1199,10 +1754,13 @@ const BannersPage: React.FC = () => {
                 <div className="p-2 bg-red-100 rounded-full">
                   <Trash2 className="w-5 h-5 text-red-600" />
                 </div>
-                <h3 className="text-lg font-semibold text-gray-900">Delete Banner</h3>
+                <h3 className="text-lg font-semibold text-gray-900">
+                  Delete Banner
+                </h3>
               </div>
               <p className="text-gray-600 mb-6">
-                Are you sure you want to delete "{deleteConfirm.title}"? This action cannot be undone.
+                Are you sure you want to delete "{deleteConfirm.title}"? This
+                action cannot be undone.
               </p>
               <div className="flex justify-end gap-3">
                 <button

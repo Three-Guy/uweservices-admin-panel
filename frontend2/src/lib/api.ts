@@ -273,6 +273,129 @@ export interface Pagination {
   hasPrev: boolean;
 }
 
+// ==================== VERIFICATION TYPES ====================
+export type VerificationStatus =
+  | 'pending'
+  | 'under_review'
+  | 'approved'
+  | 'rejected'
+  | 'resubmission_required';
+
+export interface VerificationDocument {
+  url: string | null;
+  publicId: string | null;
+  uploaded: boolean;
+}
+
+export interface VerificationProviderInfo {
+  _id: string;
+  providerId?: string;
+  name?: string;
+  email?: string;
+  phone?: string;
+  profession?: string;
+  gender?: string;
+  city?: string;
+  profilePicture?: string | null;
+  profileImage?: string | null;
+  selfieImage?: ProviderSelfieImage;
+  verificationStatus?: string;
+  isVerified?: boolean;
+  isActive?: boolean;
+  isBlocked?: boolean;
+  createdAt?: string;
+  fcmToken?: string;
+}
+
+export interface VerificationStatusHistory {
+  _id?: string;
+  status: VerificationStatus;
+  changedBy?: string | null;
+  changedByName?: string | null;
+  changedAt: string;
+  reason?: string | null;
+  notes?: string | null;
+}
+
+export interface ProviderVerification {
+  _id: string;
+  id?: string;
+  verificationId?: string;
+  provider?: VerificationProviderInfo | string | null;
+
+  documents: {
+    selfie: VerificationDocument;
+    panCard: VerificationDocument;
+    aadhaarFront: VerificationDocument;
+    aadhaarBack: VerificationDocument;
+  };
+
+  cloudinaryIds?: {
+    selfie?: string | null;
+    panCard?: string | null;
+    aadhaarFront?: string | null;
+    aadhaarBack?: string | null;
+  };
+
+  documentNumbers?: {
+    panNumber?: string | null;
+    aadhaarNumber?: string | null;
+  };
+
+  status: VerificationStatus;
+  reviewedBy?: string | null;
+  reviewedByName?: string | null;
+  rejectionReason?: string | null;
+  notes?: string | null;
+
+  statusHistory?: VerificationStatusHistory[];
+  attempts?: number;
+  previousVerifications?: string[];
+
+  submittedAt?: string | null;
+  reviewedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+
+  // Allow any additional fields
+  [key: string]: any;
+}
+
+export interface VerificationFilters {
+  page?: number;
+  limit?: number;
+  status?: VerificationStatus | 'all' | string;
+  search?: string;
+  sortBy?: string;
+  sortOrder?: 'asc' | 'desc' | string;
+  startDate?: string;
+  endDate?: string;
+}
+
+export interface VerificationStats {
+  pending: number;
+  underReview: number;
+  approved: number;
+  rejected: number;
+  resubmission: number;
+  total: number;
+  todayCount: number;
+  weekCount: number;
+  pendingTotal: number;
+}
+
+export interface BulkActionResult {
+  success: boolean;
+  message?: string;
+  processed?: number;
+  failed?: number;
+  results?: Array<{
+    verificationId: string;
+    success: boolean;
+    error?: string;
+  }>;
+}
+
 // ==================== CITY TYPES ====================
 export interface City {
   _id: string;
@@ -676,8 +799,6 @@ export interface FeatureFlagStats {
   categoryDistribution: Record<string, number>;
 }
 
-
-
 // ==================== BOOKING TYPES ====================
 export interface BookingStatusHistoryItem {
   _id?: string;
@@ -879,7 +1000,6 @@ export interface BookingStats {
   categoryDistribution: Record<string, number>;
 }
 
-
 // ==================== TRACKING TYPES ====================
 export interface TrackingDevice {
   _id: string;
@@ -937,8 +1057,14 @@ export interface HeatmapPoint {
   active: boolean;
 }
 
-
-
+// ==================== AXIOS INSTANCE ====================
+const apiClient: AxiosInstance = axios.create({
+  baseURL: API_BASE_URL,
+  timeout: 30000,
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
 
 // ==================== BOOKINGS API ====================
 export const bookingsApi = {
@@ -981,22 +1107,11 @@ export const bookingsApi = {
   },
 };
 
-
-
-
-// ==================== AXIOS INSTANCE ====================
-const apiClient: AxiosInstance = axios.create({
-  baseURL: API_BASE_URL,
-  timeout: 30000,
-  headers: {
-    'Content-Type': 'application/json',
-  },
-});
 // ==================== ADD THESE IMPORTS AT TOP ====================
-import type { 
-  Coupon, 
-  CouponFilters, 
-  CouponStats, 
+import type {
+  Coupon,
+  CouponFilters,
+  CouponStats,
   CreateCouponData,
   CheckoutSettings,
   FeeConfig,
@@ -1007,10 +1122,10 @@ import type {
 } from '../types/checkout';
 
 // ==================== COUPON TYPES (for inline use) ====================
-export type { 
-  Coupon, 
-  CouponFilters, 
-  CouponStats, 
+export type {
+  Coupon,
+  CouponFilters,
+  CouponStats,
   CreateCouponData,
   CheckoutSettings,
   PriceCalculation,
@@ -1113,13 +1228,14 @@ export const checkoutApi = {
     return response.data;
   },
 };
+
 // ==================== REQUEST INTERCEPTOR ====================
 apiClient.interceptors.request.use(
   (config: InternalAxiosRequestConfig) => {
     console.log(`📤 Request: ${config.method?.toUpperCase()} ${config.baseURL}${config.url}`);
-    
+
     const tokensStr = localStorage.getItem('admin_tokens');
-    
+
     if (tokensStr) {
       try {
         const tokens: TokenData = JSON.parse(tokensStr);
@@ -1130,11 +1246,11 @@ apiClient.interceptors.request.use(
         console.error('❌ Failed to parse tokens:', error);
       }
     }
-    
+
     if (config.data) {
       console.log('📦 Request Data:', config.data);
     }
-    
+
     return config;
   },
   (error) => {
@@ -1152,13 +1268,13 @@ apiClient.interceptors.response.use(
   async (error: AxiosError) => {
     console.error(`❌ Response Error: ${error.response?.status} ${error.config?.url}`);
     console.error('Error Data:', error.response?.data);
-    
+
     if (error.response?.status === 401 && !window.location.pathname.includes('/login')) {
       console.log('🔒 Unauthorized - clearing tokens');
       localStorage.removeItem('admin_tokens');
       localStorage.removeItem('admin_data');
     }
-    
+
     return Promise.reject(error);
   }
 );
@@ -1170,24 +1286,24 @@ export const authApi = {
   login: async (email: string, password: string): Promise<{ admin: Admin; tokens: TokenData }> => {
     console.log('\n🔐 ===== LOGIN ATTEMPT =====');
     console.log('Email:', email);
-    
+
     try {
-      const response = await apiClient.post<ApiResponse<LoginResponseData>>('/admin/auth/login', { 
-        email: email.trim().toLowerCase(), 
-        password: password
+      const response = await apiClient.post<ApiResponse<LoginResponseData>>('/admin/auth/login', {
+        email: email.trim().toLowerCase(),
+        password: password,
       });
-      
+
       console.log('📥 Login Response:', response.data);
-      
+
       if (response.data.success && response.data.data) {
         const { admin, tokens } = response.data.data;
-        
+
         localStorage.setItem('admin_tokens', JSON.stringify(tokens));
         localStorage.setItem('admin_data', JSON.stringify(admin));
-        
+
         console.log('✅ Login successful!');
         console.log('👤 Admin:', admin.email);
-        
+
         return { admin, tokens };
       } else {
         const errorMessage = response.data.message || 'Login failed';
@@ -1329,7 +1445,7 @@ export const providersApi = {
 
   deleteProvider: async (id: string, permanent: boolean = false) => {
     const response = await apiClient.delete(`/admin/providers/${id}`, {
-      params: { permanent: permanent.toString() }
+      params: { permanent: permanent.toString() },
     });
     return response.data;
   },
@@ -1347,33 +1463,126 @@ export const providersApi = {
 
 // ==================== VERIFICATIONS API ====================
 export const verificationsApi = {
-  getPending: async (params?: { page?: number; limit?: number }) => {
-    const response = await apiClient.get('/admin/verifications/pending', { params });
-    return response.data;
-  },
-
-  getAll: async (params?: any) => {
+  // GET /admin/verifications - list with filters, search, pagination
+  getAll: async (
+    params?: VerificationFilters
+  ): Promise<ApiResponse<{ verifications: ProviderVerification[]; pagination: Pagination }>> => {
+    console.log('\n📋 Fetching verifications with params:', params);
     const response = await apiClient.get('/admin/verifications', { params });
     return response.data;
   },
 
-  getById: async (id: string) => {
+  // GET /admin/verifications/pending
+  getPending: async (
+    params?: { page?: number; limit?: number }
+  ): Promise<ApiResponse<{ verifications: ProviderVerification[]; pagination: Pagination }>> => {
+    const response = await apiClient.get('/admin/verifications/pending', { params });
+    return response.data;
+  },
+
+  // GET /admin/verifications/stats
+  getStats: async (): Promise<ApiResponse<VerificationStats>> => {
+    const response = await apiClient.get('/admin/verifications/stats');
+    return response.data;
+  },
+
+  // GET /admin/verifications/:id
+  getById: async (id: string): Promise<ApiResponse<{ verification: ProviderVerification }>> => {
     const response = await apiClient.get(`/admin/verifications/${id}`);
     return response.data;
   },
 
-  approve: async (id: string, notes?: string) => {
+  // GET /admin/verifications/provider/:providerId
+  getByProvider: async (
+    providerId: string
+  ): Promise<ApiResponse<{ verifications: ProviderVerification[]; count: number }>> => {
+    const response = await apiClient.get(`/admin/verifications/provider/${providerId}`);
+    return response.data;
+  },
+
+  // POST /admin/verifications/:id/approve
+  approve: async (
+    id: string,
+    notes?: string
+  ): Promise<ApiResponse<{ verification: ProviderVerification }>> => {
+    console.log(`\n✅ Approving verification: ${id}`);
     const response = await apiClient.post(`/admin/verifications/${id}/approve`, { notes });
     return response.data;
   },
 
-  reject: async (id: string, reason: string) => {
-    const response = await apiClient.post(`/admin/verifications/${id}/reject`, { rejectionReason: reason });
+  // POST /admin/verifications/:id/reject
+  reject: async (
+    id: string,
+    rejectionReason: string,
+    notes?: string
+  ): Promise<ApiResponse<{ verification: ProviderVerification }>> => {
+    console.log(`\n❌ Rejecting verification: ${id}`);
+    const response = await apiClient.post(`/admin/verifications/${id}/reject`, {
+      rejectionReason,
+      notes,
+    });
     return response.data;
   },
 
-  getStats: async () => {
-    const response = await apiClient.get('/admin/verifications/stats');
+  // POST /admin/verifications/:id/resubmit - request resubmission
+  requestResubmission: async (
+    id: string,
+    reason: string,
+    notes?: string
+  ): Promise<ApiResponse<{ verification: ProviderVerification }>> => {
+    console.log(`\n🔄 Requesting resubmission: ${id}`);
+    const response = await apiClient.post(`/admin/verifications/${id}/resubmit`, {
+      reason,
+      notes,
+    });
+    return response.data;
+  },
+
+  // POST /admin/verifications/:id/review - mark under review
+  markUnderReview: async (
+    id: string
+  ): Promise<ApiResponse<{ verification: ProviderVerification }>> => {
+    console.log(`\n👀 Marking under review: ${id}`);
+    const response = await apiClient.post(`/admin/verifications/${id}/review`);
+    return response.data;
+  },
+
+  // POST /admin/verifications/bulk/approve
+  bulkApprove: async (
+    verificationIds: string[],
+    notes?: string
+  ): Promise<ApiResponse<BulkActionResult>> => {
+    console.log(`\n✅ Bulk approving ${verificationIds.length} verifications`);
+    const response = await apiClient.post('/admin/verifications/bulk/approve', {
+      verificationIds,
+      notes,
+    });
+    return response.data;
+  },
+
+  // POST /admin/verifications/bulk/reject
+  bulkReject: async (
+    verificationIds: string[],
+    rejectionReason: string
+  ): Promise<ApiResponse<BulkActionResult>> => {
+    console.log(`\n❌ Bulk rejecting ${verificationIds.length} verifications`);
+    const response = await apiClient.post('/admin/verifications/bulk/reject', {
+      verificationIds,
+      rejectionReason,
+    });
+    return response.data;
+  },
+
+  // DELETE /admin/verifications/:id
+  delete: async (id: string): Promise<ApiResponse<any>> => {
+    console.log(`\n🗑️ Deleting verification: ${id}`);
+    const response = await apiClient.delete(`/admin/verifications/${id}`);
+    return response.data;
+  },
+
+  // GET /admin/verifications/debug (optional debug endpoint)
+  debug: async (): Promise<ApiResponse<any>> => {
+    const response = await apiClient.get('/admin/verifications/debug');
     return response.data;
   },
 };
@@ -1801,7 +2010,6 @@ export const featureFlagsApi = {
   },
 };
 
-
 // ==================== TRACKING API ====================
 export const trackingApi = {
   getStats: async (): Promise<ApiResponse<TrackingStats>> => {
@@ -1850,9 +2058,6 @@ export const trackingApi = {
     return response.data;
   },
 };
-
-
-
 
 // ==================== DISPATCH / OFFER TYPES ====================
 export interface ProviderOffer {
@@ -1967,41 +2172,42 @@ export interface AdminNotification {
   updatedAt: string;
 }
 
-
+// ==================== DISPATCH API ====================
 export const dispatchApi = {
   getStats: () =>
-    authApi.get('/dispatch/stats'),
+    apiClient.get('/admin/dispatch/stats').then(r => r.data),
 
   getActiveDispatches: () =>
-    authApi.get('/dispatch/active'),
+    apiClient.get('/admin/dispatch/active').then(r => r.data),
 
   getNoProviderBookings: (params?: { page?: number; limit?: number }) =>
-    authApi.get('/dispatch/no-provider-found', { params }),
+    apiClient.get('/admin/dispatch/no-provider-found', { params }).then(r => r.data),
 
-  // ✅ NEW — Unassigned bookings (confirmed + searching + no_provider_found)
+  // ✅ Unassigned bookings (confirmed + searching + no_provider_found)
   getUnassignedBookings: (params?: { page?: number; limit?: number; status?: string }) =>
-    authApi.get('/dispatch/unassigned', { params }),
+    apiClient.get('/admin/dispatch/unassigned', { params }).then(r => r.data),
 
   triggerDispatch: (bookingId: string) =>
-    authApi.post(`/dispatch/trigger/${bookingId}`),
+    apiClient.post(`/admin/dispatch/trigger/${bookingId}`).then(r => r.data),
 
   reassignBooking: (bookingId: string, data?: { reason?: string }) =>
-    authApi.post(`/dispatch/reassign/${bookingId}`, data || {}),
+    apiClient.post(`/admin/dispatch/reassign/${bookingId}`, data || {}).then(r => r.data),
 
-  // ✅ NEW — Alias for reassign (frontend button uses this)
+  // ✅ Alias for reassign (frontend button uses this)
   autoRedispatch: (bookingId: string, data?: { reason?: string }) =>
-    authApi.post(`/dispatch/auto-redispatch/${bookingId}`, data || {}),
+    apiClient.post(`/admin/dispatch/auto-redispatch/${bookingId}`, data || {}).then(r => r.data),
 
   getEligibleProviders: (bookingId: string, params?: { radiusKm?: number; strict?: boolean }) =>
-    authApi.get(`/dispatch/eligible-providers/${bookingId}`, { params }),
+    apiClient.get(`/admin/dispatch/eligible-providers/${bookingId}`, { params }).then(r => r.data),
 
-  // ✅ NEW — Debug breakdown (category match, city match, etc.)
+  // ✅ Debug breakdown (category match, city match, etc.)
   getEligibleProvidersDebug: (bookingId: string) =>
-    authApi.get(`/dispatch/eligible-providers-debug/${bookingId}`),
+    apiClient.get(`/admin/dispatch/eligible-providers-debug/${bookingId}`).then(r => r.data),
 
   assignProviderManually: (bookingId: string, data: { providerId: string }) =>
-    authApi.post(`/dispatch/assign-manual/${bookingId}`, data),
+    apiClient.post(`/admin/dispatch/assign-manual/${bookingId}`, data).then(r => r.data),
 };
+
 // ==================== PROVIDER OFFERS API ====================
 export const providerOffersApi = {
   getAll: async (params?: { page?: number; limit?: number; status?: string; bookingId?: string; providerId?: string }): Promise<ApiResponse<{ offers: ProviderOffer[]; pagination: Pagination }>> => {

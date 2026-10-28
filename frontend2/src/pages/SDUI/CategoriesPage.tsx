@@ -1,7 +1,7 @@
 // src/pages/SDUI/CategoriesPage.tsx
 // SELF-CONTAINED - All components are inline, no external component imports needed
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import {
   DndContext,
   closestCenter,
@@ -51,6 +51,11 @@ import {
   Square,
   MousePointer,
   ExternalLink,
+  Play,
+  Film,
+  Volume2,
+  VolumeX,
+  Upload,
 } from 'lucide-react';
 import {
   sduiCategoryApi,
@@ -74,6 +79,7 @@ interface GridCategory {
   description: string;
   icon: string;
   image: { url: string | null; publicId: string | null };
+  mediaType?: 'image' | 'video';
   color: string;
   colorClass: string;
   sortOrder: number;
@@ -116,6 +122,190 @@ const CATEGORY_ACTION_TYPES = [
   { value: 'external_url', label: 'External URL', desc: 'Open a web link', icon: ExternalLink },
 ];
 
+const VIDEO_EXTENSIONS = ['.webm', '.mp4', '.ogg', '.mov', '.avi', '.mkv', '.m4v'];
+const VIDEO_MIME_TYPES = [
+  'video/webm', 'video/mp4', 'video/ogg', 'video/quicktime',
+  'video/x-msvideo', 'video/x-matroska', 'video/x-m4v',
+];
+const IMAGE_MIME_TYPES = [
+  'image/png', 'image/jpeg', 'image/jpg', 'image/webp',
+  'image/gif', 'image/svg+xml',
+];
+const ALL_ACCEPTED_TYPES = [...IMAGE_MIME_TYPES, ...VIDEO_MIME_TYPES].join(',');
+
+const MAX_IMAGE_SIZE_MB = 5;
+const MAX_VIDEO_SIZE_MB = 50;
+
+// ====================================================================
+// VIDEO / MEDIA HELPERS
+// ====================================================================
+
+/**
+ * Check if URL is a video based on extension
+ */
+const isVideoUrl = (url?: string | null, mediaType?: string | null): boolean => {
+  if (mediaType === 'video') return true;
+  if (mediaType === 'image') return false;
+  if (!url || typeof url !== 'string') return false;
+  try {
+    const lower = url.toLowerCase().split('?')[0].split('#')[0];
+    return VIDEO_EXTENSIONS.some((ext) => lower.endsWith(ext));
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Check if a File is a video
+ */
+const isVideoFile = (file: File): boolean => {
+  if (file.type && file.type.startsWith('video/')) return true;
+  const name = file.name?.toLowerCase() || '';
+  return VIDEO_EXTENSIONS.some((ext) => name.endsWith(ext));
+};
+
+/**
+ * Get human-readable file size
+ */
+const formatFileSize = (bytes: number): string => {
+  if (bytes === 0) return '0 Bytes';
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+};
+
+/**
+ * Get media type label
+ */
+const getMediaTypeLabel = (url?: string | null, mediaType?: string | null): string => {
+  if (isVideoUrl(url, mediaType)) return 'Video';
+  return 'Image';
+};
+
+// ====================================================================
+// MEDIA PREVIEW COMPONENT (supports both images and videos)
+// ====================================================================
+
+const MediaPreview: React.FC<{
+  url?: string | null;
+  mediaType?: string | null;
+  alt?: string;
+  className?: string;
+  showBadge?: boolean;
+  autoPlay?: boolean;
+  muted?: boolean;
+  loop?: boolean;
+  controls?: boolean;
+  fallbackIcon?: React.ReactNode;
+  style?: React.CSSProperties;
+}> = ({
+  url,
+  mediaType,
+  alt = '',
+  className = '',
+  showBadge = true,
+  autoPlay = true,
+  muted = true,
+  loop = true,
+  controls = false,
+  fallbackIcon,
+  style,
+}) => {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [hasError, setHasError] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(autoPlay);
+  const [isMuted, setIsMuted] = useState(muted);
+
+  const isVideo = useMemo(() => isVideoUrl(url, mediaType), [url, mediaType]);
+
+  // Reset error when URL changes
+  useEffect(() => {
+    setHasError(false);
+  }, [url]);
+
+  if (!url || hasError) {
+    return (
+      <div className={`flex items-center justify-center bg-gray-100 ${className}`} style={style}>
+        {fallbackIcon || <ImageIcon size={32} className="text-gray-400" />}
+      </div>
+    );
+  }
+
+  if (isVideo) {
+    return (
+      <div className={`relative overflow-hidden bg-black ${className}`} style={style}>
+        <video
+          ref={videoRef}
+          src={url}
+          autoPlay={autoPlay}
+          muted={isMuted}
+          loop={loop}
+          controls={controls}
+          playsInline
+          className="w-full h-full object-cover"
+          onError={() => setHasError(true)}
+          onPlay={() => setIsPlaying(true)}
+          onPause={() => setIsPlaying(false)}
+        />
+        {/* Video badge */}
+        {showBadge && (
+          <div className="absolute top-2 left-2 flex items-center gap-1 bg-black/60 text-white text-xs px-2 py-1 rounded-full">
+            <Film size={12} />
+            <span className="font-medium">VIDEO</span>
+          </div>
+        )}
+        {/* Play/Pause + Mute controls */}
+        <div className="absolute bottom-2 right-2 flex items-center gap-1">
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              if (videoRef.current) {
+                if (isPlaying) videoRef.current.pause();
+                else videoRef.current.play();
+              }
+            }}
+            className="p-1.5 bg-black/60 hover:bg-black/80 text-white rounded-full transition-colors"
+            title={isPlaying ? 'Pause' : 'Play'}
+          >
+            {isPlaying ? (
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="6" y="4" width="4" height="16" />
+                <rect x="14" y="4" width="4" height="16" />
+              </svg>
+            ) : (
+              <Play size={12} fill="currentColor" />
+            )}
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              setIsMuted(!isMuted);
+              if (videoRef.current) videoRef.current.muted = !isMuted;
+            }}
+            className="p-1.5 bg-black/60 hover:bg-black/80 text-white rounded-full transition-colors"
+            title={isMuted ? 'Unmute' : 'Mute'}
+          >
+            {isMuted ? <VolumeX size={12} /> : <Volume2 size={12} />}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Image
+  return (
+    <div className={`relative overflow-hidden ${className}`} style={style}>
+      <img
+        src={url}
+        alt={alt}
+        className="w-full h-full object-cover"
+        onError={() => setHasError(true)}
+      />
+    </div>
+  );
+};
+
 // ====================================================================
 // TOGGLE SWITCH COMPONENT
 // ====================================================================
@@ -139,7 +329,7 @@ const Toggle: React.FC<{ enabled: boolean; onChange: () => void; color?: string 
 );
 
 // ====================================================================
-// CATEGORY FORM MODAL
+// CATEGORY FORM MODAL (WITH VIDEO SUPPORT)
 // ====================================================================
 
 const CategoryFormModal: React.FC<{
@@ -160,25 +350,72 @@ const CategoryFormModal: React.FC<{
     sortOrder: category?.sortOrder ?? 0,
   });
 
-  const [imageFile, setImageFile] = useState<File | null>(null);
-  const [imagePreview, setImagePreview] = useState<string | null>(category?.image?.url || null);
+  const [mediaFile, setMediaFile] = useState<File | null>(null);
+  const [mediaPreview, setMediaPreview] = useState<string | null>(category?.image?.url || null);
+  const [mediaIsVideo, setMediaIsVideo] = useState<boolean>(
+    isVideoUrl(category?.image?.url, (category as any)?.mediaType)
+  );
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Cleanup object URL on unmount
+  useEffect(() => {
+    return () => {
+      if (mediaPreview && mediaPreview.startsWith('blob:')) {
+        URL.revokeObjectURL(mediaPreview);
+      }
+    };
+  }, []);
+
+  const handleMediaChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      setImageFile(file);
+    if (!file) return;
+
+    // Check if it's a video
+    const fileIsVideo = isVideoFile(file);
+
+    // Validate file size
+    const maxSize = fileIsVideo ? MAX_VIDEO_SIZE_MB : MAX_IMAGE_SIZE_MB;
+    const fileSizeMB = file.size / (1024 * 1024);
+    if (fileSizeMB > maxSize) {
+      setError(`File too large. Max ${maxSize}MB for ${fileIsVideo ? 'videos' : 'images'}. Your file: ${formatFileSize(file.size)}`);
+      return;
+    }
+
+    // Cleanup previous blob URL
+    if (mediaPreview && mediaPreview.startsWith('blob:')) {
+      URL.revokeObjectURL(mediaPreview);
+    }
+
+    setError(null);
+    setMediaFile(file);
+    setMediaIsVideo(fileIsVideo);
+
+    if (fileIsVideo) {
+      // Use object URL for video preview
+      const objectUrl = URL.createObjectURL(file);
+      setMediaPreview(objectUrl);
+    } else {
+      // Use FileReader for image preview
       const reader = new FileReader();
-      reader.onloadend = () => setImagePreview(reader.result as string);
+      reader.onloadend = () => setMediaPreview(reader.result as string);
       reader.readAsDataURL(file);
     }
+  };
+
+  const removeMedia = () => {
+    if (mediaPreview && mediaPreview.startsWith('blob:')) {
+      URL.revokeObjectURL(mediaPreview);
+    }
+    setMediaFile(null);
+    setMediaPreview(isEditing ? (category?.image?.url || null) : null);
+    setMediaIsVideo(isEditing ? isVideoUrl(category?.image?.url, (category as any)?.mediaType) : false);
   };
 
   const handleSubmit = async (e?: React.FormEvent) => {
     e?.preventDefault();
     if (!formData.name.trim()) { setError('Category name is required'); return; }
-    if (!isEditing && !imageFile) { setError('Category image is required'); return; }
+    if (!isEditing && !mediaFile) { setError('Category image or video is required'); return; }
 
     setIsSaving(true);
     setError(null);
@@ -193,7 +430,11 @@ const CategoryFormModal: React.FC<{
       fd.append('isActive', String(formData.isActive));
       fd.append('isFeatured', String(formData.isFeatured));
       fd.append('sortOrder', String(formData.sortOrder));
-      if (imageFile) fd.append('image', imageFile);
+
+      if (mediaFile) {
+        fd.append('image', mediaFile);
+        fd.append('mediaType', mediaIsVideo ? 'video' : 'image');
+      }
 
       if (isEditing && category?._id) {
         await sduiCategoryApi.update(category._id, fd);
@@ -228,7 +469,11 @@ const CategoryFormModal: React.FC<{
           <div className="p-6 overflow-y-auto max-h-[calc(90vh-140px)] space-y-6">
             {error && (
               <div className="flex items-center gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
-                <AlertCircle size={16} />{error}
+                <AlertCircle size={16} />
+                <span className="flex-1">{error}</span>
+                <button onClick={() => setError(null)} className="p-1 hover:bg-red-100 rounded">
+                  <X size={14} />
+                </button>
               </div>
             )}
 
@@ -250,26 +495,107 @@ const CategoryFormModal: React.FC<{
                 placeholder="Brief description" />
             </div>
 
-            {/* Image */}
+            {/* Media (Image or Video) */}
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">
-                Image {!isEditing && <span className="text-red-500">*</span>}
+                Image / Video {!isEditing && <span className="text-red-500">*</span>}
               </label>
               <div className="flex items-start gap-4">
-                <div className="w-32 h-32 bg-gray-100 rounded-xl overflow-hidden flex items-center justify-center border-2 border-dashed border-gray-300">
-                  {imagePreview ? (
-                    <img src={imagePreview} alt="Preview" className="w-full h-full object-cover" />
+                {/* Preview */}
+                <div className="w-36 h-36 bg-gray-100 rounded-xl overflow-hidden flex items-center justify-center border-2 border-dashed border-gray-300 relative">
+                  {mediaPreview ? (
+                    <>
+                      <MediaPreview
+                        url={mediaPreview}
+                        mediaType={mediaIsVideo ? 'video' : 'image'}
+                        alt="Preview"
+                        className="w-full h-full"
+                        showBadge={true}
+                        autoPlay={true}
+                        muted={true}
+                        loop={true}
+                        controls={false}
+                      />
+                      {/* Remove button */}
+                      {mediaFile && (
+                        <button
+                          onClick={removeMedia}
+                          className="absolute top-1 right-1 p-1 bg-red-500 hover:bg-red-600 text-white rounded-full z-10"
+                          title="Remove"
+                        >
+                          <X size={12} />
+                        </button>
+                      )}
+                    </>
                   ) : (
-                    <ImageIcon size={32} className="text-gray-400" />
+                    <div className="text-center">
+                      <Upload size={24} className="mx-auto text-gray-400 mb-1" />
+                      <span className="text-xs text-gray-400">No media</span>
+                    </div>
                   )}
                 </div>
-                <div>
-                  <input type="file" accept="image/*" onChange={handleImageChange} className="hidden" id="cat-img" />
-                  <label htmlFor="cat-img"
-                    className="inline-flex items-center gap-2 px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg cursor-pointer">
-                    <ImageIcon size={16} />{isEditing ? 'Change' : 'Upload'}
+
+                {/* Upload controls */}
+                <div className="flex-1">
+                  <input
+                    type="file"
+                    accept={ALL_ACCEPTED_TYPES}
+                    onChange={handleMediaChange}
+                    className="hidden"
+                    id="cat-media"
+                  />
+                  <label htmlFor="cat-media"
+                    className="inline-flex items-center gap-2 px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg cursor-pointer transition-colors">
+                    <Upload size={16} />
+                    {isEditing ? 'Change Media' : 'Upload Media'}
                   </label>
-                  <p className="text-xs text-gray-500 mt-2">400x400px, PNG/JPG, Max 5MB</p>
+
+                  {/* File info */}
+                  {mediaFile && (
+                    <div className="mt-2 p-2 bg-gray-50 rounded-lg">
+                      <div className="flex items-center gap-2">
+                        {mediaIsVideo ? (
+                          <Film size={14} className="text-purple-500" />
+                        ) : (
+                          <ImageIcon size={14} className="text-blue-500" />
+                        )}
+                        <span className="text-xs font-medium text-gray-700 truncate max-w-[180px]">
+                          {mediaFile.name}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2 mt-1">
+                        <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${
+                          mediaIsVideo
+                            ? 'bg-purple-100 text-purple-700'
+                            : 'bg-blue-100 text-blue-700'
+                        }`}>
+                          {mediaIsVideo ? 'VIDEO' : 'IMAGE'}
+                        </span>
+                        <span className="text-xs text-gray-500">
+                          {formatFileSize(mediaFile.size)}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  <p className="text-xs text-gray-500 mt-2">
+                    <strong>Images:</strong> PNG, JPG, WebP, GIF — Max {MAX_IMAGE_SIZE_MB}MB
+                    <br />
+                    <strong>Videos:</strong> WebM, MP4, MOV, OGG — Max {MAX_VIDEO_SIZE_MB}MB
+                  </p>
+
+                  {/* Current media type indicator for existing categories */}
+                  {isEditing && !mediaFile && category?.image?.url && (
+                    <div className="mt-2 flex items-center gap-2">
+                      <span className={`text-xs px-2 py-1 rounded-full font-medium ${
+                        isVideoUrl(category.image.url, (category as any)?.mediaType)
+                          ? 'bg-purple-100 text-purple-700'
+                          : 'bg-blue-100 text-blue-700'
+                      }`}>
+                        Current: {getMediaTypeLabel(category.image.url, (category as any)?.mediaType)}
+                      </span>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -281,7 +607,7 @@ const CategoryFormModal: React.FC<{
                 {ICON_PRESETS.map(ic => (
                   <button key={ic} type="button"
                     onClick={() => setFormData(p => ({ ...p, icon: ic }))}
-                    className={`w-10 h-10 flex items-center justify-center text-xl rounded-lg border-2 ${
+                    className={`w-10 h-10 flex items-center justify-center text-xl rounded-lg border-2 transition-colors ${
                       formData.icon === ic ? 'border-indigo-600 bg-indigo-50' : 'border-gray-200 hover:border-gray-300'
                     }`}>{ic}</button>
                 ))}
@@ -295,7 +621,7 @@ const CategoryFormModal: React.FC<{
                 {COLOR_PRESETS.map(c => (
                   <button key={c.value} type="button"
                     onClick={() => setFormData(p => ({ ...p, color: c.value, colorClass: c.cls }))}
-                    className={`w-10 h-10 rounded-lg border-2 ${
+                    className={`w-10 h-10 rounded-lg border-2 transition-all ${
                       formData.color === c.value ? 'border-gray-900 ring-2 ring-offset-2 ring-gray-400' : 'border-transparent'
                     }`} style={{ backgroundColor: c.value }} title={c.name} />
                 ))}
@@ -340,7 +666,7 @@ const CategoryFormModal: React.FC<{
 };
 
 // ====================================================================
-// CATEGORY ACTION CONFIG MODAL (FIXED - For configuring category grid actions)
+// CATEGORY ACTION CONFIG MODAL (UNCHANGED LOGIC, FULL CODE)
 // ====================================================================
 
 const CategoryActionConfigModal: React.FC<{
@@ -397,7 +723,6 @@ const CategoryActionConfigModal: React.FC<{
           sortOrder: 'asc',
         });
 
-        // Handle different response structures
         let subserviceData: SDUISubservice[] = [];
 
         if (res && res.data) {
@@ -426,16 +751,9 @@ const CategoryActionConfigModal: React.FC<{
     }
   }, [category._id]);
 
-  // Safe filtered subservices - always returns an array
-  const filteredSubservices = React.useMemo(() => {
-    if (!Array.isArray(subservices)) {
-      return [];
-    }
-
-    if (!searchQuery.trim()) {
-      return subservices;
-    }
-
+  const filteredSubservices = useMemo(() => {
+    if (!Array.isArray(subservices)) return [];
+    if (!searchQuery.trim()) return subservices;
     const query = searchQuery.toLowerCase();
     return subservices.filter(s => {
       if (!s) return false;
@@ -493,9 +811,7 @@ const CategoryActionConfigModal: React.FC<{
         },
       };
 
-      // Update category with action config
       await sduiCategoryApi.updateActionConfig(category._id, actionConfig);
-
       onSave();
       onClose();
     } catch (err: any) {
@@ -519,7 +835,6 @@ const CategoryActionConfigModal: React.FC<{
     }
   };
 
-  // Safe count for subservices
   const subservicesCount = Array.isArray(subservices) ? subservices.length : 0;
   const selectedCount = form.selectedSubservices.length;
 
@@ -538,11 +853,18 @@ const CategoryActionConfigModal: React.FC<{
           <div className="flex items-center justify-between px-6 py-4 border-b bg-gradient-to-r from-indigo-50 to-purple-50">
             <div className="flex items-center gap-3">
               <div
-                className="w-12 h-12 rounded-xl flex items-center justify-center text-2xl"
+                className="w-12 h-12 rounded-xl flex items-center justify-center text-2xl overflow-hidden"
                 style={{ backgroundColor: category.color + '20' }}
               >
                 {category.image?.url ? (
-                  <img src={category.image.url} alt="" className="w-full h-full object-cover rounded-xl" />
+                  <MediaPreview
+                    url={category.image.url}
+                    mediaType={category.mediaType}
+                    className="w-full h-full"
+                    showBadge={false}
+                    autoPlay={false}
+                    controls={false}
+                  />
                 ) : (
                   category.icon
                 )}
@@ -585,7 +907,7 @@ const CategoryActionConfigModal: React.FC<{
             {error && (
               <div className="flex items-center gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
                 <AlertCircle size={16} />
-                {error}
+                <span className="flex-1">{error}</span>
                 <button onClick={() => setError(null)} className="ml-auto">
                   <X size={14} />
                 </button>
@@ -801,10 +1123,13 @@ const CategoryActionConfigModal: React.FC<{
                               </div>
                               <div className="w-12 h-12 rounded-lg bg-gray-100 flex items-center justify-center overflow-hidden flex-shrink-0">
                                 {subservice.image?.url ? (
-                                  <img
-                                    src={subservice.image.url}
-                                    alt={subservice.name}
-                                    className="w-full h-full object-cover"
+                                  <MediaPreview
+                                    url={subservice.image.url}
+                                    mediaType={(subservice as any)?.mediaType}
+                                    className="w-full h-full"
+                                    showBadge={false}
+                                    autoPlay={false}
+                                    controls={false}
                                   />
                                 ) : (
                                   <span className="text-xl">{subservice.icon || '📦'}</span>
@@ -1004,7 +1329,7 @@ const CategoryActionConfigModal: React.FC<{
 };
 
 // ====================================================================
-// SORTABLE CATEGORY CARD (for Grid Manager)
+// SORTABLE CATEGORY CARD (for Grid Manager - WITH VIDEO SUPPORT)
 // ====================================================================
 
 const SortableCategoryCard: React.FC<{
@@ -1020,6 +1345,7 @@ const SortableCategoryCard: React.FC<{
 
   const hasActionConfig = !!category.actionConfig;
   const selectedCount = category.actionConfig?.selectedSubservices?.length || 0;
+  const isCatVideo = isVideoUrl(category.image?.url, category.mediaType);
 
   return (
     <div ref={setNodeRef} style={style}
@@ -1041,6 +1367,14 @@ const SortableCategoryCard: React.FC<{
         </div>
       )}
 
+      {/* Media type badge */}
+      {isCatVideo && (
+        <div className="absolute top-2 right-10 z-10 bg-purple-600 text-white text-xs px-2 py-1 rounded-full flex items-center gap-1">
+          <Film size={10} />
+          <span>Video</span>
+        </div>
+      )}
+
       {/* Drag Handle */}
       {!disabled && (
         <div {...attributes} {...listeners} className="absolute top-2 right-2 z-10 p-1.5 bg-white/90 rounded-lg cursor-grab active:cursor-grabbing hover:bg-gray-100">
@@ -1048,10 +1382,20 @@ const SortableCategoryCard: React.FC<{
         </div>
       )}
 
-      {/* Image */}
+      {/* Media (Image or Video) */}
       <div className="h-32 bg-gradient-to-br from-gray-100 to-gray-200 relative">
         {category.image?.url ? (
-          <img src={category.image.url} alt={category.name} className="w-full h-full object-cover" />
+          <MediaPreview
+            url={category.image.url}
+            mediaType={category.mediaType}
+            alt={category.name}
+            className="w-full h-full"
+            showBadge={false}
+            autoPlay={true}
+            muted={true}
+            loop={true}
+            controls={false}
+          />
         ) : (
           <div className="w-full h-full flex items-center justify-center text-4xl" style={{ backgroundColor: category.color + '20' }}>
             {category.icon}
@@ -1110,7 +1454,7 @@ const SortableCategoryCard: React.FC<{
 };
 
 // ====================================================================
-// CATEGORY GRID MANAGER (Without More Services)
+// CATEGORY GRID MANAGER (WITH VIDEO SUPPORT)
 // ====================================================================
 
 const CategoryGridManager: React.FC<{
@@ -1137,7 +1481,6 @@ const CategoryGridManager: React.FC<{
       const res = await sduiCategoryApi.getAll({ sortBy: 'sortOrder', sortOrder: 'asc', limit: 100 });
       if (res.success) {
         const all = (res.data || []) as GridCategory[];
-        // Filter out "More Services" section and sort by sortOrder
         const regularCategories = all
           .filter(c => !c.isMoreServicesSection)
           .sort((a, b) => a.sortOrder - b.sortOrder);
@@ -1187,8 +1530,8 @@ const CategoryGridManager: React.FC<{
 
   const activeCat = activeId ? categories.find(c => c._id === activeId) : null;
 
-  // Filter active categories for preview
   const activeCategories = categories.filter(c => c.isActive);
+  const videoCount = categories.filter(c => isVideoUrl(c.image?.url, c.mediaType)).length;
 
   if (loading) return (
     <div className="flex items-center justify-center py-12">
@@ -1274,9 +1617,16 @@ const CategoryGridManager: React.FC<{
                 <DragOverlay>
                   {activeCat ? (
                     <div className="bg-white rounded-xl border-2 border-indigo-500 shadow-2xl overflow-hidden w-48">
-                      <div className="h-24 bg-gray-200">
+                      <div className="h-24 bg-gray-200 relative">
                         {activeCat.image?.url ? (
-                          <img src={activeCat.image.url} alt="" className="w-full h-full object-cover" />
+                          <MediaPreview
+                            url={activeCat.image.url}
+                            mediaType={activeCat.mediaType}
+                            className="w-full h-full"
+                            showBadge={true}
+                            autoPlay={false}
+                            controls={false}
+                          />
                         ) : (
                           <div className="w-full h-full flex items-center justify-center text-3xl" style={{ backgroundColor: activeCat.color + '20' }}>
                             {activeCat.icon}
@@ -1294,7 +1644,7 @@ const CategoryGridManager: React.FC<{
           </div>
 
           {/* Stats */}
-          <div className="mt-4 grid grid-cols-3 gap-4">
+          <div className="mt-4 grid grid-cols-4 gap-4">
             <div className="bg-white rounded-xl border p-4">
               <div className="flex items-center gap-3">
                 <div className="w-10 h-10 bg-indigo-100 rounded-lg flex items-center justify-center">
@@ -1302,7 +1652,7 @@ const CategoryGridManager: React.FC<{
                 </div>
                 <div>
                   <p className="text-2xl font-bold text-gray-900">{categories.length}</p>
-                  <p className="text-sm text-gray-500">Total Categories</p>
+                  <p className="text-sm text-gray-500">Total</p>
                 </div>
               </div>
             </div>
@@ -1320,7 +1670,18 @@ const CategoryGridManager: React.FC<{
             <div className="bg-white rounded-xl border p-4">
               <div className="flex items-center gap-3">
                 <div className="w-10 h-10 bg-purple-100 rounded-lg flex items-center justify-center">
-                  <Settings size={20} className="text-purple-600" />
+                  <Film size={20} className="text-purple-600" />
+                </div>
+                <div>
+                  <p className="text-2xl font-bold text-gray-900">{videoCount}</p>
+                  <p className="text-sm text-gray-500">Videos</p>
+                </div>
+              </div>
+            </div>
+            <div className="bg-white rounded-xl border p-4">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-orange-100 rounded-lg flex items-center justify-center">
+                  <Settings size={20} className="text-orange-600" />
                 </div>
                 <div>
                   <p className="text-2xl font-bold text-gray-900">{categories.filter(c => c.actionConfig).length}</p>
@@ -1347,7 +1708,17 @@ const CategoryGridManager: React.FC<{
                     {activeCategories.slice(0, 6).map(c => (
                       <div key={c._id} className="aspect-square rounded-xl overflow-hidden relative">
                         {c.image?.url ? (
-                          <img src={c.image.url} alt="" className="w-full h-full object-cover" />
+                          <MediaPreview
+                            url={c.image.url}
+                            mediaType={c.mediaType}
+                            alt={c.name}
+                            className="w-full h-full"
+                            showBadge={false}
+                            autoPlay={true}
+                            muted={true}
+                            loop={true}
+                            controls={false}
+                          />
                         ) : (
                           <div className="w-full h-full flex items-center justify-center text-2xl" style={{ backgroundColor: c.color + '30' }}>
                             {c.icon}
@@ -1355,9 +1726,13 @@ const CategoryGridManager: React.FC<{
                         )}
                         <div className="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent" />
                         <span className="absolute bottom-1 left-1 right-1 text-white text-xs font-medium truncate">{c.name}</span>
-                        {/* Show config indicator in preview */}
+                        {/* Config indicator */}
                         {c.actionConfig && (
                           <div className="absolute top-1 right-1 w-3 h-3 bg-green-500 rounded-full border border-white" title="Action configured" />
+                        )}
+                        {/* Video indicator */}
+                        {isVideoUrl(c.image?.url, c.mediaType) && (
+                          <div className="absolute top-1 left-1 w-3 h-3 bg-purple-500 rounded-full border border-white" title="Video" />
                         )}
                       </div>
                     ))}
@@ -1372,11 +1747,17 @@ const CategoryGridManager: React.FC<{
                   </div>
                 </div>
               </div>
-              <div className="mt-4 p-3 bg-white rounded-lg">
+              <div className="mt-4 p-3 bg-white rounded-lg space-y-1">
                 <p className="text-xs text-gray-600 text-center flex items-center justify-center gap-2">
                   <span className="inline-flex items-center gap-1">
                     <span className="w-3 h-3 bg-green-500 rounded-full"></span>
                     Action configured
+                  </span>
+                </p>
+                <p className="text-xs text-gray-600 text-center flex items-center justify-center gap-2">
+                  <span className="inline-flex items-center gap-1">
+                    <span className="w-3 h-3 bg-purple-500 rounded-full"></span>
+                    Video media
                   </span>
                 </p>
               </div>
@@ -1525,59 +1906,79 @@ const CategoriesPage: React.FC = () => {
         </div>
       ) : viewMode === 'grid' ? (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
-          {filteredCategories.map(cat => (
-            <div key={cat._id} className={`bg-white rounded-xl border overflow-hidden hover:shadow-lg transition-shadow ${!cat.isActive ? 'opacity-60' : ''}`}>
-              <div className="h-40 bg-gray-100 relative">
-                {cat.image?.url ? (
-                  <img src={cat.image.url} alt={cat.name} className="w-full h-full object-cover" />
-                ) : (
-                  <div className="w-full h-full flex items-center justify-center text-5xl" style={{ backgroundColor: cat.color + '20' }}>
-                    {cat.icon}
+          {filteredCategories.map(cat => {
+            const catAny = cat as any;
+            const isCatVideo = isVideoUrl(cat.image?.url, catAny.mediaType);
+
+            return (
+              <div key={cat._id} className={`bg-white rounded-xl border overflow-hidden hover:shadow-lg transition-shadow ${!cat.isActive ? 'opacity-60' : ''}`}>
+                <div className="h-40 bg-gray-100 relative">
+                  {cat.image?.url ? (
+                    <MediaPreview
+                      url={cat.image.url}
+                      mediaType={catAny.mediaType}
+                      alt={cat.name}
+                      className="w-full h-full"
+                      showBadge={true}
+                      autoPlay={true}
+                      muted={true}
+                      loop={true}
+                      controls={false}
+                    />
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center text-5xl" style={{ backgroundColor: cat.color + '20' }}>
+                      {cat.icon}
+                    </div>
+                  )}
+                  <div className="absolute top-2 left-2 flex gap-1 flex-wrap">
+                    {cat.isFeatured && (
+                      <span className="flex items-center gap-1 px-2 py-1 bg-yellow-100 text-yellow-700 text-xs font-medium rounded-full">
+                        <Star size={12} />Featured
+                      </span>
+                    )}
+                    {catAny.actionConfig && (
+                      <span className="flex items-center gap-1 px-2 py-1 bg-green-100 text-green-700 text-xs font-medium rounded-full">
+                        <Settings size={12} />Action
+                      </span>
+                    )}
+                    {isCatVideo && (
+                      <span className="flex items-center gap-1 px-2 py-1 bg-purple-100 text-purple-700 text-xs font-medium rounded-full">
+                        <Film size={12} />Video
+                      </span>
+                    )}
                   </div>
-                )}
-                <div className="absolute top-2 left-2 flex gap-1">
-                  {cat.isFeatured && (
-                    <span className="flex items-center gap-1 px-2 py-1 bg-yellow-100 text-yellow-700 text-xs font-medium rounded-full">
-                      <Star size={12} />Featured
+                  <div className="absolute top-2 right-2">
+                    <span className={`px-2 py-1 text-xs font-medium rounded-full ${cat.isActive ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                      {cat.isActive ? 'Active' : 'Inactive'}
                     </span>
-                  )}
-                  {cat.actionConfig && (
-                    <span className="flex items-center gap-1 px-2 py-1 bg-green-100 text-green-700 text-xs font-medium rounded-full">
-                      <Settings size={12} />Action
-                    </span>
-                  )}
+                  </div>
                 </div>
-                <div className="absolute top-2 right-2">
-                  <span className={`px-2 py-1 text-xs font-medium rounded-full ${cat.isActive ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
-                    {cat.isActive ? 'Active' : 'Inactive'}
-                  </span>
+                <div className="p-4">
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <h3 className="font-semibold text-gray-900">{cat.name}</h3>
+                      <p className="text-sm text-gray-500 mt-1">{cat.subservicesCount || cat.servicesCount || 0} services</p>
+                    </div>
+                    <div className="w-8 h-8 rounded-full flex-shrink-0" style={{ backgroundColor: cat.color }} />
+                  </div>
+                  {cat.description && (
+                    <p className="text-sm text-gray-500 mt-2 line-clamp-2">{cat.description}</p>
+                  )}
+                  <div className="flex items-center gap-2 mt-4 pt-4 border-t border-gray-100">
+                    <button onClick={() => handleEdit(cat)} className="flex-1 flex items-center justify-center gap-1 px-3 py-2 text-sm text-gray-700 hover:bg-gray-100 rounded-lg">
+                      <Edit size={16} />Edit
+                    </button>
+                    <button onClick={() => handleToggleActive(cat)} className={`p-2 rounded-lg ${cat.isActive ? 'text-green-600 hover:bg-green-50' : 'text-gray-400 hover:bg-gray-100'}`}>
+                      {cat.isActive ? <Eye size={18} /> : <EyeOff size={18} />}
+                    </button>
+                    <button onClick={() => setShowDeleteConfirm(cat._id)} className="p-2 text-red-500 hover:bg-red-50 rounded-lg">
+                      <Trash2 size={18} />
+                    </button>
+                  </div>
                 </div>
               </div>
-              <div className="p-4">
-                <div className="flex items-start justify-between gap-2">
-                  <div>
-                    <h3 className="font-semibold text-gray-900">{cat.name}</h3>
-                    <p className="text-sm text-gray-500 mt-1">{cat.subservicesCount || cat.servicesCount || 0} services</p>
-                  </div>
-                  <div className="w-8 h-8 rounded-full flex-shrink-0" style={{ backgroundColor: cat.color }} />
-                </div>
-                {cat.description && (
-                  <p className="text-sm text-gray-500 mt-2 line-clamp-2">{cat.description}</p>
-                )}
-                <div className="flex items-center gap-2 mt-4 pt-4 border-t border-gray-100">
-                  <button onClick={() => handleEdit(cat)} className="flex-1 flex items-center justify-center gap-1 px-3 py-2 text-sm text-gray-700 hover:bg-gray-100 rounded-lg">
-                    <Edit size={16} />Edit
-                  </button>
-                  <button onClick={() => handleToggleActive(cat)} className={`p-2 rounded-lg ${cat.isActive ? 'text-green-600 hover:bg-green-50' : 'text-gray-400 hover:bg-gray-100'}`}>
-                    {cat.isActive ? <Eye size={18} /> : <EyeOff size={18} />}
-                  </button>
-                  <button onClick={() => setShowDeleteConfirm(cat._id)} className="p-2 text-red-500 hover:bg-red-50 rounded-lg">
-                    <Trash2 size={18} />
-                  </button>
-                </div>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       ) : (
         /* List View */
@@ -1586,6 +1987,7 @@ const CategoriesPage: React.FC = () => {
             <thead className="bg-gray-50 border-b">
               <tr>
                 <th className="text-left px-6 py-3 text-xs font-semibold text-gray-600 uppercase">Category</th>
+                <th className="text-left px-6 py-3 text-xs font-semibold text-gray-600 uppercase">Media</th>
                 <th className="text-left px-6 py-3 text-xs font-semibold text-gray-600 uppercase">Services</th>
                 <th className="text-left px-6 py-3 text-xs font-semibold text-gray-600 uppercase">Status</th>
                 <th className="text-left px-6 py-3 text-xs font-semibold text-gray-600 uppercase">Action Config</th>
@@ -1594,53 +1996,77 @@ const CategoriesPage: React.FC = () => {
               </tr>
             </thead>
             <tbody className="divide-y">
-              {filteredCategories.map(cat => (
-                <tr key={cat._id} className="hover:bg-gray-50">
-                  <td className="px-6 py-4">
-                    <div className="flex items-center gap-3">
-                      <div className="w-12 h-12 rounded-lg flex items-center justify-center text-2xl overflow-hidden" style={{ backgroundColor: cat.color + '20' }}>
-                        {cat.image?.url ? <img src={cat.image.url} alt="" className="w-full h-full object-cover" /> : cat.icon}
+              {filteredCategories.map(cat => {
+                const catAny = cat as any;
+                const isCatVideo = isVideoUrl(cat.image?.url, catAny.mediaType);
+
+                return (
+                  <tr key={cat._id} className="hover:bg-gray-50">
+                    <td className="px-6 py-4">
+                      <div className="flex items-center gap-3">
+                        <div className="w-12 h-12 rounded-lg flex items-center justify-center text-2xl overflow-hidden" style={{ backgroundColor: cat.color + '20' }}>
+                          {cat.image?.url ? (
+                            <MediaPreview
+                              url={cat.image.url}
+                              mediaType={catAny.mediaType}
+                              className="w-full h-full"
+                              showBadge={false}
+                              autoPlay={false}
+                              controls={false}
+                            />
+                          ) : cat.icon}
+                        </div>
+                        <div>
+                          <p className="font-medium text-gray-900">{cat.name}</p>
+                          <p className="text-sm text-gray-500">{cat.categoryId}</p>
+                        </div>
                       </div>
-                      <div>
-                        <p className="font-medium text-gray-900">{cat.name}</p>
-                        <p className="text-sm text-gray-500">{cat.categoryId}</p>
-                      </div>
-                    </div>
-                  </td>
-                  <td className="px-6 py-4 text-sm text-gray-600">{cat.subservicesCount || cat.servicesCount || 0}</td>
-                  <td className="px-6 py-4">
-                    <span className={`inline-flex px-2 py-1 text-xs font-medium rounded-full ${cat.isActive ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
-                      {cat.isActive ? 'Active' : 'Inactive'}
-                    </span>
-                  </td>
-                  <td className="px-6 py-4">
-                    {cat.actionConfig ? (
-                      <span className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-full bg-green-100 text-green-700">
-                        <Settings size={12} />
-                        {cat.actionConfig.actionType === 'show_selected_subservices'
-                          ? `${cat.actionConfig.selectedSubservices?.length || 0} selected`
-                          : 'Configured'}
+                    </td>
+                    <td className="px-6 py-4">
+                      <span className={`inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-full ${
+                        isCatVideo
+                          ? 'bg-purple-100 text-purple-700'
+                          : 'bg-blue-100 text-blue-700'
+                      }`}>
+                        {isCatVideo ? <Film size={12} /> : <ImageIcon size={12} />}
+                        {isCatVideo ? 'Video' : 'Image'}
                       </span>
-                    ) : (
-                      <span className="text-xs text-gray-400">Not configured</span>
-                    )}
-                  </td>
-                  <td className="px-6 py-4 text-sm text-gray-600">#{cat.sortOrder + 1}</td>
-                  <td className="px-6 py-4">
-                    <div className="flex items-center justify-end gap-2">
-                      <button onClick={() => handleEdit(cat)} className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg">
-                        <Edit size={16} />
-                      </button>
-                      <button onClick={() => handleToggleActive(cat)} className={`p-2 rounded-lg ${cat.isActive ? 'text-green-600 hover:bg-green-50' : 'text-gray-400 hover:bg-gray-100'}`}>
-                        {cat.isActive ? <Eye size={16} /> : <EyeOff size={16} />}
-                      </button>
-                      <button onClick={() => setShowDeleteConfirm(cat._id)} className="p-2 text-red-500 hover:bg-red-50 rounded-lg">
-                        <Trash2 size={16} />
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
+                    </td>
+                    <td className="px-6 py-4 text-sm text-gray-600">{cat.subservicesCount || cat.servicesCount || 0}</td>
+                    <td className="px-6 py-4">
+                      <span className={`inline-flex px-2 py-1 text-xs font-medium rounded-full ${cat.isActive ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                        {cat.isActive ? 'Active' : 'Inactive'}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4">
+                      {catAny.actionConfig ? (
+                        <span className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-full bg-green-100 text-green-700">
+                          <Settings size={12} />
+                          {catAny.actionConfig.actionType === 'show_selected_subservices'
+                            ? `${catAny.actionConfig.selectedSubservices?.length || 0} selected`
+                            : 'Configured'}
+                        </span>
+                      ) : (
+                        <span className="text-xs text-gray-400">Not configured</span>
+                      )}
+                    </td>
+                    <td className="px-6 py-4 text-sm text-gray-600">#{cat.sortOrder + 1}</td>
+                    <td className="px-6 py-4">
+                      <div className="flex items-center justify-end gap-2">
+                        <button onClick={() => handleEdit(cat)} className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg">
+                          <Edit size={16} />
+                        </button>
+                        <button onClick={() => handleToggleActive(cat)} className={`p-2 rounded-lg ${cat.isActive ? 'text-green-600 hover:bg-green-50' : 'text-gray-400 hover:bg-gray-100'}`}>
+                          {cat.isActive ? <Eye size={16} /> : <EyeOff size={16} />}
+                        </button>
+                        <button onClick={() => setShowDeleteConfirm(cat._id)} className="p-2 text-red-500 hover:bg-red-50 rounded-lg">
+                          <Trash2 size={16} />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
