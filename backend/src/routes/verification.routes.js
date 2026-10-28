@@ -9,28 +9,32 @@ router.use((req, res, next) => {
   next();
 });
 
-// All routes require authentication
+// Auth required for all routes
 router.use(authMiddleware);
 
-// Debug endpoint
+// Debug
 router.get('/debug', verificationController.debugVerifications);
 
-// Get verification stats
+// Stats
 router.get('/stats', verificationController.getVerificationStats);
 
-// Get all verifications
+// List
 router.get('/', verificationController.getAllVerifications);
-
-// Get pending verifications
 router.get('/pending', verificationController.getPendingVerifications);
 
-// Get verification by ID
+// Bulk actions (MUST be before /:id routes)
+router.post('/bulk/approve', verificationController.bulkApprove);
+router.post('/bulk/reject', verificationController.bulkReject);
+
+// By provider
+router.get('/provider/:providerId', verificationController.getVerificationsByProvider);
+
+// Single verification
 router.get('/:id', verificationController.getVerificationById);
-
-// Approve verification
 router.post('/:id/approve', verificationController.approveVerification);
-
-// Reject verification
 router.post('/:id/reject', verificationController.rejectVerification);
+router.post('/:id/resubmit', verificationController.requestResubmission);
+router.post('/:id/review', verificationController.markUnderReview);
+router.delete('/:id', verificationController.deleteVerification);
 
 module.exports = router;

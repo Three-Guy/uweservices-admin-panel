@@ -3,7 +3,29 @@ const ApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
 const mongoose = require('mongoose');
 
-// Helper to get the correct collection
+// ========= Optional dependencies (safe require) =========
+let fcmService = null;
+try {
+  fcmService = require('../services/fcmService');
+} catch (e) {
+  logger.warn('fcmService not loaded in verification.controller');
+}
+
+let AdminNotification = null;
+try {
+  AdminNotification = require('../models/AdminNotification');
+} catch (e) {
+  logger.warn('AdminNotification model not loaded');
+}
+
+let AuditLog = null;
+try {
+  AuditLog = require('../models/AuditLog');
+} catch (e) {
+  logger.warn('AuditLog model not loaded');
+}
+
+// ================== COLLECTION HELPERS ==================
 const getVerificationCollection = () => {
   const providerConn = getProviderConnection();
   return providerConn.db.collection('provider_verifications');
@@ -14,246 +36,258 @@ const getProviderCollection = () => {
   return providerConn.db.collection('providers');
 };
 
-// Helper function to extract document URLs - FIXED FOR YOUR DATA STRUCTURE
+// ================== DOCUMENT EXTRACTION ==================
+/**
+ * Extract documents from verification record in a NORMALIZED format.
+ * Supports both legacy formats AND the current actual DB structure:
+ *   documents: { selfie, panCard, aadhaarFront, aadhaarBack } (strings)
+ *   cloudinaryIds: { selfie, panCard, aadhaarFront, aadhaarBack }
+ */
 const extractDocuments = (verification) => {
-  console.log('🔍 Extracting documents from:', verification.documents);
-  
   const docs = {
     selfie: null,
-    aadhaarCard: null,
     panCard: null,
+    aadhaarFront: null,
+    aadhaarBack: null,
   };
 
-  if (!verification.documents) {
-    return docs;
+  if (!verification || !verification.documents) return docs;
+
+  const d = verification.documents;
+  const cids = verification.cloudinaryIds || {};
+  const submittedAt = verification.submittedAt || verification.createdAt || new Date();
+
+  const normalize = (field, publicIdField) => {
+    const value = d[field];
+    if (!value) return null;
+
+    if (typeof value === 'string') {
+      return {
+        url: value,
+        publicId: cids[publicIdField] || null,
+        uploadedAt: submittedAt,
+      };
+    }
+    if (typeof value === 'object' && value.url) {
+      return {
+        url: value.url,
+        publicId: value.publicId || cids[publicIdField] || null,
+        uploadedAt: value.uploadedAt || submittedAt,
+      };
+    }
+    return null;
+  };
+
+  docs.selfie = normalize('selfie', 'selfie');
+  docs.panCard = normalize('panCard', 'panCard') || normalize('pan', 'pan');
+  docs.aadhaarFront = normalize('aadhaarFront', 'aadhaarFront');
+  docs.aadhaarBack = normalize('aadhaarBack', 'aadhaarBack');
+
+  // Legacy fallback: single aadhaarCard => map to aadhaarFront
+  if (!docs.aadhaarFront && d.aadhaarCard) {
+    docs.aadhaarFront = normalize('aadhaarCard', 'aadhaarCard');
   }
 
-  // Your structure: documents.selfie is a STRING URL directly
-  // documents.selfie: "https://res.cloudinary.com/..."
-  
-  // Handle selfie
-  if (verification.documents.selfie) {
-    if (typeof verification.documents.selfie === 'string') {
-      // Direct URL string
-      docs.selfie = {
-        url: verification.documents.selfie,
-        publicId: verification.cloudinaryIds?.selfie || null,
-        uploadedAt: verification.submittedAt || verification.createdAt || new Date().toISOString(),
-      };
-    } else if (verification.documents.selfie.url) {
-      // Object with url property
-      docs.selfie = {
-        url: verification.documents.selfie.url,
-        publicId: verification.documents.selfie.publicId || verification.cloudinaryIds?.selfie || null,
-        uploadedAt: verification.documents.selfie.uploadedAt || verification.submittedAt || verification.createdAt,
-      };
-    }
-  }
-
-  // Handle aadhaarCard (or aadhaar)
-  if (verification.documents.aadhaarCard) {
-    if (typeof verification.documents.aadhaarCard === 'string') {
-      docs.aadhaarCard = {
-        url: verification.documents.aadhaarCard,
-        publicId: verification.cloudinaryIds?.aadhaarCard || null,
-        uploadedAt: verification.submittedAt || verification.createdAt || new Date().toISOString(),
-      };
-    } else if (verification.documents.aadhaarCard.url) {
-      docs.aadhaarCard = {
-        url: verification.documents.aadhaarCard.url,
-        publicId: verification.documents.aadhaarCard.publicId || verification.cloudinaryIds?.aadhaarCard || null,
-        uploadedAt: verification.documents.aadhaarCard.uploadedAt || verification.submittedAt || verification.createdAt,
-      };
-    }
-  } else if (verification.documents.aadhaar) {
-    if (typeof verification.documents.aadhaar === 'string') {
-      docs.aadhaarCard = {
-        url: verification.documents.aadhaar,
-        publicId: verification.cloudinaryIds?.aadhaar || null,
-        uploadedAt: verification.submittedAt || verification.createdAt || new Date().toISOString(),
-      };
-    } else if (verification.documents.aadhaar.url) {
-      docs.aadhaarCard = {
-        url: verification.documents.aadhaar.url,
-        publicId: verification.documents.aadhaar.publicId || verification.cloudinaryIds?.aadhaar || null,
-        uploadedAt: verification.documents.aadhaar.uploadedAt || verification.submittedAt || verification.createdAt,
-      };
-    }
-  }
-
-  // Handle panCard (or pan)
-  if (verification.documents.panCard) {
-    if (typeof verification.documents.panCard === 'string') {
-      docs.panCard = {
-        url: verification.documents.panCard,
-        publicId: verification.cloudinaryIds?.panCard || null,
-        uploadedAt: verification.submittedAt || verification.createdAt || new Date().toISOString(),
-      };
-    } else if (verification.documents.panCard.url) {
-      docs.panCard = {
-        url: verification.documents.panCard.url,
-        publicId: verification.documents.panCard.publicId || verification.cloudinaryIds?.panCard || null,
-        uploadedAt: verification.documents.panCard.uploadedAt || verification.submittedAt || verification.createdAt,
-      };
-    }
-  } else if (verification.documents.pan) {
-    if (typeof verification.documents.pan === 'string') {
-      docs.panCard = {
-        url: verification.documents.pan,
-        publicId: verification.cloudinaryIds?.pan || null,
-        uploadedAt: verification.submittedAt || verification.createdAt || new Date().toISOString(),
-      };
-    } else if (verification.documents.pan.url) {
-      docs.panCard = {
-        url: verification.documents.pan.url,
-        publicId: verification.documents.pan.publicId || verification.cloudinaryIds?.pan || null,
-        uploadedAt: verification.documents.pan.uploadedAt || verification.submittedAt || verification.createdAt,
-      };
-    }
-  }
-
-  console.log('✅ Extracted documents:', docs);
   return docs;
 };
 
-// Get provider details by ID
-const getProviderDetails = async (providerId) => {
+// ================== PROVIDER DETAILS ==================
+const getProviderDetails = async (providerIdOrObj) => {
   try {
     const providersCollection = getProviderCollection();
-    
     let provider = null;
-    
-    // Try to find by ObjectId
-    if (mongoose.Types.ObjectId.isValid(providerId)) {
-      provider = await providersCollection.findOne({ 
-        _id: new mongoose.Types.ObjectId(providerId) 
+
+    const id = providerIdOrObj?.toString ? providerIdOrObj.toString() : providerIdOrObj;
+
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      provider = await providersCollection.findOne({
+        _id: new mongoose.Types.ObjectId(id),
       });
     }
-    
-    // Try to find by providerId string
-    if (!provider && typeof providerId === 'string') {
-      provider = await providersCollection.findOne({ providerId: providerId });
+    if (!provider && typeof id === 'string') {
+      provider = await providersCollection.findOne({ providerId: id });
     }
-    
-    if (provider) {
-      return {
-        _id: provider._id,
-        providerId: provider.providerId || provider._id.toString(),
-        name: provider.name || 'Unknown',
-        email: provider.email || 'N/A',
-        phone: provider.phone || 'N/A',
-        profession: provider.profession || provider.service || 'N/A',
-        profileImage: provider.profileImage || provider.profilePhoto || null,
-      };
-    }
-    
-    return null;
+
+    if (!provider) return null;
+
+    return {
+      _id: provider._id,
+      providerId: provider.providerId || provider._id.toString(),
+      name: provider.name || 'Unknown',
+      email: provider.email || 'N/A',
+      phone: provider.phone || 'N/A',
+      profession: provider.profession || 'N/A',
+      categoryName: provider.categoryName || null,
+      city: provider.city || null,
+      gender: provider.gender || null,
+      profilePicture:
+        provider.profilePicture ||
+        provider.profileImage ||
+        provider.profilePhoto ||
+        null,
+      verificationStatus: provider.verificationStatus || 'pending',
+      isVerified: !!provider.isVerified,
+      isActive: provider.isActive !== false,
+      fcmToken: provider.fcmToken || null,
+    };
   } catch (error) {
-    console.error('Error fetching provider:', error);
+    logger.error('Error fetching provider:', error);
     return null;
   }
 };
 
-// Get all verifications
+// ================== AUDIT / NOTIFICATIONS ==================
+const createAuditLog = async ({ action, adminId, adminEmail, targetId, metadata }) => {
+  if (!AuditLog) return;
+  try {
+    await AuditLog.create({
+      action,
+      performedBy: adminId,
+      performedByEmail: adminEmail,
+      targetType: 'Verification',
+      targetId,
+      metadata,
+      timestamp: new Date(),
+    });
+  } catch (err) {
+    logger.error('Audit log error:', err.message);
+  }
+};
+
+const createAdminNotification = async ({ title, message, type, metadata }) => {
+  if (!AdminNotification) return;
+  try {
+    await AdminNotification.create({
+      title,
+      message,
+      type,
+      metadata,
+      isRead: false,
+      createdAt: new Date(),
+    });
+  } catch (err) {
+    logger.error('Admin notification error:', err.message);
+  }
+};
+
+const sendProviderFCM = async (fcmToken, title, body, data = {}) => {
+  if (!fcmService || !fcmToken) return;
+  try {
+    await fcmService.sendToToken(fcmToken, {
+      notification: { title, body },
+      data: Object.fromEntries(
+        Object.entries(data).map(([k, v]) => [k, String(v)])
+      ),
+    });
+  } catch (err) {
+    logger.error('FCM send error:', err.message);
+  }
+};
+
+// ================== TRANSFORMER ==================
+const transformVerification = async (v) => {
+  const documents = extractDocuments(v);
+  let providerDetails = null;
+  if (v.provider) providerDetails = await getProviderDetails(v.provider);
+  else if (v.providerId) providerDetails = await getProviderDetails(v.providerId);
+
+  return {
+    _id: v._id,
+    verificationId: v.verificationId || v._id.toString().slice(-8).toUpperCase(),
+    provider: providerDetails || {
+      _id: v.provider || v.providerId || 'unknown',
+      providerId: 'N/A',
+      name: 'Unknown Provider',
+      email: 'N/A',
+      phone: 'N/A',
+      profession: 'N/A',
+      profilePicture: null,
+    },
+    documents,
+    documentNumbers: v.documentNumbers || { panNumber: '', aadhaarNumber: '' },
+    status: v.status || 'pending',
+    reviewedBy: v.reviewedBy || null,
+    reviewedAt: v.reviewedAt || null,
+    rejectionReason: v.rejectionReason || '',
+    notes: v.notes || '',
+    attempts: v.attempts || 1,
+    statusHistory: v.statusHistory || [],
+    submittedAt: v.submittedAt || v.createdAt,
+    createdAt: v.createdAt || v.submittedAt,
+    updatedAt: v.updatedAt,
+  };
+};
+
+// ================== ROUTES ==================
+
+// GET all verifications (with filters, search, pagination, sort)
 exports.getAllVerifications = async (req, res, next) => {
   try {
-    console.log('\n📋 ═══════════════════════════════════════');
-    console.log('📋 Fetching all verifications from provider_verifications...');
-    console.log('📋 ═══════════════════════════════════════');
-    
-    const { 
-      page = 1, 
-      limit = 20, 
-      status, 
-      search 
+    const {
+      page = 1,
+      limit = 20,
+      status,
+      search,
+      sortBy = 'createdAt',
+      sortOrder = 'desc',
+      startDate,
+      endDate,
     } = req.query;
 
     const verificationCollection = getVerificationCollection();
-
-    // Build query
     const query = {};
-    
+
     if (status && status !== 'all') {
-      query.status = status;
+      if (status === 'pending') {
+        query.status = { $in: ['pending', 'under_review'] };
+      } else {
+        query.status = status;
+      }
     }
 
-    // Count total
-    const total = await verificationCollection.countDocuments(query);
-    console.log('📊 Total verifications in provider_verifications:', total);
+    if (startDate || endDate) {
+      query.createdAt = {};
+      if (startDate) query.createdAt.$gte = new Date(startDate);
+      if (endDate) query.createdAt.$lte = new Date(endDate);
+    }
 
-    // Fetch verifications
+    // Search by verificationId directly in Mongo
+    if (search && /^[A-Z]{3}\d+$/i.test(search)) {
+      query.verificationId = { $regex: search, $options: 'i' };
+    }
+
+    const sortOptions = {};
+    sortOptions[sortBy] = sortOrder === 'asc' ? 1 : -1;
+
+    const total = await verificationCollection.countDocuments(query);
     const verifications = await verificationCollection
       .find(query)
-      .sort({ createdAt: -1 })
+      .sort(sortOptions)
       .skip((parseInt(page) - 1) * parseInt(limit))
       .limit(parseInt(limit))
       .toArray();
 
-    console.log('📥 Fetched verifications:', verifications.length);
+    let transformed = await Promise.all(verifications.map(transformVerification));
 
-    // Transform verifications and populate provider details
-    const transformedVerifications = await Promise.all(
-      verifications.map(async (v) => {
-        // Extract documents
-        const documents = extractDocuments(v);
-        
-        // Get provider details
-        let providerDetails = null;
-        if (v.provider) {
-          providerDetails = await getProviderDetails(v.provider);
-        } else if (v.providerId) {
-          providerDetails = await getProviderDetails(v.providerId);
-        }
-        
-        const result = {
-          _id: v._id,
-          verificationId: v.verificationId || v._id.toString().slice(-8).toUpperCase(),
-          provider: providerDetails || {
-            _id: v.provider || v.providerId || 'unknown',
-            providerId: 'N/A',
-            name: v.providerName || 'Unknown Provider',
-            email: v.providerEmail || 'N/A',
-            phone: v.providerPhone || 'N/A',
-            profession: v.profession || 'N/A',
-            profileImage: null,
-          },
-          documents,
-          status: v.status || v.verificationStatus || 'pending',
-          reviewedBy: v.reviewedBy,
-          reviewedAt: v.reviewedAt,
-          rejectionReason: v.rejectionReason || v.reason || '',
-          notes: v.notes || v.adminNotes || '',
-          attempts: v.attempts || 1,
-          createdAt: v.createdAt || v.submittedAt || new Date().toISOString(),
-          updatedAt: v.updatedAt || new Date().toISOString(),
-        };
-        
-        return result;
-      })
-    );
-
-    // Calculate pagination
-    const totalPages = Math.ceil(total / parseInt(limit));
-
-    // Filter by search if provided
-    let filteredVerifications = transformedVerifications;
-    if (search) {
-      const searchLower = search.toLowerCase();
-      filteredVerifications = transformedVerifications.filter(v => 
-        v.provider?.name?.toLowerCase().includes(searchLower) ||
-        v.provider?.email?.toLowerCase().includes(searchLower) ||
-        v.provider?.phone?.includes(search) ||
-        v.verificationId?.toLowerCase().includes(searchLower)
+    // Secondary search filter (name, email, phone, providerId)
+    if (search && !/^[A-Z]{3}\d+$/i.test(search)) {
+      const s = search.toLowerCase();
+      transformed = transformed.filter(
+        (v) =>
+          v.provider?.name?.toLowerCase().includes(s) ||
+          v.provider?.email?.toLowerCase().includes(s) ||
+          v.provider?.phone?.includes(search) ||
+          v.provider?.providerId?.toLowerCase().includes(s) ||
+          v.verificationId?.toLowerCase().includes(s)
       );
     }
 
-    console.log('✅ Returning verifications:', filteredVerifications.length);
-    console.log('📄 First verification documents:', filteredVerifications[0]?.documents);
+    const totalPages = Math.ceil(total / parseInt(limit));
 
     res.json({
       success: true,
       data: {
-        verifications: filteredVerifications,
+        verifications: transformed,
         pagination: {
           page: parseInt(page),
           limit: parseInt(limit),
@@ -265,59 +299,34 @@ exports.getAllVerifications = async (req, res, next) => {
       },
     });
   } catch (error) {
-    console.error('❌ Error fetching verifications:', error);
     logger.error('Error fetching verifications:', error);
     next(error);
   }
 };
 
-// Get pending verifications
+// GET pending verifications
 exports.getPendingVerifications = async (req, res, next) => {
   try {
     const { page = 1, limit = 20 } = req.query;
-    
     const verificationCollection = getVerificationCollection();
 
-    const query = { 
-      status: { $in: ['pending', 'submitted', 'under_review'] } 
-    };
-    
+    const query = { status: { $in: ['pending', 'under_review'] } };
     const total = await verificationCollection.countDocuments(query);
-    
+
     const verifications = await verificationCollection
       .find(query)
-      .sort({ createdAt: -1 })
+      .sort({ submittedAt: -1, createdAt: -1 })
       .skip((parseInt(page) - 1) * parseInt(limit))
       .limit(parseInt(limit))
       .toArray();
 
-    const transformedVerifications = await Promise.all(
-      verifications.map(async (v) => {
-        const documents = extractDocuments(v);
-        
-        let providerDetails = null;
-        if (v.provider) {
-          providerDetails = await getProviderDetails(v.provider);
-        }
-        
-        return {
-          _id: v._id,
-          verificationId: v.verificationId || v._id.toString().slice(-8).toUpperCase(),
-          provider: providerDetails || { name: 'Unknown', email: 'N/A', phone: 'N/A' },
-          documents,
-          status: v.status || 'pending',
-          createdAt: v.createdAt || v.submittedAt,
-          updatedAt: v.updatedAt,
-        };
-      })
-    );
-
+    const transformed = await Promise.all(verifications.map(transformVerification));
     const totalPages = Math.ceil(total / parseInt(limit));
 
     res.json({
       success: true,
       data: {
-        verifications: transformedVerifications,
+        verifications: transformed,
         pagination: {
           page: parseInt(page),
           limit: parseInt(limit),
@@ -332,51 +341,63 @@ exports.getPendingVerifications = async (req, res, next) => {
   }
 };
 
-// Get verification by ID
+// GET verification by ID
 exports.getVerificationById = async (req, res, next) => {
   try {
     const { id } = req.params;
-    
     const verificationCollection = getVerificationCollection();
 
     let verification = null;
-    
     if (mongoose.Types.ObjectId.isValid(id)) {
-      verification = await verificationCollection.findOne({ 
-        _id: new mongoose.Types.ObjectId(id) 
+      verification = await verificationCollection.findOne({
+        _id: new mongoose.Types.ObjectId(id),
       });
     }
-
     if (!verification) {
-      throw ApiError.notFound('Verification not found');
+      verification = await verificationCollection.findOne({ verificationId: id });
     }
 
-    const documents = extractDocuments(verification);
-    
-    let providerDetails = null;
-    if (verification.provider) {
-      providerDetails = await getProviderDetails(verification.provider);
+    if (!verification) throw ApiError.notFound('Verification not found');
+
+    const transformed = await transformVerification(verification);
+
+    res.json({
+      success: true,
+      data: { verification: transformed },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET verifications by provider ID (all history for one provider)
+exports.getVerificationsByProvider = async (req, res, next) => {
+  try {
+    const { providerId } = req.params;
+    const verificationCollection = getVerificationCollection();
+
+    const query = {};
+    if (mongoose.Types.ObjectId.isValid(providerId)) {
+      query.provider = new mongoose.Types.ObjectId(providerId);
+    } else {
+      // Try provider's providerId field (e.g. PEL37) by resolving to _id
+      const providersCollection = getProviderCollection();
+      const p = await providersCollection.findOne({ providerId });
+      if (p) query.provider = p._id;
     }
 
-    const transformedVerification = {
-      _id: verification._id,
-      verificationId: verification.verificationId || verification._id.toString().slice(-8).toUpperCase(),
-      provider: providerDetails || { name: 'Unknown', email: 'N/A', phone: 'N/A' },
-      documents,
-      status: verification.status || 'pending',
-      reviewedBy: verification.reviewedBy,
-      reviewedAt: verification.reviewedAt,
-      rejectionReason: verification.rejectionReason || '',
-      notes: verification.notes || verification.adminNotes || '',
-      attempts: verification.attempts || 1,
-      createdAt: verification.createdAt || verification.submittedAt,
-      updatedAt: verification.updatedAt,
-    };
+    const verifications = await verificationCollection
+      .find(query)
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const transformed = await Promise.all(verifications.map(transformVerification));
 
     res.json({
       success: true,
       data: {
-        verification: transformedVerification,
+        verifications: transformed,
+        total: transformed.length,
       },
     });
   } catch (error) {
@@ -384,72 +405,175 @@ exports.getVerificationById = async (req, res, next) => {
   }
 };
 
-// Approve verification
+// Shared core: apply status change
+const applyStatusChange = async ({
+  verificationCollection,
+  providersCollection,
+  verification,
+  newStatus,
+  admin,
+  notes,
+  rejectionReason,
+}) => {
+  const now = new Date();
+  const adminId = admin?.adminId || admin?._id || admin?.id;
+  const adminEmail = admin?.email || 'unknown';
+  const adminName = admin?.name || adminEmail;
+
+  const historyEntry = {
+    status: newStatus,
+    changedBy: adminId ? new mongoose.Types.ObjectId(adminId) : null,
+    changedByName: adminName,
+    reason: rejectionReason || '',
+    notes: notes || '',
+    changedAt: now,
+  };
+
+  const verificationUpdate = {
+    status: newStatus,
+    reviewedBy: adminId ? new mongoose.Types.ObjectId(adminId) : null,
+    reviewedAt: now,
+    updatedAt: now,
+  };
+  if (notes !== undefined) verificationUpdate.notes = notes || '';
+  if (newStatus === 'rejected') {
+    verificationUpdate.rejectionReason = rejectionReason || 'No reason provided';
+  } else if (newStatus === 'approved') {
+    verificationUpdate.rejectionReason = '';
+  }
+
+  await verificationCollection.updateOne(
+    { _id: verification._id },
+    {
+      $set: verificationUpdate,
+      $push: { statusHistory: historyEntry },
+    }
+  );
+
+  // ================== Sync Provider ==================
+  if (verification.provider) {
+    const providerUpdate = { updatedAt: now };
+    const providerObjId = new mongoose.Types.ObjectId(verification.provider);
+
+    if (newStatus === 'approved') {
+      providerUpdate.verificationStatus = 'approved';
+      providerUpdate.isVerified = true;
+      providerUpdate.verifiedAt = now;
+      providerUpdate.verifiedBy = adminId ? String(adminId) : null;
+      providerUpdate.rejectionReason = '';
+
+      // Sync selfie as profile picture
+      const docs = extractDocuments(verification);
+      if (docs.selfie?.url) {
+        providerUpdate.profilePicture = docs.selfie.url;
+        providerUpdate.selfieImage = {
+          url: docs.selfie.url,
+          publicId: docs.selfie.publicId,
+          uploadedAt: docs.selfie.uploadedAt || now,
+        };
+      }
+    } else if (newStatus === 'rejected') {
+      providerUpdate.verificationStatus = 'rejected';
+      providerUpdate.isVerified = false;
+      providerUpdate.rejectedAt = now;
+      providerUpdate.rejectedBy = adminId ? String(adminId) : null;
+      providerUpdate.rejectionReason = rejectionReason || 'No reason provided';
+      providerUpdate.isAvailable = false;
+      providerUpdate.isAcceptingJobs = false;
+    } else if (newStatus === 'pending' || newStatus === 'under_review') {
+      providerUpdate.verificationStatus = 'pending';
+      providerUpdate.isVerified = false;
+    } else if (newStatus === 'resubmission_required') {
+      providerUpdate.verificationStatus = 'incomplete';
+      providerUpdate.isVerified = false;
+      providerUpdate.rejectionReason = rejectionReason || 'Please resubmit documents';
+    }
+
+    await providersCollection.updateOne({ _id: providerObjId }, { $set: providerUpdate });
+  }
+};
+
+// POST approve
 exports.approveVerification = async (req, res, next) => {
   try {
     const { id } = req.params;
     const { notes } = req.body;
 
-    console.log('✅ Approving verification:', id);
-
     const verificationCollection = getVerificationCollection();
     const providersCollection = getProviderCollection();
 
-    if (!mongoose.Types.ObjectId.isValid(id)) {
+    if (!mongoose.Types.ObjectId.isValid(id))
       throw ApiError.badRequest('Invalid verification ID');
-    }
 
-    const verification = await verificationCollection.findOne({ 
-      _id: new mongoose.Types.ObjectId(id) 
+    const verification = await verificationCollection.findOne({
+      _id: new mongoose.Types.ObjectId(id),
+    });
+    if (!verification) throw ApiError.notFound('Verification not found');
+    if (verification.status === 'approved')
+      throw ApiError.badRequest('Verification already approved');
+
+    await applyStatusChange({
+      verificationCollection,
+      providersCollection,
+      verification,
+      newStatus: 'approved',
+      admin: req.admin,
+      notes,
     });
 
-    if (!verification) {
-      throw ApiError.notFound('Verification not found');
-    }
+    // Fetch provider for FCM
+    const provider = verification.provider
+      ? await providersCollection.findOne({
+          _id: new mongoose.Types.ObjectId(verification.provider),
+        })
+      : null;
 
-    if (verification.status === 'approved') {
-      throw ApiError.badRequest('Verification already approved');
-    }
-
-    // Update verification
-    await verificationCollection.updateOne(
-      { _id: new mongoose.Types.ObjectId(id) },
-      {
-        $set: {
-          status: 'approved',
-          reviewedBy: req.admin.adminId,
-          reviewedAt: new Date(),
-          notes: notes || '',
-          updatedAt: new Date(),
-        }
-      }
-    );
-
-    // Update provider status
-    if (verification.provider) {
-      await providersCollection.updateOne(
-        { _id: new mongoose.Types.ObjectId(verification.provider) },
+    // FCM to provider
+    if (provider?.fcmToken) {
+      await sendProviderFCM(
+        provider.fcmToken,
+        '✅ Verification Approved',
+        'Congratulations! Your account has been verified. You can now start accepting jobs.',
         {
-          $set: {
-            verificationStatus: 'approved',
-            isVerified: true,
-            verifiedAt: new Date(),
-            verifiedBy: req.admin.adminId,
-          }
+          type: 'verification_approved',
+          verificationId: id,
+          status: 'approved',
         }
       );
     }
 
-    // Emit socket event
+    // Admin notification
+    await createAdminNotification({
+      title: 'Verification Approved',
+      message: `Provider ${provider?.name || 'Unknown'} (${provider?.providerId || ''}) has been approved.`,
+      type: 'verification_approved',
+      metadata: { verificationId: id, providerId: verification.provider },
+    });
+
+    // Audit log
+    await createAuditLog({
+      action: 'VERIFICATION_APPROVED',
+      adminId: req.admin?.adminId || req.admin?._id,
+      adminEmail: req.admin?.email,
+      targetId: id,
+      metadata: { notes },
+    });
+
+    // Socket emit
     const io = req.app.get('io');
     if (io) {
-      io.emit('verification-updated', {
+      io.emit('verification:updated', {
         verificationId: id,
         status: 'approved',
+        providerId: verification.provider,
+      });
+      io.to('admins').emit('verification:approved', {
+        verificationId: id,
+        providerId: verification.provider,
       });
     }
 
-    logger.info(`Verification approved: ${id} by ${req.admin.email}`);
+    logger.info(`Verification approved: ${id} by ${req.admin?.email}`);
 
     res.json({
       success: true,
@@ -468,77 +592,89 @@ exports.approveVerification = async (req, res, next) => {
   }
 };
 
-// Reject verification
+// POST reject
 exports.rejectVerification = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { rejectionReason } = req.body;
+    const { rejectionReason, notes } = req.body;
 
-    if (!rejectionReason) {
+    if (!rejectionReason || !rejectionReason.trim())
       throw ApiError.badRequest('Rejection reason is required');
-    }
-
-    console.log('❌ Rejecting verification:', id);
 
     const verificationCollection = getVerificationCollection();
     const providersCollection = getProviderCollection();
 
-    if (!mongoose.Types.ObjectId.isValid(id)) {
+    if (!mongoose.Types.ObjectId.isValid(id))
       throw ApiError.badRequest('Invalid verification ID');
-    }
 
-    const verification = await verificationCollection.findOne({ 
-      _id: new mongoose.Types.ObjectId(id) 
+    const verification = await verificationCollection.findOne({
+      _id: new mongoose.Types.ObjectId(id),
+    });
+    if (!verification) throw ApiError.notFound('Verification not found');
+    if (verification.status === 'rejected')
+      throw ApiError.badRequest('Verification already rejected');
+
+    await applyStatusChange({
+      verificationCollection,
+      providersCollection,
+      verification,
+      newStatus: 'rejected',
+      admin: req.admin,
+      notes,
+      rejectionReason,
     });
 
-    if (!verification) {
-      throw ApiError.notFound('Verification not found');
-    }
+    const provider = verification.provider
+      ? await providersCollection.findOne({
+          _id: new mongoose.Types.ObjectId(verification.provider),
+        })
+      : null;
 
-    if (verification.status === 'rejected') {
-      throw ApiError.badRequest('Verification already rejected');
-    }
-
-    // Update verification
-    await verificationCollection.updateOne(
-      { _id: new mongoose.Types.ObjectId(id) },
-      {
-        $set: {
-          status: 'rejected',
-          reviewedBy: req.admin.adminId,
-          reviewedAt: new Date(),
-          rejectionReason: rejectionReason,
-          updatedAt: new Date(),
-        }
-      }
-    );
-
-    // Update provider status
-    if (verification.provider) {
-      await providersCollection.updateOne(
-        { _id: new mongoose.Types.ObjectId(verification.provider) },
+    if (provider?.fcmToken) {
+      await sendProviderFCM(
+        provider.fcmToken,
+        '❌ Verification Rejected',
+        `Your verification was rejected. Reason: ${rejectionReason}`,
         {
-          $set: {
-            verificationStatus: 'rejected',
-            isVerified: false,
-            rejectedAt: new Date(),
-            rejectedBy: req.admin.adminId,
-            rejectionReason: rejectionReason,
-          }
+          type: 'verification_rejected',
+          verificationId: id,
+          status: 'rejected',
+          rejectionReason,
         }
       );
     }
 
-    // Emit socket event
+    await createAdminNotification({
+      title: 'Verification Rejected',
+      message: `Provider ${provider?.name || 'Unknown'} (${provider?.providerId || ''}) rejected. Reason: ${rejectionReason}`,
+      type: 'verification_rejected',
+      metadata: { verificationId: id, providerId: verification.provider, rejectionReason },
+    });
+
+    await createAuditLog({
+      action: 'VERIFICATION_REJECTED',
+      adminId: req.admin?.adminId || req.admin?._id,
+      adminEmail: req.admin?.email,
+      targetId: id,
+      metadata: { rejectionReason, notes },
+    });
+
     const io = req.app.get('io');
     if (io) {
-      io.emit('verification-updated', {
+      io.emit('verification:updated', {
         verificationId: id,
         status: 'rejected',
+        providerId: verification.provider,
+        rejectionReason,
+      });
+      io.to('admins').emit('verification:rejected', {
+        verificationId: id,
+        providerId: verification.provider,
+        rejectionReason,
       });
     }
 
-    logger.info(`Verification rejected: ${id} by ${req.admin.email}`);
+    logger.info(`Verification rejected: ${id} by ${req.admin?.email}`);
 
     res.json({
       success: true,
@@ -558,27 +694,316 @@ exports.rejectVerification = async (req, res, next) => {
   }
 };
 
-// Get verification stats
+// POST request resubmission
+exports.requestResubmission = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { reason, notes } = req.body;
+
+    if (!reason) throw ApiError.badRequest('Reason is required');
+
+    const verificationCollection = getVerificationCollection();
+    const providersCollection = getProviderCollection();
+
+    if (!mongoose.Types.ObjectId.isValid(id))
+      throw ApiError.badRequest('Invalid verification ID');
+
+    const verification = await verificationCollection.findOne({
+      _id: new mongoose.Types.ObjectId(id),
+    });
+    if (!verification) throw ApiError.notFound('Verification not found');
+
+    await applyStatusChange({
+      verificationCollection,
+      providersCollection,
+      verification,
+      newStatus: 'resubmission_required',
+      admin: req.admin,
+      notes,
+      rejectionReason: reason,
+    });
+
+    const provider = verification.provider
+      ? await providersCollection.findOne({
+          _id: new mongoose.Types.ObjectId(verification.provider),
+        })
+      : null;
+
+    if (provider?.fcmToken) {
+      await sendProviderFCM(
+        provider.fcmToken,
+        '📝 Resubmission Required',
+        `Please resubmit your documents. ${reason}`,
+        {
+          type: 'verification_resubmission',
+          verificationId: id,
+          reason,
+        }
+      );
+    }
+
+    await createAuditLog({
+      action: 'VERIFICATION_RESUBMISSION_REQUESTED',
+      adminId: req.admin?.adminId || req.admin?._id,
+      adminEmail: req.admin?.email,
+      targetId: id,
+      metadata: { reason, notes },
+    });
+
+    const io = req.app.get('io');
+    if (io) {
+      io.emit('verification:updated', {
+        verificationId: id,
+        status: 'resubmission_required',
+        providerId: verification.provider,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Resubmission requested successfully',
+      data: { _id: id, status: 'resubmission_required' },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// POST mark as under review
+exports.markUnderReview = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const verificationCollection = getVerificationCollection();
+    const providersCollection = getProviderCollection();
+
+    if (!mongoose.Types.ObjectId.isValid(id))
+      throw ApiError.badRequest('Invalid verification ID');
+
+    const verification = await verificationCollection.findOne({
+      _id: new mongoose.Types.ObjectId(id),
+    });
+    if (!verification) throw ApiError.notFound('Verification not found');
+
+    await applyStatusChange({
+      verificationCollection,
+      providersCollection,
+      verification,
+      newStatus: 'under_review',
+      admin: req.admin,
+    });
+
+    const io = req.app.get('io');
+    if (io) {
+      io.emit('verification:updated', {
+        verificationId: id,
+        status: 'under_review',
+        providerId: verification.provider,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Verification marked as under review',
+      data: { _id: id, status: 'under_review' },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// POST bulk approve
+exports.bulkApprove = async (req, res, next) => {
+  try {
+    const { verificationIds, notes } = req.body;
+    if (!Array.isArray(verificationIds) || verificationIds.length === 0) {
+      throw ApiError.badRequest('verificationIds array is required');
+    }
+
+    const verificationCollection = getVerificationCollection();
+    const providersCollection = getProviderCollection();
+
+    const results = { approved: [], failed: [] };
+
+    for (const id of verificationIds) {
+      try {
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+          results.failed.push({ id, error: 'Invalid ID' });
+          continue;
+        }
+        const verification = await verificationCollection.findOne({
+          _id: new mongoose.Types.ObjectId(id),
+        });
+        if (!verification) {
+          results.failed.push({ id, error: 'Not found' });
+          continue;
+        }
+        if (verification.status === 'approved') {
+          results.failed.push({ id, error: 'Already approved' });
+          continue;
+        }
+        await applyStatusChange({
+          verificationCollection,
+          providersCollection,
+          verification,
+          newStatus: 'approved',
+          admin: req.admin,
+          notes,
+        });
+
+        // FCM
+        if (verification.provider) {
+          const provider = await providersCollection.findOne({
+            _id: new mongoose.Types.ObjectId(verification.provider),
+          });
+          if (provider?.fcmToken) {
+            await sendProviderFCM(
+              provider.fcmToken,
+              '✅ Verification Approved',
+              'Your account has been verified.',
+              { type: 'verification_approved', verificationId: id }
+            );
+          }
+        }
+        results.approved.push(id);
+      } catch (err) {
+        results.failed.push({ id, error: err.message });
+      }
+    }
+
+    await createAuditLog({
+      action: 'VERIFICATION_BULK_APPROVED',
+      adminId: req.admin?.adminId || req.admin?._id,
+      adminEmail: req.admin?.email,
+      targetId: 'bulk',
+      metadata: { count: results.approved.length, failed: results.failed.length },
+    });
+
+    const io = req.app.get('io');
+    if (io) io.emit('verification:bulk_updated', { approved: results.approved });
+
+    res.json({
+      success: true,
+      message: `${results.approved.length} verifications approved, ${results.failed.length} failed`,
+      data: results,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// POST bulk reject
+exports.bulkReject = async (req, res, next) => {
+  try {
+    const { verificationIds, rejectionReason } = req.body;
+    if (!Array.isArray(verificationIds) || verificationIds.length === 0) {
+      throw ApiError.badRequest('verificationIds array is required');
+    }
+    if (!rejectionReason) throw ApiError.badRequest('Rejection reason required');
+
+    const verificationCollection = getVerificationCollection();
+    const providersCollection = getProviderCollection();
+
+    const results = { rejected: [], failed: [] };
+
+    for (const id of verificationIds) {
+      try {
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+          results.failed.push({ id, error: 'Invalid ID' });
+          continue;
+        }
+        const verification = await verificationCollection.findOne({
+          _id: new mongoose.Types.ObjectId(id),
+        });
+        if (!verification) {
+          results.failed.push({ id, error: 'Not found' });
+          continue;
+        }
+        if (verification.status === 'rejected') {
+          results.failed.push({ id, error: 'Already rejected' });
+          continue;
+        }
+        await applyStatusChange({
+          verificationCollection,
+          providersCollection,
+          verification,
+          newStatus: 'rejected',
+          admin: req.admin,
+          rejectionReason,
+        });
+
+        if (verification.provider) {
+          const provider = await providersCollection.findOne({
+            _id: new mongoose.Types.ObjectId(verification.provider),
+          });
+          if (provider?.fcmToken) {
+            await sendProviderFCM(
+              provider.fcmToken,
+              '❌ Verification Rejected',
+              `Your verification was rejected. Reason: ${rejectionReason}`,
+              { type: 'verification_rejected', verificationId: id, rejectionReason }
+            );
+          }
+        }
+        results.rejected.push(id);
+      } catch (err) {
+        results.failed.push({ id, error: err.message });
+      }
+    }
+
+    await createAuditLog({
+      action: 'VERIFICATION_BULK_REJECTED',
+      adminId: req.admin?.adminId || req.admin?._id,
+      adminEmail: req.admin?.email,
+      targetId: 'bulk',
+      metadata: { count: results.rejected.length, failed: results.failed.length, rejectionReason },
+    });
+
+    const io = req.app.get('io');
+    if (io) io.emit('verification:bulk_updated', { rejected: results.rejected });
+
+    res.json({
+      success: true,
+      message: `${results.rejected.length} verifications rejected, ${results.failed.length} failed`,
+      data: results,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET stats
 exports.getVerificationStats = async (req, res, next) => {
   try {
     const verificationCollection = getVerificationCollection();
-    
-    const [pending, approved, rejected, total] = await Promise.all([
-      verificationCollection.countDocuments({ status: { $in: ['pending', 'submitted', 'under_review'] } }),
-      verificationCollection.countDocuments({ status: 'approved' }),
-      verificationCollection.countDocuments({ status: 'rejected' }),
-      verificationCollection.countDocuments(),
-    ]);
 
-    console.log('📊 Verification stats from provider_verifications:', { pending, approved, rejected, total });
+    const [pending, underReview, approved, rejected, resubmission, total, todayCount, weekCount] =
+      await Promise.all([
+        verificationCollection.countDocuments({ status: 'pending' }),
+        verificationCollection.countDocuments({ status: 'under_review' }),
+        verificationCollection.countDocuments({ status: 'approved' }),
+        verificationCollection.countDocuments({ status: 'rejected' }),
+        verificationCollection.countDocuments({ status: 'resubmission_required' }),
+        verificationCollection.countDocuments({}),
+        verificationCollection.countDocuments({
+          createdAt: { $gte: new Date(new Date().setHours(0, 0, 0, 0)) },
+        }),
+        verificationCollection.countDocuments({
+          createdAt: { $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+        }),
+      ]);
 
     res.json({
       success: true,
       data: {
         pending,
+        underReview,
         approved,
         rejected,
+        resubmission,
         total,
+        todayCount,
+        weekCount,
+        pendingTotal: pending + underReview,
       },
     });
   } catch (error) {
@@ -586,53 +1011,61 @@ exports.getVerificationStats = async (req, res, next) => {
   }
 };
 
-// Debug endpoint - View raw data
+// DELETE verification (admin only)
+exports.deleteVerification = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const verificationCollection = getVerificationCollection();
+
+    if (!mongoose.Types.ObjectId.isValid(id))
+      throw ApiError.badRequest('Invalid verification ID');
+
+    const result = await verificationCollection.deleteOne({
+      _id: new mongoose.Types.ObjectId(id),
+    });
+
+    if (result.deletedCount === 0) throw ApiError.notFound('Verification not found');
+
+    await createAuditLog({
+      action: 'VERIFICATION_DELETED',
+      adminId: req.admin?.adminId || req.admin?._id,
+      adminEmail: req.admin?.email,
+      targetId: id,
+      metadata: {},
+    });
+
+    const io = req.app.get('io');
+    if (io) io.emit('verification:deleted', { verificationId: id });
+
+    res.json({
+      success: true,
+      message: 'Verification deleted successfully',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// DEBUG endpoint
 exports.debugVerifications = async (req, res, next) => {
   try {
     const providerConn = getProviderConnection();
-    
-    // List all collections
     const collections = await providerConn.db.listCollections().toArray();
-    console.log('\n📦 Collections:', collections.map(c => c.name));
-    
-    // Get raw data from provider_verifications
     const pvCollection = providerConn.db.collection('provider_verifications');
     const pvData = await pvCollection.find({}).limit(5).toArray();
-    console.log('\n📄 provider_verifications sample:', JSON.stringify(pvData[0], null, 2));
-    
-    // Test document extraction
-    if (pvData.length > 0) {
-      const extractedDocs = extractDocuments(pvData[0]);
-      console.log('✅ Extracted documents:', extractedDocs);
-    }
-    
-    // Get providers sample
-    const pCollection = providerConn.db.collection('providers');
-    const pData = await pCollection.find({}).limit(3).toArray();
-    
+
     res.json({
       success: true,
       data: {
-        collections: collections.map(c => c.name),
+        collections: collections.map((c) => c.name),
         provider_verifications: {
           count: await pvCollection.countDocuments(),
           sample: pvData,
           extractedDocuments: pvData.length > 0 ? extractDocuments(pvData[0]) : null,
         },
-        providers: {
-          count: await pCollection.countDocuments(),
-          sample: pData.map(p => ({
-            _id: p._id,
-            name: p.name,
-            email: p.email,
-            phone: p.phone,
-            verificationStatus: p.verificationStatus,
-          })),
-        },
       },
     });
   } catch (error) {
-    console.error('Debug error:', error);
     next(error);
   }
 };
