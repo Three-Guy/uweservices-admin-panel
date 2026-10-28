@@ -1,6 +1,19 @@
 // src/controllers/banner.controller.js
 const { getBannerModel } = require('../config/database');
-const { deleteImage, extractPublicId } = require('../config/cloudinary');
+const { deleteImage, extractPublicId, isVideoMime, isVideoUrl } = require('../config/cloudinary');
+
+/**
+ * Determine media type from file or URL
+ */
+const detectMediaType = (file, url) => {
+  if (file && file.mimetype) {
+    return isVideoMime(file.mimetype) ? 'video' : 'image';
+  }
+  if (url && isVideoUrl(url)) {
+    return 'video';
+  }
+  return 'image';
+};
 
 /**
  * Get all banners with pagination and filters
@@ -15,6 +28,7 @@ exports.getBanners = async (req, res) => {
       search = '',
       isActive,
       position,
+      mediaType,
       sortBy = 'display.sortOrder',
       sortOrder = 'asc',
     } = req.query;
@@ -35,6 +49,10 @@ exports.getBanners = async (req, res) => {
 
     if (position) {
       query['display.position'] = position;
+    }
+
+    if (mediaType) {
+      query.mediaType = mediaType;
     }
 
     // Build sort
@@ -114,11 +132,12 @@ exports.createBanner = async (req, res) => {
 
     console.log('📤 Creating banner...');
     console.log('📦 Request body:', req.body);
-    console.log('📎 File:', req.file ? req.file.filename : 'No file');
+    console.log('📎 File:', req.file ? `${req.file.filename} (${req.file.mimetype})` : 'No file');
 
     const {
       title,
       description,
+      mediaType: mediaTypeInput,
       // Flat form fields for action
       actionType,
       actionTarget,
@@ -160,7 +179,8 @@ exports.createBanner = async (req, res) => {
     // Validate required fields
     if (!title) {
       if (req.file?.filename) {
-        await deleteImage(req.file.filename).catch(console.error);
+        const rt = req.file.mimetype && isVideoMime(req.file.mimetype) ? 'video' : 'image';
+        await deleteImage(req.file.filename, rt).catch(console.error);
       }
       return res.status(400).json({
         success: false,
@@ -171,9 +191,16 @@ exports.createBanner = async (req, res) => {
     if (!req.file) {
       return res.status(400).json({
         success: false,
-        message: 'Banner image is required',
+        message: 'Banner image or video is required',
       });
     }
+
+    // Detect media type
+    const detectedMediaType = detectMediaType(req.file);
+    const finalMediaType = mediaTypeInput || detectedMediaType;
+    const isVideo = finalMediaType === 'video';
+
+    console.log(`🎬 Media type: ${finalMediaType} (detected: ${detectedMediaType})`);
 
     // Auto-generate bannerId
     const timestamp = Date.now().toString(36);
@@ -200,7 +227,7 @@ exports.createBanner = async (req, res) => {
     // Priority: Use flat fields if provided, otherwise use parsed JSON
     parsedAction = {
       type: actionType || parsedAction.type || 'none',
-      target: actionTarget || parsedAction.target || '', // ✅ This was missing!
+      target: actionTarget || parsedAction.target || '',
       serviceRef: serviceRef || parsedAction.serviceRef || null,
       categoryRef: categoryRef || parsedAction.categoryRef || null,
       promoCode: promoCode || parsedAction.promoCode || '',
@@ -294,12 +321,16 @@ exports.createBanner = async (req, res) => {
       bannerId,
       title,
       description: description || '',
+      mediaType: finalMediaType,
       image: {
         url: req.file.path,
         publicId: req.file.filename,
         altText: title,
+        resourceType: isVideo ? 'video' : 'image',
+        mimeType: req.file.mimetype || null,
+        size: req.file.size || null,
       },
-      action: parsedAction, // ✅ Now includes target field
+      action: parsedAction,
       animation: parsedAnimation,
       schedule: parsedSchedule,
       targeting: parsedTargeting,
@@ -311,20 +342,22 @@ exports.createBanner = async (req, res) => {
     await banner.save();
 
     console.log('✅ Banner created:', banner.bannerId);
-    console.log('📋 Action saved:', banner.action); // Debug log
+    console.log('🎬 Media type:', banner.mediaType);
+    console.log('📋 Action saved:', banner.action);
 
     res.status(201).json({
       success: true,
-      message: 'Banner created successfully',
+      message: `Banner created successfully with ${finalMediaType}`,
       data: banner,
     });
 
   } catch (error) {
     console.error('Error creating banner:', error);
 
-    // Delete uploaded image if banner creation fails
+    // Delete uploaded file if banner creation fails
     if (req.file?.filename) {
-      await deleteImage(req.file.filename).catch(console.error);
+      const rt = req.file.mimetype && isVideoMime(req.file.mimetype) ? 'video' : 'image';
+      await deleteImage(req.file.filename, rt).catch(console.error);
     }
 
     res.status(500).json({
@@ -345,13 +378,14 @@ exports.updateBanner = async (req, res) => {
 
     console.log('📤 Updating banner:', id);
     console.log('📦 Request body:', req.body);
-    console.log('📎 File:', req.file ? req.file.filename : 'No file');
+    console.log('📎 File:', req.file ? `${req.file.filename} (${req.file.mimetype})` : 'No file');
 
     const banner = await Banner.findById(id);
 
     if (!banner) {
       if (req.file?.filename) {
-        await deleteImage(req.file.filename).catch(console.error);
+        const rt = req.file.mimetype && isVideoMime(req.file.mimetype) ? 'video' : 'image';
+        await deleteImage(req.file.filename, rt).catch(console.error);
       }
       return res.status(404).json({
         success: false,
@@ -362,6 +396,7 @@ exports.updateBanner = async (req, res) => {
     const {
       title,
       description,
+      mediaType: mediaTypeInput,
       // Flat form fields for action
       actionType,
       actionTarget,
@@ -412,7 +447,7 @@ exports.updateBanner = async (req, res) => {
 
     // Update with flat fields if provided
     if (actionType !== undefined) parsedAction.type = actionType;
-    if (actionTarget !== undefined) parsedAction.target = actionTarget; // ✅ This was missing!
+    if (actionTarget !== undefined) parsedAction.target = actionTarget;
     if (serviceRef !== undefined) parsedAction.serviceRef = serviceRef;
     if (categoryRef !== undefined) parsedAction.categoryRef = categoryRef;
     if (promoCode !== undefined) parsedAction.promoCode = promoCode;
@@ -487,7 +522,7 @@ exports.updateBanner = async (req, res) => {
     if (position !== undefined) parsedDisplay.position = position;
     if (sortOrder !== undefined) parsedDisplay.sortOrder = parseInt(sortOrder);
     if (backgroundColor !== undefined) parsedDisplay.backgroundColor = backgroundColor;
-    
+
     if (!parsedDisplay.overlay) parsedDisplay.overlay = {};
     if (overlayEnabled !== undefined) parsedDisplay.overlay.enabled = overlayEnabled === 'true' || overlayEnabled === true;
     if (overlayTitle !== undefined) parsedDisplay.overlay.title = overlayTitle;
@@ -495,14 +530,30 @@ exports.updateBanner = async (req, res) => {
     if (overlayButtonText !== undefined) parsedDisplay.overlay.buttonText = overlayButtonText;
     if (overlayTextColor !== undefined) parsedDisplay.overlay.textColor = overlayTextColor;
 
-    // Handle image update
+    // Handle media file update
     if (req.file) {
-      // Delete old image
-      if (banner.image.publicId) {
-        await deleteImage(banner.image.publicId).catch(console.error);
+      const detectedMediaType = detectMediaType(req.file);
+      const finalMediaType = mediaTypeInput || detectedMediaType;
+      const isVideo = finalMediaType === 'video';
+
+      console.log(`🎬 New media type: ${finalMediaType}`);
+
+      // Delete old media (use its stored resourceType or fallback to mediaType)
+      if (banner.image?.publicId) {
+        const oldResourceType = banner.image.resourceType ||
+          (banner.mediaType === 'video' ? 'video' : 'image');
+        await deleteImage(banner.image.publicId, oldResourceType).catch(console.error);
       }
+
+      banner.mediaType = finalMediaType;
       banner.image.url = req.file.path;
       banner.image.publicId = req.file.filename;
+      banner.image.resourceType = isVideo ? 'video' : 'image';
+      banner.image.mimeType = req.file.mimetype || null;
+      banner.image.size = req.file.size || null;
+    } else if (mediaTypeInput && !req.file) {
+      // Allow updating mediaType without a new file (edge case)
+      banner.mediaType = mediaTypeInput;
     }
 
     // Update fields
@@ -511,20 +562,21 @@ exports.updateBanner = async (req, res) => {
       banner.image.altText = title;
     }
     if (description !== undefined) banner.description = description;
-    
-    banner.action = parsedAction; // ✅ Now includes target field
+
+    banner.action = parsedAction;
     banner.animation = parsedAnimation;
     banner.schedule = parsedSchedule;
     banner.targeting = parsedTargeting;
     banner.display = parsedDisplay;
-    
+
     if (isActive !== undefined) banner.isActive = isActive === 'true' || isActive === true;
     banner.updatedBy = req.user?._id || req.admin?._id;
 
     await banner.save();
 
     console.log('✅ Banner updated:', banner.bannerId);
-    console.log('📋 Action saved:', banner.action); // Debug log
+    console.log('🎬 Media type:', banner.mediaType);
+    console.log('📋 Action saved:', banner.action);
 
     res.json({
       success: true,
@@ -535,9 +587,10 @@ exports.updateBanner = async (req, res) => {
   } catch (error) {
     console.error('Error updating banner:', error);
 
-    // Delete uploaded image if update fails
+    // Delete uploaded file if update fails
     if (req.file?.filename) {
-      await deleteImage(req.file.filename).catch(console.error);
+      const rt = req.file.mimetype && isVideoMime(req.file.mimetype) ? 'video' : 'image';
+      await deleteImage(req.file.filename, rt).catch(console.error);
     }
 
     res.status(500).json({
@@ -565,14 +618,17 @@ exports.deleteBanner = async (req, res) => {
       });
     }
 
-    // Delete image from Cloudinary
-    if (banner.image.publicId) {
-      await deleteImage(banner.image.publicId).catch(console.error);
+    // Delete main media from Cloudinary (use correct resource_type)
+    if (banner.image?.publicId) {
+      const resourceType = banner.image.resourceType ||
+        (banner.mediaType === 'video' ? 'video' : 'image');
+      await deleteImage(banner.image.publicId, resourceType).catch(console.error);
     }
 
     // Delete mobile image if exists
     if (banner.mobileImage?.publicId) {
-      await deleteImage(banner.mobileImage.publicId).catch(console.error);
+      const mobileResourceType = banner.mobileImage.resourceType || 'image';
+      await deleteImage(banner.mobileImage.publicId, mobileResourceType).catch(console.error);
     }
 
     await banner.deleteOne();
@@ -649,11 +705,15 @@ exports.getBannerStats = async (req, res) => {
       totalBanners,
       activeBanners,
       scheduledBanners,
+      videoBanners,
+      imageBanners,
       positionStats,
     ] = await Promise.all([
       Banner.countDocuments(),
       Banner.countDocuments({ isActive: true }),
       Banner.countDocuments({ 'schedule.isScheduled': true }),
+      Banner.countDocuments({ mediaType: 'video' }),
+      Banner.countDocuments({ $or: [{ mediaType: 'image' }, { mediaType: { $exists: false } }] }),
       Banner.aggregate([
         {
           $group: {
@@ -684,7 +744,13 @@ exports.getBannerStats = async (req, res) => {
         inactiveBanners: totalBanners - activeBanners,
         scheduledBanners,
         expiredBanners,
+        videoBanners,
+        imageBanners,
         positionDistribution,
+        mediaDistribution: {
+          image: imageBanners,
+          video: videoBanners,
+        },
       },
     });
 

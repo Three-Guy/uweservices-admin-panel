@@ -4,7 +4,7 @@ const mongoose = require('mongoose');
 /**
  * Banner Schema
  * Promotional banners for homepage carousel
- * Supports scheduling and targeting
+ * Supports scheduling, targeting, and image/video media
  */
 const bannerSchema = new mongoose.Schema({
   // Unique identifier
@@ -32,14 +32,37 @@ const bannerSchema = new mongoose.Schema({
     default: '',
   },
 
-  // Banner image
+  // Media type: image or video
+  mediaType: {
+    type: String,
+    enum: ['image', 'video'],
+    default: 'image',
+  },
+
+  // Banner media (image or video)
   image: {
     url: {
       type: String,
-      required: [true, 'Banner image URL is required'],
+      required: [true, 'Banner media URL is required'],
     },
     publicId: {
       type: String,
+      default: null,
+    },
+    // Cloudinary resource_type: 'image' or 'video'
+    resourceType: {
+      type: String,
+      enum: ['image', 'video'],
+      default: 'image',
+    },
+    // Mime type of the uploaded file
+    mimeType: {
+      type: String,
+      default: null,
+    },
+    // File size in bytes
+    size: {
+      type: Number,
       default: null,
     },
     // Image for dark mode
@@ -58,6 +81,7 @@ const bannerSchema = new mongoose.Schema({
   mobileImage: {
     url: { type: String, default: null },
     publicId: { type: String, default: null },
+    resourceType: { type: String, enum: ['image', 'video'], default: 'image' },
   },
 
   // Click action
@@ -227,6 +251,7 @@ const bannerSchema = new mongoose.Schema({
 // Indexes
 bannerSchema.index({ bannerId: 1 }, { unique: true });
 bannerSchema.index({ isActive: 1 });
+bannerSchema.index({ mediaType: 1 });
 bannerSchema.index({ 'display.sortOrder': 1 });
 bannerSchema.index({ 'display.position': 1 });
 bannerSchema.index({ 'schedule.startDate': 1, 'schedule.endDate': 1 });
@@ -235,15 +260,20 @@ bannerSchema.index({ 'targeting.cities': 1 });
 // Virtual: Check if banner is currently scheduled to show
 bannerSchema.virtual('isScheduledToShow').get(function() {
   if (!this.schedule.isScheduled) return true;
-  
+
   const now = new Date();
   const start = this.schedule.startDate;
   const end = this.schedule.endDate;
-  
+
   if (start && now < start) return false;
   if (end && now > end) return false;
-  
+
   return true;
+});
+
+// Virtual: Is this a video banner?
+bannerSchema.virtual('isVideo').get(function() {
+  return this.mediaType === 'video';
 });
 
 // Pre-save middleware
@@ -259,6 +289,11 @@ bannerSchema.pre('save', function(next) {
     this.bannerId = `${titleSlug}-${timestamp}`;
   }
 
+  // Auto-sync image.resourceType with mediaType if missing
+  if (this.image && !this.image.resourceType) {
+    this.image.resourceType = this.mediaType === 'video' ? 'video' : 'image';
+  }
+
   // Calculate CTR
   if (this.analytics.impressions > 0) {
     this.analytics.ctr = (this.analytics.clicks / this.analytics.impressions) * 100;
@@ -269,7 +304,7 @@ bannerSchema.pre('save', function(next) {
 
 // Static: Get active banners for display
 bannerSchema.statics.getActiveBanners = async function(options = {}) {
-  const { position = 'hero', cityId = null, limit = 10 } = options;
+  const { position = 'hero', cityId = null, limit = 10, mediaType = null } = options;
   const now = new Date();
 
   const query = {
@@ -287,6 +322,10 @@ bannerSchema.statics.getActiveBanners = async function(options = {}) {
       },
     ],
   };
+
+  if (mediaType) {
+    query.mediaType = mediaType;
+  }
 
   if (cityId) {
     query.$or.push(
