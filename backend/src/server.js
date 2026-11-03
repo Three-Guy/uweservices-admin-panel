@@ -30,6 +30,13 @@ try {
 const connectDB = require('./config/database');
 const logger = require('./utils/logger');
 
+// ✅ FORCE-LOAD EMAIL SERVICE — prints provider banner at startup
+try {
+  require('./utils/emailService');
+} catch (e) {
+  console.error('⚠️  Could not pre-load emailService:', e.message);
+}
+
 const app = express();
 const server = http.createServer(app);
 
