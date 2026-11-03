@@ -26,6 +26,10 @@ exports.createNotification = async (req, res, next) => {
     const {
       title,
       body,
+      subject,              // NEW
+      emailHtml,            // NEW
+      emailTemplate,        // NEW
+      emailBlock,           // NEW
       type = 'push',
       priority = 'normal',
       targetAudience = 'all',
@@ -60,6 +64,10 @@ exports.createNotification = async (req, res, next) => {
     const notification = new Notification({
       title,
       body,
+      subject: subject || null,
+      emailHtml: emailHtml || null,
+      emailTemplate: emailTemplate || null,
+      emailBlock: emailBlock || null,
       type,
       priority,
       targetAudience,
@@ -79,6 +87,7 @@ exports.createNotification = async (req, res, next) => {
 
     logger.info(`Notification created: ${notification._id} by admin: ${adminId}`);
     console.log('✅ Notification created:', notification._id);
+    console.log('   Has custom HTML:', !!emailHtml);
 
     res.status(201).json({
       success: true,
@@ -123,6 +132,7 @@ exports.getAllNotifications = async (req, res, next) => {
       query.$or = [
         { title: { $regex: search, $options: 'i' } },
         { body: { $regex: search, $options: 'i' } },
+        { subject: { $regex: search, $options: 'i' } },
         { tags: { $in: [new RegExp(search, 'i')] } }
       ];
     }
@@ -231,7 +241,8 @@ exports.updateNotification = async (req, res, next) => {
     }
 
     const allowedUpdates = [
-      'title', 'body', 'type', 'priority', 'targetAudience',
+      'title', 'body', 'subject', 'emailHtml', 'emailTemplate', 'emailBlock',
+      'type', 'priority', 'targetAudience',
       'targetIds', 'targetCities', 'targetZones', 'scheduledAt',
       'actionUrl', 'imageUrl', 'tags', 'data'
     ];
@@ -357,6 +368,8 @@ exports.sendNotification = async (req, res, next) => {
     
     if (notification.type === 'email' || notification.type === 'all') {
       console.log('\n📧 ===== SENDING EMAIL NOTIFICATIONS =====');
+      console.log('   Has custom HTML:', !!notification.emailHtml);
+      console.log('   Subject:', notification.subject || notification.title);
       
       const { sendBulkEmails } = require('../utils/emailService');
       
@@ -369,7 +382,7 @@ exports.sendNotification = async (req, res, next) => {
         // Prepare email data for each recipient
         const emailRecipients = targetEmails.map(({ email, name }) => ({
           to: email,
-          subject: notification.title,
+          subject: notification.subject || notification.title,
           title: notification.title,
           body: notification.body,
           recipientName: name,
@@ -377,6 +390,7 @@ exports.sendNotification = async (req, res, next) => {
           actionText: notification.actionUrl ? 'View Details' : null,
           imageUrl: notification.imageUrl || null,
           priority: notification.priority,
+          customHtml: notification.emailHtml || null, // ⭐ Custom HTML from builder
         }));
 
         // Send emails in batches to avoid overwhelming the email service
@@ -409,6 +423,7 @@ exports.sendNotification = async (req, res, next) => {
           notificationId: notification._id,
           totalSent: totalEmailsSent,
           totalFailed: totalEmailsFailed,
+          mode: notification.emailHtml ? 'custom-html' : 'default-template',
         });
       } else {
         console.warn('⚠️ No email addresses found for target audience');
@@ -422,6 +437,9 @@ exports.sendNotification = async (req, res, next) => {
       notificationId: notification._id.toString(),
       title: notification.title,
       body: notification.body,
+      subject: notification.subject,
+      emailHtml: notification.emailHtml,
+      emailTemplate: notification.emailTemplate,
       type: notification.type,
       priority: notification.priority,
       targetAudience: notification.targetAudience,
@@ -525,6 +543,10 @@ exports.sendNotificationNow = async (req, res, next) => {
     const {
       title,
       body,
+      subject,              // NEW
+      emailHtml,            // NEW
+      emailTemplate,        // NEW
+      emailBlock,           // NEW
       type = 'push',
       priority = 'normal',
       targetAudience = 'all',
@@ -553,6 +575,10 @@ exports.sendNotificationNow = async (req, res, next) => {
     const notification = new Notification({
       title,
       body,
+      subject: subject || null,
+      emailHtml: emailHtml || null,
+      emailTemplate: emailTemplate || null,
+      emailBlock: emailBlock || null,
       type,
       priority,
       targetAudience,
@@ -571,6 +597,10 @@ exports.sendNotificationNow = async (req, res, next) => {
 
     await notification.save();
 
+    console.log('   Has custom HTML:', !!emailHtml);
+    console.log('   Subject:', subject || title);
+    console.log('   Template:', emailTemplate || 'none');
+
     // Get target count
     let totalTargets = 0;
     try {
@@ -588,6 +618,7 @@ exports.sendNotificationNow = async (req, res, next) => {
     if (notification.type === 'email' || notification.type === 'all') {
       console.log('\n📧 ===== SENDING EMAIL NOTIFICATIONS =====');
       console.log(`📧 Target Audience: ${notification.targetAudience}`);
+      console.log(`📧 Mode: ${notification.emailHtml ? '🎨 CUSTOM HTML (from builder)' : '📋 DEFAULT TEMPLATE'}`);
       
       const { sendBulkEmails } = require('../utils/emailService');
       
@@ -604,7 +635,7 @@ exports.sendNotificationNow = async (req, res, next) => {
         // Prepare email data for each recipient
         const emailRecipients = targetEmails.map(({ email, name }) => ({
           to: email,
-          subject: notification.title,
+          subject: notification.subject || notification.title,
           title: notification.title,
           body: notification.body,
           recipientName: name,
@@ -612,6 +643,7 @@ exports.sendNotificationNow = async (req, res, next) => {
           actionText: notification.actionUrl ? 'View Details' : null,
           imageUrl: notification.imageUrl || null,
           priority: notification.priority,
+          customHtml: notification.emailHtml || null, // ⭐ Custom HTML from builder
         }));
 
         // Send emails in batches
@@ -651,6 +683,9 @@ exports.sendNotificationNow = async (req, res, next) => {
       notificationId: notification._id.toString(),
       title: notification.title,
       body: notification.body,
+      subject: notification.subject,
+      emailHtml: notification.emailHtml,
+      emailTemplate: notification.emailTemplate,
       type: notification.type,
       priority: notification.priority,
       targetAudience: notification.targetAudience,
@@ -856,6 +891,10 @@ exports.duplicateNotification = async (req, res, next) => {
     const duplicate = new Notification({
       title: `${original.title} (Copy)`,
       body: original.body,
+      subject: original.subject,
+      emailHtml: original.emailHtml,
+      emailTemplate: original.emailTemplate,
+      emailBlock: original.emailBlock,
       type: original.type,
       priority: original.priority,
       targetAudience: original.targetAudience,

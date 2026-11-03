@@ -42,10 +42,50 @@ const createTransporter = () => {
 // Initialize transporter
 createTransporter();
 
+// ==================== HELPERS ====================
+
+/**
+ * Simple personalization: replace {{name}} tokens in HTML with recipient name
+ */
+const personalizeHtml = (html, recipientName) => {
+  if (!html) return html;
+  const safeName = String(recipientName || 'Valued User')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  return html
+    .replace(/\{\{\s*name\s*\}\}/gi, safeName)
+    .replace(/\{\{\s*recipient_name\s*\}\}/gi, safeName)
+    .replace(/\{\{\s*recipientName\s*\}\}/gi, safeName);
+};
+
+/**
+ * Strip HTML tags → plain text fallback
+ */
+const htmlToPlainText = (html) => {
+  if (!html) return '';
+  return html
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<\/div>/gi, '\n')
+    .replace(/<\/tr>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+};
+
 // ==================== EMAIL TEMPLATES ====================
 
 /**
- * Professional Notification Email Template
+ * Professional Notification Email Template (DEFAULT FALLBACK)
+ * Used when no custom emailHtml is provided from frontend
  */
 const getNotificationEmailTemplate = (data) => {
   const {
@@ -274,7 +314,7 @@ Need help? Contact us at ${supportEmail}
  * Send email notification
  * @param {Object} options - Email options
  * @param {string} options.to - Recipient email
- * @param {string} options.subject - Email subject
+ * @param {string} options.subject - Email subject (optional, falls back to title)
  * @param {string} options.title - Notification title
  * @param {string} options.body - Notification body
  * @param {string} options.recipientName - Recipient's name
@@ -282,6 +322,7 @@ Need help? Contact us at ${supportEmail}
  * @param {string} options.actionText - Optional action button text
  * @param {string} options.imageUrl - Optional image URL
  * @param {string} options.priority - Email priority (urgent, high, normal, low)
+ * @param {string} options.customHtml - Optional pre-built HTML (from frontend builder) — overrides template
  * @returns {Promise<Object>} - Email send result
  */
 const sendNotificationEmail = async (options) => {
@@ -295,17 +336,21 @@ const sendNotificationEmail = async (options) => {
     actionText,
     imageUrl,
     priority = 'normal',
+    customHtml,
   } = options;
+
+  const finalSubject = subject || title || '(No Subject)';
 
   console.log('\n📧 ===== SENDING EMAIL =====');
   console.log('   To:', to);
-  console.log('   Subject:', subject);
+  console.log('   Subject:', finalSubject);
   console.log('   Priority:', priority);
+  console.log('   Mode:', customHtml ? '🎨 Custom HTML (from builder)' : '📋 Default Template');
 
   // Check if transporter is available
   if (!transporter) {
     console.warn('⚠️ Email transporter not available. Skipping email send.');
-    logger.warn('Email send skipped - transporter not configured', { to, subject });
+    logger.warn('Email send skipped - transporter not configured', { to, subject: finalSubject });
     return {
       success: false,
       message: 'Email service not configured',
@@ -314,7 +359,7 @@ const sendNotificationEmail = async (options) => {
   }
 
   try {
-    // Prepare template data
+    // Prepare template data (for fallback template + plain text)
     const templateData = {
       title,
       body,
@@ -325,15 +370,28 @@ const sendNotificationEmail = async (options) => {
       priority,
     };
 
-    // Generate HTML and plain text
-    const html = getNotificationEmailTemplate(templateData);
-    const text = getPlainTextVersion(templateData);
+    // ===== DECIDE HTML SOURCE =====
+    let html;
+    if (customHtml && typeof customHtml === 'string' && customHtml.trim().length > 0) {
+      // Use custom HTML from frontend builder + personalize {{name}} tokens
+      html = personalizeHtml(customHtml, recipientName);
+      console.log('   ✨ Using custom HTML from builder');
+    } else {
+      // Fallback → default template
+      html = getNotificationEmailTemplate(templateData);
+      console.log('   📋 Using default template');
+    }
+
+    // Plain text version — try to generate from customHtml, else use fallback
+    const text = customHtml
+      ? htmlToPlainText(personalizeHtml(customHtml, recipientName))
+      : getPlainTextVersion(templateData);
 
     // Email options
     const mailOptions = {
       from: `${FROM_EMAIL.name} <${FROM_EMAIL.address}>`,
       to,
-      subject,
+      subject: finalSubject,
       text,
       html,
       priority: priority === 'urgent' ? 'high' : 'normal',
@@ -347,9 +405,10 @@ const sendNotificationEmail = async (options) => {
 
     logger.info('Email sent successfully', {
       to,
-      subject,
+      subject: finalSubject,
       messageId: info.messageId,
       priority,
+      mode: customHtml ? 'custom' : 'template',
     });
 
     return {
@@ -363,7 +422,7 @@ const sendNotificationEmail = async (options) => {
     logger.error('Email send failed:', {
       error: error.message,
       to,
-      subject,
+      subject: finalSubject,
       stack: error.stack,
     });
 
@@ -377,7 +436,7 @@ const sendNotificationEmail = async (options) => {
 
 /**
  * Send bulk emails
- * @param {Array} recipients - Array of recipient objects
+ * @param {Array} recipients - Array of recipient objects (each may contain customHtml, subject, etc.)
  * @returns {Promise<Object>} - Bulk send results
  */
 const sendBulkEmails = async (recipients) => {
@@ -465,4 +524,6 @@ module.exports = {
   verifyEmailConfig,
   getNotificationEmailTemplate,
   getPlainTextVersion,
+  personalizeHtml,
+  htmlToPlainText,
 };

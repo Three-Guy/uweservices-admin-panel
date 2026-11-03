@@ -14,8 +14,30 @@ const notificationSchema = new mongoose.Schema({
     type: String,
     required: [true, 'Notification body is required'],
     trim: true,
-    maxlength: [1000, 'Body cannot exceed 1000 characters']
+    maxlength: [5000, 'Body cannot exceed 5000 characters']
   },
+  
+  // ===== NEW EMAIL FIELDS =====
+  subject: {
+    type: String,
+    trim: true,
+    maxlength: [300, 'Subject cannot exceed 300 characters'],
+    default: null
+  },
+  emailHtml: {
+    type: String,
+    default: null
+  },
+  emailTemplate: {
+    type: String,
+    enum: ['welcome', 'promo', 'announcement', 'alert', 'newsletter', 'invoice', 'custom'],
+    default: null
+  },
+  emailBlock: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null
+  },
+  // ============================
   
   // Notification Type
   type: {
@@ -155,6 +177,7 @@ notificationSchema.index({ scheduledAt: 1 }, { sparse: true });
 notificationSchema.index({ createdBy: 1 });
 notificationSchema.index({ isDeleted: 1 });
 notificationSchema.index({ tags: 1 });
+notificationSchema.index({ emailTemplate: 1 });
 
 // Virtual for delivery rate
 notificationSchema.virtual('deliveryRate').get(function() {
