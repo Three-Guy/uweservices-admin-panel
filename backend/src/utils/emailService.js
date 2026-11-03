@@ -12,6 +12,19 @@ const EMAIL_CONFIG = {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASSWORD,
   },
+  // ===== CONNECTION POOLING (FIXES TIMEOUT) =====
+  pool: true,
+  maxConnections: 5,
+  maxMessages: 100,
+  // ===== INCREASED TIMEOUTS (FIXES "Connection timeout") =====
+  connectionTimeout: 30000,   // 30s to establish connection (default was 2s)
+  greetingTimeout: 15000,     // 15s for server greeting
+  socketTimeout: 60000,       // 60s for socket inactivity
+  // ===== TLS SETTINGS =====
+  tls: {
+    rejectUnauthorized: false,
+    ciphers: 'SSLv3',
+  },
 };
 
 const FROM_EMAIL = {
@@ -19,23 +32,65 @@ const FROM_EMAIL = {
   address: process.env.EMAIL_FROM_ADDRESS || process.env.EMAIL_USER,
 };
 
+// ==================== RETRY CONFIG ====================
+const MAX_RETRIES = 3;
+const RETRY_BASE_DELAY_MS = 2000;       // 2s, 4s, 8s backoff
+const BULK_EMAIL_DELAY_MS = 500;        // 500ms between each email (was 100ms)
+
 // ==================== CREATE TRANSPORTER ====================
 let transporter = null;
+let transporterHealthy = false;
 
 const createTransporter = () => {
   if (!EMAIL_CONFIG.auth.user || !EMAIL_CONFIG.auth.pass) {
     console.warn('⚠️ Email credentials not configured. Email functionality disabled.');
+    transporterHealthy = false;
     return null;
   }
 
   try {
+    // Close old transporter if exists
+    if (transporter) {
+      try {
+        transporter.close();
+      } catch (e) {
+        // ignore close errors
+      }
+    }
+
     transporter = nodemailer.createTransport(EMAIL_CONFIG);
-    console.log('✅ Email transporter created successfully');
+
+    // Listen for idle events to track health
+    transporter.on('idle', () => {
+      transporterHealthy = true;
+    });
+
+    console.log('✅ Email transporter created successfully (pool: true, maxConn: 5)');
+    transporterHealthy = true;
     return transporter;
   } catch (error) {
     console.error('❌ Failed to create email transporter:', error.message);
     logger.error('Email transporter creation failed:', error);
+    transporterHealthy = false;
     return null;
+  }
+};
+
+/**
+ * Ensure transporter is alive. Re-create if dead.
+ */
+const ensureTransporter = async () => {
+  if (!transporter) {
+    return createTransporter();
+  }
+
+  try {
+    await transporter.verify();
+    transporterHealthy = true;
+    return transporter;
+  } catch (err) {
+    console.warn('⚠️ Transporter unhealthy, recreating...', err.message);
+    return createTransporter();
   }
 };
 
@@ -79,6 +134,54 @@ const htmlToPlainText = (html) => {
     .replace(/&#39;/g, "'")
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+};
+
+/**
+ * Sleep helper
+ */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Retry wrapper with exponential backoff
+ * Retries on: timeout, connection reset, ECONNRESET, ETIMEDOUT, socket hang up
+ */
+const sendWithRetry = async (mailOptions, attempt = 1) => {
+  try {
+    const info = await transporter.sendMail(mailOptions);
+    return info;
+  } catch (error) {
+    const isRetryable =
+      error.message.includes('timeout') ||
+      error.message.includes('ECONNRESET') ||
+      error.message.includes('ETIMEDOUT') ||
+      error.message.includes('socket hang up') ||
+      error.message.includes('Connection closed') ||
+      error.message.includes('Greeting never received') ||
+      error.code === 'ETIMEDOUT' ||
+      error.code === 'ECONNRESET' ||
+      error.code === 'ESOCKET';
+
+    if (isRetryable && attempt < MAX_RETRIES) {
+      const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+      console.warn(
+        `⚠️ Email to ${mailOptions.to} failed (attempt ${attempt}/${MAX_RETRIES}): ${error.message}. Retrying in ${delay / 1000}s...`
+      );
+      logger.warn('Email retry', {
+        to: mailOptions.to,
+        attempt,
+        error: error.message,
+        nextRetryIn: `${delay}ms`,
+      });
+
+      // Recreate transporter before retry
+      await ensureTransporter();
+      await sleep(delay);
+      return sendWithRetry(mailOptions, attempt + 1);
+    }
+
+    // Not retryable or max retries exhausted
+    throw error;
+  }
 };
 
 // ==================== EMAIL TEMPLATES ====================
@@ -308,6 +411,26 @@ Need help? Contact us at ${supportEmail}
   `.trim();
 };
 
+// ==================== SUBJECT SANITIZER ====================
+
+/**
+ * If subject is just a template name like "welcome", "promo", etc.,
+ * replace it with the title so emails don't show "Subject: welcome"
+ */
+const TEMPLATE_NAMES = [
+  'welcome', 'promo', 'announcement', 'alert',
+  'newsletter', 'invoice', 'custom',
+];
+
+const sanitizeSubject = (subject, title) => {
+  if (!subject) return title || '(No Subject)';
+  const lower = subject.trim().toLowerCase();
+  if (TEMPLATE_NAMES.includes(lower)) {
+    return title || subject;
+  }
+  return subject;
+};
+
 // ==================== SEND EMAIL FUNCTION ====================
 
 /**
@@ -339,7 +462,8 @@ const sendNotificationEmail = async (options) => {
     customHtml,
   } = options;
 
-  const finalSubject = subject || title || '(No Subject)';
+  // ===== FIX: sanitize subject so "welcome" → actual title =====
+  const finalSubject = sanitizeSubject(subject, title);
 
   console.log('\n📧 ===== SENDING EMAIL =====');
   console.log('   To:', to);
@@ -349,13 +473,17 @@ const sendNotificationEmail = async (options) => {
 
   // Check if transporter is available
   if (!transporter) {
-    console.warn('⚠️ Email transporter not available. Skipping email send.');
-    logger.warn('Email send skipped - transporter not configured', { to, subject: finalSubject });
-    return {
-      success: false,
-      message: 'Email service not configured',
-      skipped: true,
-    };
+    console.warn('⚠️ Email transporter not available. Attempting to recreate...');
+    await ensureTransporter();
+    if (!transporter) {
+      console.warn('⚠️ Email transporter still not available. Skipping email send.');
+      logger.warn('Email send skipped - transporter not configured', { to, subject: finalSubject });
+      return {
+        success: false,
+        message: 'Email service not configured',
+        skipped: true,
+      };
+    }
   }
 
   try {
@@ -395,10 +523,17 @@ const sendNotificationEmail = async (options) => {
       text,
       html,
       priority: priority === 'urgent' ? 'high' : 'normal',
+      // ===== ANTI-SPAM HEADERS =====
+      headers: {
+        'X-Mailer': 'UWE-Services-Admin',
+        'X-Priority': priority === 'urgent' ? '1' : priority === 'high' ? '2' : '3',
+        'List-Unsubscribe': `<mailto:${process.env.EMAIL_SUPPORT_EMAIL || 'support@uweservices.com'}?subject=unsubscribe>`,
+        'Precedence': 'bulk',
+      },
     };
 
-    // Send email
-    const info = await transporter.sendMail(mailOptions);
+    // ===== SEND WITH RETRY (fixes timeout) =====
+    const info = await sendWithRetry(mailOptions);
 
     console.log('✅ Email sent successfully');
     console.log('   Message ID:', info.messageId);
@@ -409,6 +544,7 @@ const sendNotificationEmail = async (options) => {
       messageId: info.messageId,
       priority,
       mode: customHtml ? 'custom' : 'template',
+      timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
     });
 
     return {
@@ -424,6 +560,7 @@ const sendNotificationEmail = async (options) => {
       to,
       subject: finalSubject,
       stack: error.stack,
+      timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
     });
 
     return {
@@ -442,6 +579,9 @@ const sendNotificationEmail = async (options) => {
 const sendBulkEmails = async (recipients) => {
   console.log(`\n📧 ===== SENDING BULK EMAILS (${recipients.length}) =====`);
 
+  // Ensure transporter is healthy before bulk send
+  await ensureTransporter();
+
   if (!transporter) {
     console.warn('⚠️ Email transporter not available. Skipping bulk email send.');
     return {
@@ -459,10 +599,20 @@ const sendBulkEmails = async (recipients) => {
     failures: [],
   };
 
-  for (const recipient of recipients) {
+  const totalBatches = Math.ceil(recipients.length / 50);
+
+  for (let i = 0; i < recipients.length; i++) {
+    const recipient = recipients[i];
+    const batchNum = Math.floor(i / 50) + 1;
+
+    // Log batch progress
+    if (i % 50 === 0) {
+      console.log(`\n📧 Sending batch ${batchNum}/${totalBatches}`);
+    }
+
     try {
       const result = await sendNotificationEmail(recipient);
-      
+
       if (result.success) {
         results.totalSent++;
       } else {
@@ -473,8 +623,20 @@ const sendBulkEmails = async (recipients) => {
         });
       }
 
-      // Small delay to avoid rate limiting
-      await new Promise(resolve => setTimeout(resolve, 100));
+      // ===== RATE LIMITING: 500ms between emails (was 100ms) =====
+      // Gmail allows ~500 emails/day for free accounts
+      // 500ms delay = 2 emails/sec = safe rate
+      if (i < recipients.length - 1) {
+        await sleep(BULK_EMAIL_DELAY_MS);
+      }
+
+      // Every 50 emails, pause 5 seconds to let Gmail breathe
+      if ((i + 1) % 50 === 0 && i < recipients.length - 1) {
+        console.log(`   ⏸️ Pausing 5s after batch ${batchNum}...`);
+        await sleep(5000);
+        // Verify transporter is still alive
+        await ensureTransporter();
+      }
     } catch (error) {
       results.totalFailed++;
       results.failures.push({
@@ -484,7 +646,14 @@ const sendBulkEmails = async (recipients) => {
     }
   }
 
-  console.log(`✅ Bulk email complete: ${results.totalSent} sent, ${results.totalFailed} failed`);
+  console.log(`\n✅ Bulk email complete: ${results.totalSent} sent, ${results.totalFailed} failed`);
+
+  if (results.failures.length > 0) {
+    console.log(`⚠️ Failed emails:`);
+    results.failures.forEach((f) => {
+      console.log(`   ❌ ${f.email}: ${f.error}`);
+    });
+  }
 
   return results;
 };
@@ -503,12 +672,14 @@ const verifyEmailConfig = async () => {
   try {
     await transporter.verify();
     console.log('✅ Email configuration verified');
+    transporterHealthy = true;
     return {
       success: true,
       message: 'Email configuration is valid',
     };
   } catch (error) {
     console.error('❌ Email configuration invalid:', error.message);
+    transporterHealthy = false;
     return {
       success: false,
       message: error.message,
