@@ -1,6 +1,7 @@
 // src/utils/emailService.js
 const nodemailer = require('nodemailer');
 const https = require('https');
+const dns = require('dns').promises;
 const logger = require('./logger');
 
 // ==================== EMAIL CONFIGURATION ====================
@@ -34,14 +35,14 @@ const FROM_EMAIL = {
 const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
 const USE_BREVO = BREVO_API_KEY.length > 0;
 const BREVO_API_URL = 'https://api.brevo.com/v3/smtp/email';
-const BREVO_DAILY_LIMIT = 290; // safe margin (Brevo free = 300/day)
+const BREVO_DAILY_LIMIT = 290;
 
 // ==================== RETRY CONFIG ====================
 const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 2000;
 const BULK_EMAIL_DELAY_MS = 600;
 
-// ==================== DAILY COUNTER (Brevo 300/day) ====================
+// ==================== DAILY COUNTER ====================
 let dailyEmailCount = 0;
 let dailyResetDate = new Date().toDateString();
 
@@ -58,9 +59,188 @@ const incrementDailyCount = () => {
   dailyEmailCount++;
 };
 
+// ==================== EMAIL VALIDATION (SKIP FAKE EMAILS) ====================
+
+/**
+ * Known fake/test email patterns — automatically skipped
+ */
+const FAKE_EMAIL_PATTERNS = [
+  // Fake name patterns
+  /^test\d*@/i,
+  /^fake\d*@/i,
+  /^demo\d*@/i,
+  /^sample\d*@/i,
+  /^example\d*@/i,
+  /^dummy\d*@/i,
+  /^abc\d*@/i,
+  /^xyz\d*@/i,
+  /^asdf+@/i,
+  /^qwerty+@/i,
+  /^user\d+@/i,
+  /^temp\d*@/i,
+  /^tmp\d*@/i,
+  /^noreply@/i,
+  /^no-reply@/i,
+  /^donotreply@/i,
+
+  // Common fake names used in testing
+  /^(sam|naman|bhavuk|vickey|ved|heh|pranav|vijsag|maurya|rubi)\d*@gmail\.com$/i,
+  /^(vaibhav|veduu|bhavuk\d+|bahvuk|kushal|anshul\d+)@gmail\.com$/i,
+  /^(mayank|vrinda|mangala|great|muskan|nihanshu|komal)\d*@gmail\.com$/i,
+
+  // Keyboard mashing
+  /^[a-z]{1,3}@/i,            // "a@", "ab@", "xyz@"
+  /^(.)\1{4,}@/i,              // "aaaaa@", "bbbbbb@"
+  /^[0-9]+@/i,                 // "12345@"
+];
+
+/**
+ * Known disposable/fake email domains
+ */
+const FAKE_DOMAINS = new Set([
+  'test.com',
+  'example.com',
+  'example.org',
+  'example.net',
+  'fake.com',
+  'tempmail.com',
+  'temp-mail.org',
+  'mailinator.com',
+  'guerrillamail.com',
+  '10minutemail.com',
+  'throwaway.email',
+  'yopmail.com',
+  'trashmail.com',
+  'dispostable.com',
+  'maildrop.cc',
+  'getnada.com',
+  'cloudtestlabaccounts.com', // Google test accounts
+  'localhost',
+  'local',
+  'invalid',
+  'none.com',
+  'nothing.com',
+  'abc.com',
+  'xyz.com',
+  '123.com',
+]);
+
+/**
+ * MX cache (don't re-check same domain repeatedly)
+ */
+const mxCache = new Map();
+const MX_CACHE_TTL = 60 * 60 * 1000; // 1 hour
+
+/**
+ * Basic RFC email format check
+ */
+const EMAIL_REGEX = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+
+/**
+ * Validate email format + check if it's a known fake pattern
+ * Returns: { valid: boolean, reason: string }
+ */
+const validateEmailFormat = (email) => {
+  if (!email || typeof email !== 'string') {
+    return { valid: false, reason: 'Email is empty or not a string' };
+  }
+
+  const trimmed = email.trim().toLowerCase();
+
+  // Length check
+  if (trimmed.length < 5 || trimmed.length > 254) {
+    return { valid: false, reason: 'Email length invalid' };
+  }
+
+  // RFC format check
+  if (!EMAIL_REGEX.test(trimmed)) {
+    return { valid: false, reason: 'Invalid email format' };
+  }
+
+  const [localPart, domain] = trimmed.split('@');
+
+  // Local part too short
+  if (localPart.length < 2) {
+    return { valid: false, reason: 'Local part too short' };
+  }
+
+  // Check against fake domains
+  if (FAKE_DOMAINS.has(domain)) {
+    return { valid: false, reason: `Fake/disposable domain: ${domain}` };
+  }
+
+  // Check against fake patterns
+  for (const pattern of FAKE_EMAIL_PATTERNS) {
+    if (pattern.test(trimmed)) {
+      return { valid: false, reason: `Matches fake pattern: ${pattern}` };
+    }
+  }
+
+  return { valid: true, reason: 'Format OK' };
+};
+
+/**
+ * Check if domain has valid MX records (real deliverable domain)
+ * Returns: { valid: boolean, reason: string }
+ */
+const checkDomainMX = async (email) => {
+  const domain = email.split('@')[1].toLowerCase();
+
+  // Check cache
+  const cached = mxCache.get(domain);
+  if (cached && Date.now() - cached.timestamp < MX_CACHE_TTL) {
+    return cached.result;
+  }
+
+  try {
+    const mxRecords = await dns.resolveMx(domain);
+    if (!mxRecords || mxRecords.length === 0) {
+      const result = { valid: false, reason: `No MX records for ${domain}` };
+      mxCache.set(domain, { result, timestamp: Date.now() });
+      return result;
+    }
+    const result = { valid: true, reason: `${mxRecords.length} MX records found` };
+    mxCache.set(domain, { result, timestamp: Date.now() });
+    return result;
+  } catch (err) {
+    const result = {
+      valid: false,
+      reason: `MX lookup failed for ${domain}: ${err.code || err.message}`,
+    };
+    mxCache.set(domain, { result, timestamp: Date.now() });
+    return result;
+  }
+};
+
+/**
+ * MAIN validator — format + fake-pattern + MX check
+ * Returns: { valid: boolean, reason: string, skipped: boolean }
+ */
+const isGenuineEmail = async (email) => {
+  // Step 1: format + fake pattern check (fast, no network)
+  const formatCheck = validateEmailFormat(email);
+  if (!formatCheck.valid) {
+    return {
+      valid: false,
+      reason: formatCheck.reason,
+      skipped: true,
+    };
+  }
+
+  // Step 2: MX record check (network, cached)
+  const mxCheck = await checkDomainMX(email);
+  if (!mxCheck.valid) {
+    return {
+      valid: false,
+      reason: mxCheck.reason,
+      skipped: true,
+    };
+  }
+
+  return { valid: true, reason: 'Genuine email', skipped: false };
+};
+
 // ==================== BREVO HTTP CLIENT ====================
-// Uses Node built-in https (port 443) — works on Render free tier
-// No external dependencies needed (no axios, no node-fetch)
 
 const sendViaBrevo = (mailOptions) => {
   return new Promise((resolve, reject) => {
@@ -115,17 +295,14 @@ const sendViaBrevo = (mailOptions) => {
               response: 'OK',
             });
           } else {
-            const errMsg =
-              parsed.message || parsed.code || `HTTP ${res.statusCode}`;
+            const errMsg = parsed.message || parsed.code || `HTTP ${res.statusCode}`;
             reject(new Error(`Brevo API error: ${errMsg}`));
           }
         } catch (e) {
           if (res.statusCode >= 200 && res.statusCode < 300) {
             resolve({ messageId: `brevo-${Date.now()}`, response: 'OK' });
           } else {
-            reject(
-              new Error(`Brevo API ${res.statusCode}: ${responseData}`)
-            );
+            reject(new Error(`Brevo API ${res.statusCode}: ${responseData}`));
           }
         }
       });
@@ -151,9 +328,7 @@ let transporterHealthy = false;
 
 const createTransporter = () => {
   if (!EMAIL_CONFIG.auth.user || !EMAIL_CONFIG.auth.pass) {
-    console.warn(
-      '⚠️ Email credentials not configured. SMTP fallback disabled.'
-    );
+    console.warn('⚠️ Email credentials not configured. SMTP fallback disabled.');
     transporterHealthy = false;
     return null;
   }
@@ -173,16 +348,11 @@ const createTransporter = () => {
       transporterHealthy = true;
     });
 
-    console.log(
-      '✅ SMTP transporter created (fallback for local dev)'
-    );
+    console.log('✅ SMTP transporter created (fallback for local dev)');
     transporterHealthy = true;
     return transporter;
   } catch (error) {
-    console.error(
-      '❌ Failed to create SMTP transporter:',
-      error.message
-    );
+    console.error('❌ Failed to create SMTP transporter:', error.message);
     logger.error('SMTP transporter creation failed:', error);
     transporterHealthy = false;
     return null;
@@ -198,10 +368,7 @@ const ensureTransporter = async () => {
     transporterHealthy = true;
     return transporter;
   } catch (err) {
-    console.warn(
-      '⚠️ SMTP transporter unhealthy, recreating...',
-      err.message
-    );
+    console.warn('⚠️ SMTP transporter unhealthy, recreating...', err.message);
     return createTransporter();
   }
 };
@@ -213,9 +380,9 @@ if (USE_BREVO) {
   console.log('║  📧 EMAIL MODE: Brevo HTTP API (port 443)       ║');
   console.log('║  ✅ Works on Render / Railway / Vercel           ║');
   console.log('║  📊 Daily limit: 300 emails (free tier)          ║');
+  console.log('║  🛡️  Fake email filter: ENABLED                  ║');
   console.log('╚══════════════════════════════════════════════════╝');
   console.log('');
-  // Also create SMTP transporter as backup
   createTransporter();
 } else {
   console.log('');
@@ -223,6 +390,7 @@ if (USE_BREVO) {
   console.log('║  📧 EMAIL MODE: Gmail SMTP (port 587)            ║');
   console.log('║  ⚠️  Will NOT work on Render free tier!          ║');
   console.log('║  💡 Set BREVO_API_KEY env var to fix             ║');
+  console.log('║  🛡️  Fake email filter: ENABLED                  ║');
   console.log('╚══════════════════════════════════════════════════╝');
   console.log('');
   createTransporter();
@@ -230,9 +398,6 @@ if (USE_BREVO) {
 
 // ==================== HELPERS ====================
 
-/**
- * Simple personalization: replace {{name}} tokens in HTML with recipient name
- */
 const personalizeHtml = (html, recipientName) => {
   if (!html) return html;
   const safeName = String(recipientName || 'Valued User')
@@ -244,9 +409,6 @@ const personalizeHtml = (html, recipientName) => {
     .replace(/\{\{\s*recipientName\s*\}\}/gi, safeName);
 };
 
-/**
- * Strip HTML tags → plain text fallback
- */
 const htmlToPlainText = (html) => {
   if (!html) return '';
   return html
@@ -267,14 +429,8 @@ const htmlToPlainText = (html) => {
     .trim();
 };
 
-/**
- * Sleep helper
- */
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/**
- * Subject sanitizer — replaces template names with actual title
- */
 const TEMPLATE_NAMES = [
   'welcome',
   'promo',
@@ -294,7 +450,7 @@ const sanitizeSubject = (subject, title) => {
   return subject;
 };
 
-// ==================== SMTP RETRY (for local dev fallback) ====================
+// ==================== SMTP RETRY ====================
 
 const sendViaSmtpWithRetry = async (mailOptions, attempt = 1) => {
   try {
@@ -333,10 +489,6 @@ const sendViaSmtpWithRetry = async (mailOptions, attempt = 1) => {
 
 // ==================== EMAIL TEMPLATES ====================
 
-/**
- * Professional Notification Email Template (DEFAULT FALLBACK)
- * Used when no custom emailHtml is provided from frontend
- */
 const getNotificationEmailTemplate = (data) => {
   const {
     title,
@@ -348,14 +500,10 @@ const getNotificationEmailTemplate = (data) => {
     priority = 'normal',
   } = data;
 
-  const logoUrl =
-    process.env.EMAIL_LOGO_URL ||
-    'https://via.placeholder.com/150x50?text=Logo';
-  const companyName =
-    process.env.EMAIL_COMPANY_NAME || 'Service Marketplace';
+  const logoUrl = process.env.EMAIL_LOGO_URL || 'https://via.placeholder.com/150x50?text=Logo';
+  const companyName = process.env.EMAIL_COMPANY_NAME || 'Service Marketplace';
   const websiteUrl = process.env.EMAIL_WEBSITE_URL || '#';
-  const supportEmail =
-    process.env.EMAIL_SUPPORT_EMAIL || 'support@example.com';
+  const supportEmail = process.env.EMAIL_SUPPORT_EMAIL || 'support@example.com';
   const currentYear = new Date().getFullYear();
 
   const priorityColors = {
@@ -365,8 +513,7 @@ const getNotificationEmailTemplate = (data) => {
     low: '#6B7280',
   };
 
-  const priorityColor =
-    priorityColors[priority] || priorityColors.normal;
+  const priorityColor = priorityColors[priority] || priorityColors.normal;
 
   return `
 <!DOCTYPE html>
@@ -406,17 +553,13 @@ const getNotificationEmailTemplate = (data) => {
           </tr>
           
           <!-- Image Section (if provided) -->
-          ${
-            imageUrl
-              ? `
+          ${imageUrl ? `
           <tr>
             <td align="center" style="padding: 0 40px 24px 40px;">
               <img src="${imageUrl}" alt="Notification Image" style="max-width: 100%; height: auto; border-radius: 8px; display: block;" />
             </td>
           </tr>
-          `
-              : ''
-          }
+          ` : ''}
           
           <!-- Greeting -->
           <tr>
@@ -446,9 +589,7 @@ const getNotificationEmailTemplate = (data) => {
           </tr>
           
           <!-- Action Button (if actionUrl provided) -->
-          ${
-            actionUrl
-              ? `
+          ${actionUrl ? `
           <tr>
             <td align="center" style="padding: 0 40px 40px 40px;">
               <table role="presentation" cellspacing="0" cellpadding="0" border="0">
@@ -462,9 +603,7 @@ const getNotificationEmailTemplate = (data) => {
               </table>
             </td>
           </tr>
-          `
-              : ''
-          }
+          ` : ''}
           
           <!-- Divider -->
           <tr>
@@ -545,21 +684,10 @@ const getNotificationEmailTemplate = (data) => {
   `;
 };
 
-/**
- * Plain text version for email clients that don't support HTML
- */
 const getPlainTextVersion = (data) => {
-  const {
-    title,
-    body,
-    recipientName = 'Valued User',
-    actionUrl,
-    actionText = 'View Details',
-  } = data;
-  const companyName =
-    process.env.EMAIL_COMPANY_NAME || 'Service Marketplace';
-  const supportEmail =
-    process.env.EMAIL_SUPPORT_EMAIL || 'support@example.com';
+  const { title, body, recipientName = 'Valued User', actionUrl, actionText = 'View Details' } = data;
+  const companyName = process.env.EMAIL_COMPANY_NAME || 'Service Marketplace';
+  const supportEmail = process.env.EMAIL_SUPPORT_EMAIL || 'support@example.com';
 
   return `
 Hello ${recipientName},
@@ -580,21 +708,6 @@ Need help? Contact us at ${supportEmail}
 
 // ==================== SEND EMAIL FUNCTION ====================
 
-/**
- * Send email notification
- * @param {Object} options - Email options
- * @param {string} options.to - Recipient email
- * @param {string} options.subject - Email subject (optional, falls back to title)
- * @param {string} options.title - Notification title
- * @param {string} options.body - Notification body
- * @param {string} options.recipientName - Recipient's name
- * @param {string} options.actionUrl - Optional action URL
- * @param {string} options.actionText - Optional action button text
- * @param {string} options.imageUrl - Optional image URL
- * @param {string} options.priority - Email priority (urgent, high, normal, low)
- * @param {string} options.customHtml - Optional pre-built HTML (from frontend builder)
- * @returns {Promise<Object>} - Email send result
- */
 const sendNotificationEmail = async (options) => {
   const {
     to,
@@ -607,6 +720,7 @@ const sendNotificationEmail = async (options) => {
     imageUrl,
     priority = 'normal',
     customHtml,
+    skipValidation = false, // allow override for internal emails
   } = options;
 
   const finalSubject = sanitizeSubject(subject, title);
@@ -615,20 +729,31 @@ const sendNotificationEmail = async (options) => {
   console.log('   To:', to);
   console.log('   Subject:', finalSubject);
   console.log('   Priority:', priority);
-  console.log(
-    '   Mode:',
-    customHtml ? '🎨 Custom HTML (from builder)' : '📋 Default Template'
-  );
-  console.log(
-    '   Provider:',
-    USE_BREVO ? '🟢 Brevo HTTP API' : '🔵 Gmail SMTP'
-  );
+  console.log('   Mode:', customHtml ? '🎨 Custom HTML (from builder)' : '📋 Default Template');
+  console.log('   Provider:', USE_BREVO ? '🟢 Brevo HTTP API' : '🔵 Gmail SMTP');
+
+  // ===== VALIDATE EMAIL (SKIP FAKE EMAILS) =====
+  if (!skipValidation) {
+    const validation = await isGenuineEmail(to);
+    if (!validation.valid) {
+      console.log(`   ⏭️  SKIPPED (fake/invalid): ${validation.reason}`);
+      logger.info('Email skipped - fake/invalid', {
+        to,
+        reason: validation.reason,
+      });
+      return {
+        success: false,
+        message: `Skipped: ${validation.reason}`,
+        skipped: true,
+        fake: true,
+      };
+    }
+    console.log(`   ✅ Email validated: ${validation.reason}`);
+  }
 
   // ===== CHECK DAILY LIMIT (Brevo) =====
   if (USE_BREVO && !checkDailyLimit()) {
-    console.warn(
-      '⚠️ Brevo daily limit reached (300/day). Email skipped.'
-    );
+    console.warn('⚠️ Brevo daily limit reached (300/day). Email skipped.');
     logger.warn('Brevo daily limit reached', { to, subject: finalSubject });
     return {
       success: false,
@@ -639,13 +764,8 @@ const sendNotificationEmail = async (options) => {
 
   // ===== CHECK TRANSPORTER (SMTP fallback) =====
   if (!USE_BREVO && !transporter) {
-    console.warn(
-      '⚠️ No email provider available. Set BREVO_API_KEY or SMTP credentials.'
-    );
-    logger.warn('Email send skipped - no provider configured', {
-      to,
-      subject: finalSubject,
-    });
+    console.warn('⚠️ No email provider available. Set BREVO_API_KEY or SMTP credentials.');
+    logger.warn('Email send skipped - no provider configured', { to, subject: finalSubject });
     return {
       success: false,
       message: 'Email service not configured',
@@ -654,7 +774,6 @@ const sendNotificationEmail = async (options) => {
   }
 
   try {
-    // Prepare template data
     const templateData = {
       title,
       body,
@@ -665,13 +784,8 @@ const sendNotificationEmail = async (options) => {
       priority,
     };
 
-    // ===== DECIDE HTML SOURCE =====
     let html;
-    if (
-      customHtml &&
-      typeof customHtml === 'string' &&
-      customHtml.trim().length > 0
-    ) {
+    if (customHtml && typeof customHtml === 'string' && customHtml.trim().length > 0) {
       html = personalizeHtml(customHtml, recipientName);
       console.log('   ✨ Using custom HTML from builder');
     } else {
@@ -679,12 +793,10 @@ const sendNotificationEmail = async (options) => {
       console.log('   📋 Using default template');
     }
 
-    // Plain text version
     const text = customHtml
       ? htmlToPlainText(personalizeHtml(customHtml, recipientName))
       : getPlainTextVersion(templateData);
 
-    // Build mail options object (used by both Brevo and SMTP)
     const mailOptions = {
       from: `${FROM_EMAIL.name} <${FROM_EMAIL.address}>`,
       to,
@@ -695,29 +807,19 @@ const sendNotificationEmail = async (options) => {
       recipientName: recipientName || to.split('@')[0],
       headers: {
         'X-Mailer': 'UWE-Services-Admin',
-        'X-Priority':
-          priority === 'urgent'
-            ? '1'
-            : priority === 'high'
-              ? '2'
-              : '3',
+        'X-Priority': priority === 'urgent' ? '1' : priority === 'high' ? '2' : '3',
         'List-Unsubscribe': `<mailto:${process.env.EMAIL_SUPPORT_EMAIL || 'support@uweservices.com'}?subject=unsubscribe>`,
         Precedence: 'bulk',
       },
     };
 
-    // ===== SEND VIA BREVO OR SMTP =====
     let info;
 
     if (USE_BREVO) {
-      // ---- BREVO HTTP API (port 443 — works on Render!) ----
       info = await sendViaBrevo(mailOptions);
       incrementDailyCount();
-      console.log(
-        `   📊 Brevo daily usage: ${dailyEmailCount}/${BREVO_DAILY_LIMIT}`
-      );
+      console.log(`   📊 Brevo daily usage: ${dailyEmailCount}/${BREVO_DAILY_LIMIT}`);
     } else {
-      // ---- SMTP FALLBACK (local dev only) ----
       info = await sendViaSmtpWithRetry(mailOptions);
     }
 
@@ -759,68 +861,99 @@ const sendNotificationEmail = async (options) => {
   }
 };
 
-/**
- * Send bulk emails
- * @param {Array} recipients - Array of recipient objects
- * @returns {Promise<Object>} - Bulk send results
- */
+// ==================== BULK EMAIL SENDER WITH PRE-FILTERING ====================
+
 const sendBulkEmails = async (recipients) => {
-  console.log(
-    `\n📧 ===== SENDING BULK EMAILS (${recipients.length}) =====`
-  );
-  console.log(
-    `   Provider: ${USE_BREVO ? '🟢 Brevo HTTP API' : '🔵 Gmail SMTP'}`
-  );
+  console.log(`\n📧 ===== SENDING BULK EMAILS (${recipients.length}) =====`);
+  console.log(`   Provider: ${USE_BREVO ? '🟢 Brevo HTTP API' : '🔵 Gmail SMTP'}`);
+
+  // ===== STEP 1: PRE-FILTER FAKE EMAILS (BULK VALIDATION) =====
+  console.log(`\n🛡️  Pre-filtering fake/invalid emails...`);
+
+  const genuine = [];
+  const skipped = [];
+
+  for (const recipient of recipients) {
+    const validation = await isGenuineEmail(recipient.to);
+    if (validation.valid) {
+      genuine.push(recipient);
+    } else {
+      skipped.push({
+        email: recipient.to,
+        reason: validation.reason,
+      });
+    }
+  }
+
+  console.log(`   ✅ Genuine emails: ${genuine.length}`);
+  console.log(`   ⏭️  Fake/invalid skipped: ${skipped.length}`);
+
+  if (skipped.length > 0) {
+    console.log(`\n⏭️  Skipped emails (first 20):`);
+    skipped.slice(0, 20).forEach((s) => {
+      console.log(`      ⏭️  ${s.email} — ${s.reason}`);
+    });
+    if (skipped.length > 20) {
+      console.log(`      ... and ${skipped.length - 20} more`);
+    }
+  }
+
+  if (genuine.length === 0) {
+    console.warn(`⚠️ No genuine emails to send!`);
+    return {
+      success: true,
+      totalSent: 0,
+      totalFailed: 0,
+      totalSkipped: skipped.length,
+      failures: [],
+      skipped: skipped,
+    };
+  }
 
   if (USE_BREVO) {
     const remaining = BREVO_DAILY_LIMIT - dailyEmailCount;
-    console.log(
-      `   📊 Brevo daily remaining: ${remaining}/${BREVO_DAILY_LIMIT}`
-    );
-    if (recipients.length > remaining) {
-      console.warn(
-        `   ⚠️ Requested ${recipients.length} but only ${remaining} remaining today!`
-      );
-      console.warn(
-        `   ⚠️ Will send ${remaining} and skip the rest.`
-      );
+    console.log(`\n   📊 Brevo daily remaining: ${remaining}/${BREVO_DAILY_LIMIT}`);
+    if (genuine.length > remaining) {
+      console.warn(`   ⚠️ Requested ${genuine.length} genuine but only ${remaining} remaining today!`);
+      console.warn(`   ⚠️ Will send ${remaining} and skip the rest.`);
     }
   }
 
   if (!USE_BREVO && !transporter) {
-    console.warn(
-      '⚠️ No email provider available. Skipping bulk send.'
-    );
+    console.warn('⚠️ No email provider available. Skipping bulk send.');
     return {
       success: false,
       message: 'Email service not configured',
       totalSent: 0,
-      totalFailed: recipients.length,
+      totalFailed: genuine.length,
+      totalSkipped: skipped.length,
     };
   }
 
+  // ===== STEP 2: SEND TO GENUINE EMAILS =====
   const results = {
     success: true,
     totalSent: 0,
     totalFailed: 0,
+    totalSkipped: skipped.length,
     failures: [],
+    skipped: skipped,
   };
 
-  const totalBatches = Math.ceil(recipients.length / 50);
+  const totalBatches = Math.ceil(genuine.length / 50);
 
-  for (let i = 0; i < recipients.length; i++) {
-    const recipient = recipients[i];
+  console.log(`\n📤 Starting to send ${genuine.length} genuine emails in ${totalBatches} batch(es)...`);
+
+  for (let i = 0; i < genuine.length; i++) {
+    const recipient = genuine[i];
     const batchNum = Math.floor(i / 50) + 1;
 
-    // Check daily limit mid-bulk
     if (USE_BREVO && !checkDailyLimit()) {
-      console.warn(
-        `\n⚠️ Brevo daily limit hit at email ${i + 1}/${recipients.length}. Stopping.`
-      );
-      const skipped = recipients.length - i;
-      results.totalFailed += skipped;
+      console.warn(`\n⚠️ Brevo daily limit hit at email ${i + 1}/${genuine.length}. Stopping.`);
+      const remaining = genuine.length - i;
+      results.totalFailed += remaining;
       results.failures.push({
-        email: `${skipped} remaining`,
+        email: `${remaining} remaining`,
         error: 'Daily limit reached (300/day)',
       });
       break;
@@ -831,7 +964,11 @@ const sendBulkEmails = async (recipients) => {
     }
 
     try {
-      const result = await sendNotificationEmail(recipient);
+      // Skip validation inside loop (already pre-validated)
+      const result = await sendNotificationEmail({
+        ...recipient,
+        skipValidation: true,
+      });
 
       if (result.success) {
         results.totalSent++;
@@ -843,16 +980,12 @@ const sendBulkEmails = async (recipients) => {
         });
       }
 
-      // Rate limiting delay
-      if (i < recipients.length - 1) {
+      if (i < genuine.length - 1) {
         await sleep(BULK_EMAIL_DELAY_MS);
       }
 
-      // Pause every 50 emails
-      if ((i + 1) % 50 === 0 && i < recipients.length - 1) {
-        console.log(
-          `   ⏸️ Pausing 5s after batch ${batchNum}...`
-        );
+      if ((i + 1) % 50 === 0 && i < genuine.length - 1) {
+        console.log(`   ⏸️ Pausing 5s after batch ${batchNum}...`);
         await sleep(5000);
       }
     } catch (error) {
@@ -864,12 +997,13 @@ const sendBulkEmails = async (recipients) => {
     }
   }
 
-  console.log(
-    `\n✅ Bulk email complete: ${results.totalSent} sent, ${results.totalFailed} failed`
-  );
+  console.log(`\n✅ Bulk email complete:`);
+  console.log(`   📤 Sent: ${results.totalSent}`);
+  console.log(`   ❌ Failed: ${results.totalFailed}`);
+  console.log(`   ⏭️  Skipped (fake): ${results.totalSkipped}`);
 
   if (results.failures.length > 0) {
-    console.log(`⚠️ Failed emails:`);
+    console.log(`\n⚠️ Failed emails:`);
     results.failures.forEach((f) => {
       console.log(`   ❌ ${f.email}: ${f.error}`);
     });
@@ -878,12 +1012,10 @@ const sendBulkEmails = async (recipients) => {
   return results;
 };
 
-/**
- * Verify email configuration
- */
+// ==================== VERIFY EMAIL CONFIG ====================
+
 const verifyEmailConfig = async () => {
   if (USE_BREVO) {
-    // Test Brevo API key with a lightweight call
     try {
       const result = await new Promise((resolve, reject) => {
         const reqOptions = {
@@ -918,19 +1050,14 @@ const verifyEmailConfig = async () => {
       });
 
       console.log('✅ Brevo API key verified');
-      console.log(
-        `   Account: ${result.email || 'verified'}`
-      );
+      console.log(`   Account: ${result.email || 'verified'}`);
       return {
         success: true,
         message: 'Brevo API configuration is valid',
         provider: 'brevo',
       };
     } catch (error) {
-      console.error(
-        '❌ Brevo API key invalid:',
-        error.message
-      );
+      console.error('❌ Brevo API key invalid:', error.message);
       return {
         success: false,
         message: error.message,
@@ -939,7 +1066,6 @@ const verifyEmailConfig = async () => {
     }
   }
 
-  // SMTP fallback verify
   if (!transporter) {
     return {
       success: false,
@@ -957,10 +1083,7 @@ const verifyEmailConfig = async () => {
       provider: 'smtp',
     };
   } catch (error) {
-    console.error(
-      '❌ SMTP configuration invalid:',
-      error.message
-    );
+    console.error('❌ SMTP configuration invalid:', error.message);
     transporterHealthy = false;
     return {
       success: false,
@@ -980,4 +1103,8 @@ module.exports = {
   getPlainTextVersion,
   personalizeHtml,
   htmlToPlainText,
+  // Expose validators for testing / other modules
+  isGenuineEmail,
+  validateEmailFormat,
+  checkDomainMX,
 };
