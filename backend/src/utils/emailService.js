@@ -1,5 +1,6 @@
 // src/utils/emailService.js
 const nodemailer = require('nodemailer');
+const https = require('https');
 const logger = require('./logger');
 
 // ==================== EMAIL CONFIGURATION ====================
@@ -12,15 +13,12 @@ const EMAIL_CONFIG = {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASSWORD,
   },
-  // ===== CONNECTION POOLING (FIXES TIMEOUT) =====
   pool: true,
   maxConnections: 5,
   maxMessages: 100,
-  // ===== INCREASED TIMEOUTS (FIXES "Connection timeout") =====
-  connectionTimeout: 30000,   // 30s to establish connection (default was 2s)
-  greetingTimeout: 15000,     // 15s for server greeting
-  socketTimeout: 60000,       // 60s for socket inactivity
-  // ===== TLS SETTINGS =====
+  connectionTimeout: 30000,
+  greetingTimeout: 15000,
+  socketTimeout: 60000,
   tls: {
     rejectUnauthorized: false,
     ciphers: 'SSLv3',
@@ -32,70 +30,203 @@ const FROM_EMAIL = {
   address: process.env.EMAIL_FROM_ADDRESS || process.env.EMAIL_USER,
 };
 
+// ==================== BREVO CONFIG ====================
+const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
+const USE_BREVO = BREVO_API_KEY.length > 0;
+const BREVO_API_URL = 'https://api.brevo.com/v3/smtp/email';
+const BREVO_DAILY_LIMIT = 290; // safe margin (Brevo free = 300/day)
+
 // ==================== RETRY CONFIG ====================
 const MAX_RETRIES = 3;
-const RETRY_BASE_DELAY_MS = 2000;       // 2s, 4s, 8s backoff
-const BULK_EMAIL_DELAY_MS = 500;        // 500ms between each email (was 100ms)
+const RETRY_BASE_DELAY_MS = 2000;
+const BULK_EMAIL_DELAY_MS = 600;
 
-// ==================== CREATE TRANSPORTER ====================
+// ==================== DAILY COUNTER (Brevo 300/day) ====================
+let dailyEmailCount = 0;
+let dailyResetDate = new Date().toDateString();
+
+const checkDailyLimit = () => {
+  const today = new Date().toDateString();
+  if (today !== dailyResetDate) {
+    dailyEmailCount = 0;
+    dailyResetDate = today;
+  }
+  return dailyEmailCount < BREVO_DAILY_LIMIT;
+};
+
+const incrementDailyCount = () => {
+  dailyEmailCount++;
+};
+
+// ==================== BREVO HTTP CLIENT ====================
+// Uses Node built-in https (port 443) — works on Render free tier
+// No external dependencies needed (no axios, no node-fetch)
+
+const sendViaBrevo = (mailOptions) => {
+  return new Promise((resolve, reject) => {
+    const payload = {
+      sender: {
+        name: FROM_EMAIL.name,
+        email: FROM_EMAIL.address,
+      },
+      to: [
+        {
+          email: mailOptions.to,
+          name: mailOptions.recipientName || mailOptions.to.split('@')[0],
+        },
+      ],
+      subject: mailOptions.subject,
+      htmlContent: mailOptions.html,
+      textContent: mailOptions.text,
+      headers: {
+        'X-Mailer': 'UWE-Services-Admin',
+        'X-Priority': mailOptions.priority === 'high' ? '1' : '3',
+        'List-Unsubscribe': `<mailto:${process.env.EMAIL_SUPPORT_EMAIL || 'support@uweservices.com'}?subject=unsubscribe>`,
+        ...(mailOptions.headers || {}),
+      },
+    };
+
+    const data = JSON.stringify(payload);
+
+    const reqOptions = {
+      hostname: 'api.brevo.com',
+      port: 443,
+      path: '/v3/smtp/email',
+      method: 'POST',
+      headers: {
+        'api-key': BREVO_API_KEY,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'Content-Length': Buffer.byteLength(data),
+      },
+    };
+
+    const req = https.request(reqOptions, (res) => {
+      let responseData = '';
+      res.on('data', (chunk) => {
+        responseData += chunk;
+      });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(responseData);
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve({
+              messageId: parsed.messageId || `brevo-${Date.now()}`,
+              response: 'OK',
+            });
+          } else {
+            const errMsg =
+              parsed.message || parsed.code || `HTTP ${res.statusCode}`;
+            reject(new Error(`Brevo API error: ${errMsg}`));
+          }
+        } catch (e) {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve({ messageId: `brevo-${Date.now()}`, response: 'OK' });
+          } else {
+            reject(
+              new Error(`Brevo API ${res.statusCode}: ${responseData}`)
+            );
+          }
+        }
+      });
+    });
+
+    req.on('error', (err) => {
+      reject(new Error(`Brevo network error: ${err.message}`));
+    });
+
+    req.setTimeout(30000, () => {
+      req.destroy();
+      reject(new Error('Brevo API timeout (30s)'));
+    });
+
+    req.write(data);
+    req.end();
+  });
+};
+
+// ==================== CREATE TRANSPORTER (SMTP FALLBACK) ====================
 let transporter = null;
 let transporterHealthy = false;
 
 const createTransporter = () => {
   if (!EMAIL_CONFIG.auth.user || !EMAIL_CONFIG.auth.pass) {
-    console.warn('⚠️ Email credentials not configured. Email functionality disabled.');
+    console.warn(
+      '⚠️ Email credentials not configured. SMTP fallback disabled.'
+    );
     transporterHealthy = false;
     return null;
   }
 
   try {
-    // Close old transporter if exists
     if (transporter) {
       try {
         transporter.close();
       } catch (e) {
-        // ignore close errors
+        // ignore
       }
     }
 
     transporter = nodemailer.createTransport(EMAIL_CONFIG);
 
-    // Listen for idle events to track health
     transporter.on('idle', () => {
       transporterHealthy = true;
     });
 
-    console.log('✅ Email transporter created successfully (pool: true, maxConn: 5)');
+    console.log(
+      '✅ SMTP transporter created (fallback for local dev)'
+    );
     transporterHealthy = true;
     return transporter;
   } catch (error) {
-    console.error('❌ Failed to create email transporter:', error.message);
-    logger.error('Email transporter creation failed:', error);
+    console.error(
+      '❌ Failed to create SMTP transporter:',
+      error.message
+    );
+    logger.error('SMTP transporter creation failed:', error);
     transporterHealthy = false;
     return null;
   }
 };
 
-/**
- * Ensure transporter is alive. Re-create if dead.
- */
 const ensureTransporter = async () => {
   if (!transporter) {
     return createTransporter();
   }
-
   try {
     await transporter.verify();
     transporterHealthy = true;
     return transporter;
   } catch (err) {
-    console.warn('⚠️ Transporter unhealthy, recreating...', err.message);
+    console.warn(
+      '⚠️ SMTP transporter unhealthy, recreating...',
+      err.message
+    );
     return createTransporter();
   }
 };
 
-// Initialize transporter
-createTransporter();
+// Initialize
+if (USE_BREVO) {
+  console.log('');
+  console.log('╔══════════════════════════════════════════════════╗');
+  console.log('║  📧 EMAIL MODE: Brevo HTTP API (port 443)       ║');
+  console.log('║  ✅ Works on Render / Railway / Vercel           ║');
+  console.log('║  📊 Daily limit: 300 emails (free tier)          ║');
+  console.log('╚══════════════════════════════════════════════════╝');
+  console.log('');
+  // Also create SMTP transporter as backup
+  createTransporter();
+} else {
+  console.log('');
+  console.log('╔══════════════════════════════════════════════════╗');
+  console.log('║  📧 EMAIL MODE: Gmail SMTP (port 587)            ║');
+  console.log('║  ⚠️  Will NOT work on Render free tier!          ║');
+  console.log('║  💡 Set BREVO_API_KEY env var to fix             ║');
+  console.log('╚══════════════════════════════════════════════════╝');
+  console.log('');
+  createTransporter();
+}
 
 // ==================== HELPERS ====================
 
@@ -142,10 +273,30 @@ const htmlToPlainText = (html) => {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Retry wrapper with exponential backoff
- * Retries on: timeout, connection reset, ECONNRESET, ETIMEDOUT, socket hang up
+ * Subject sanitizer — replaces template names with actual title
  */
-const sendWithRetry = async (mailOptions, attempt = 1) => {
+const TEMPLATE_NAMES = [
+  'welcome',
+  'promo',
+  'announcement',
+  'alert',
+  'newsletter',
+  'invoice',
+  'custom',
+];
+
+const sanitizeSubject = (subject, title) => {
+  if (!subject) return title || '(No Subject)';
+  const lower = subject.trim().toLowerCase();
+  if (TEMPLATE_NAMES.includes(lower)) {
+    return title || subject;
+  }
+  return subject;
+};
+
+// ==================== SMTP RETRY (for local dev fallback) ====================
+
+const sendViaSmtpWithRetry = async (mailOptions, attempt = 1) => {
   try {
     const info = await transporter.sendMail(mailOptions);
     return info;
@@ -164,22 +315,18 @@ const sendWithRetry = async (mailOptions, attempt = 1) => {
     if (isRetryable && attempt < MAX_RETRIES) {
       const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
       console.warn(
-        `⚠️ Email to ${mailOptions.to} failed (attempt ${attempt}/${MAX_RETRIES}): ${error.message}. Retrying in ${delay / 1000}s...`
+        `⚠️ SMTP to ${mailOptions.to} failed (attempt ${attempt}/${MAX_RETRIES}): ${error.message}. Retrying in ${delay / 1000}s...`
       );
-      logger.warn('Email retry', {
+      logger.warn('SMTP retry', {
         to: mailOptions.to,
         attempt,
         error: error.message,
         nextRetryIn: `${delay}ms`,
       });
-
-      // Recreate transporter before retry
       await ensureTransporter();
       await sleep(delay);
-      return sendWithRetry(mailOptions, attempt + 1);
+      return sendViaSmtpWithRetry(mailOptions, attempt + 1);
     }
-
-    // Not retryable or max retries exhausted
     throw error;
   }
 };
@@ -201,13 +348,16 @@ const getNotificationEmailTemplate = (data) => {
     priority = 'normal',
   } = data;
 
-  const logoUrl = process.env.EMAIL_LOGO_URL || 'https://via.placeholder.com/150x50?text=Logo';
-  const companyName = process.env.EMAIL_COMPANY_NAME || 'Service Marketplace';
+  const logoUrl =
+    process.env.EMAIL_LOGO_URL ||
+    'https://via.placeholder.com/150x50?text=Logo';
+  const companyName =
+    process.env.EMAIL_COMPANY_NAME || 'Service Marketplace';
   const websiteUrl = process.env.EMAIL_WEBSITE_URL || '#';
-  const supportEmail = process.env.EMAIL_SUPPORT_EMAIL || 'support@example.com';
+  const supportEmail =
+    process.env.EMAIL_SUPPORT_EMAIL || 'support@example.com';
   const currentYear = new Date().getFullYear();
 
-  // Priority colors
   const priorityColors = {
     urgent: '#DC2626',
     high: '#EA580C',
@@ -215,7 +365,8 @@ const getNotificationEmailTemplate = (data) => {
     low: '#6B7280',
   };
 
-  const priorityColor = priorityColors[priority] || priorityColors.normal;
+  const priorityColor =
+    priorityColors[priority] || priorityColors.normal;
 
   return `
 <!DOCTYPE html>
@@ -255,13 +406,17 @@ const getNotificationEmailTemplate = (data) => {
           </tr>
           
           <!-- Image Section (if provided) -->
-          ${imageUrl ? `
+          ${
+            imageUrl
+              ? `
           <tr>
             <td align="center" style="padding: 0 40px 24px 40px;">
               <img src="${imageUrl}" alt="Notification Image" style="max-width: 100%; height: auto; border-radius: 8px; display: block;" />
             </td>
           </tr>
-          ` : ''}
+          `
+              : ''
+          }
           
           <!-- Greeting -->
           <tr>
@@ -291,7 +446,9 @@ const getNotificationEmailTemplate = (data) => {
           </tr>
           
           <!-- Action Button (if actionUrl provided) -->
-          ${actionUrl ? `
+          ${
+            actionUrl
+              ? `
           <tr>
             <td align="center" style="padding: 0 40px 40px 40px;">
               <table role="presentation" cellspacing="0" cellpadding="0" border="0">
@@ -305,7 +462,9 @@ const getNotificationEmailTemplate = (data) => {
               </table>
             </td>
           </tr>
-          ` : ''}
+          `
+              : ''
+          }
           
           <!-- Divider -->
           <tr>
@@ -390,9 +549,17 @@ const getNotificationEmailTemplate = (data) => {
  * Plain text version for email clients that don't support HTML
  */
 const getPlainTextVersion = (data) => {
-  const { title, body, recipientName = 'Valued User', actionUrl, actionText = 'View Details' } = data;
-  const companyName = process.env.EMAIL_COMPANY_NAME || 'Service Marketplace';
-  const supportEmail = process.env.EMAIL_SUPPORT_EMAIL || 'support@example.com';
+  const {
+    title,
+    body,
+    recipientName = 'Valued User',
+    actionUrl,
+    actionText = 'View Details',
+  } = data;
+  const companyName =
+    process.env.EMAIL_COMPANY_NAME || 'Service Marketplace';
+  const supportEmail =
+    process.env.EMAIL_SUPPORT_EMAIL || 'support@example.com';
 
   return `
 Hello ${recipientName},
@@ -411,26 +578,6 @@ Need help? Contact us at ${supportEmail}
   `.trim();
 };
 
-// ==================== SUBJECT SANITIZER ====================
-
-/**
- * If subject is just a template name like "welcome", "promo", etc.,
- * replace it with the title so emails don't show "Subject: welcome"
- */
-const TEMPLATE_NAMES = [
-  'welcome', 'promo', 'announcement', 'alert',
-  'newsletter', 'invoice', 'custom',
-];
-
-const sanitizeSubject = (subject, title) => {
-  if (!subject) return title || '(No Subject)';
-  const lower = subject.trim().toLowerCase();
-  if (TEMPLATE_NAMES.includes(lower)) {
-    return title || subject;
-  }
-  return subject;
-};
-
 // ==================== SEND EMAIL FUNCTION ====================
 
 /**
@@ -445,7 +592,7 @@ const sanitizeSubject = (subject, title) => {
  * @param {string} options.actionText - Optional action button text
  * @param {string} options.imageUrl - Optional image URL
  * @param {string} options.priority - Email priority (urgent, high, normal, low)
- * @param {string} options.customHtml - Optional pre-built HTML (from frontend builder) — overrides template
+ * @param {string} options.customHtml - Optional pre-built HTML (from frontend builder)
  * @returns {Promise<Object>} - Email send result
  */
 const sendNotificationEmail = async (options) => {
@@ -462,32 +609,52 @@ const sendNotificationEmail = async (options) => {
     customHtml,
   } = options;
 
-  // ===== FIX: sanitize subject so "welcome" → actual title =====
   const finalSubject = sanitizeSubject(subject, title);
 
   console.log('\n📧 ===== SENDING EMAIL =====');
   console.log('   To:', to);
   console.log('   Subject:', finalSubject);
   console.log('   Priority:', priority);
-  console.log('   Mode:', customHtml ? '🎨 Custom HTML (from builder)' : '📋 Default Template');
+  console.log(
+    '   Mode:',
+    customHtml ? '🎨 Custom HTML (from builder)' : '📋 Default Template'
+  );
+  console.log(
+    '   Provider:',
+    USE_BREVO ? '🟢 Brevo HTTP API' : '🔵 Gmail SMTP'
+  );
 
-  // Check if transporter is available
-  if (!transporter) {
-    console.warn('⚠️ Email transporter not available. Attempting to recreate...');
-    await ensureTransporter();
-    if (!transporter) {
-      console.warn('⚠️ Email transporter still not available. Skipping email send.');
-      logger.warn('Email send skipped - transporter not configured', { to, subject: finalSubject });
-      return {
-        success: false,
-        message: 'Email service not configured',
-        skipped: true,
-      };
-    }
+  // ===== CHECK DAILY LIMIT (Brevo) =====
+  if (USE_BREVO && !checkDailyLimit()) {
+    console.warn(
+      '⚠️ Brevo daily limit reached (300/day). Email skipped.'
+    );
+    logger.warn('Brevo daily limit reached', { to, subject: finalSubject });
+    return {
+      success: false,
+      message: 'Daily email limit reached (300/day)',
+      skipped: true,
+    };
+  }
+
+  // ===== CHECK TRANSPORTER (SMTP fallback) =====
+  if (!USE_BREVO && !transporter) {
+    console.warn(
+      '⚠️ No email provider available. Set BREVO_API_KEY or SMTP credentials.'
+    );
+    logger.warn('Email send skipped - no provider configured', {
+      to,
+      subject: finalSubject,
+    });
+    return {
+      success: false,
+      message: 'Email service not configured',
+      skipped: true,
+    };
   }
 
   try {
-    // Prepare template data (for fallback template + plain text)
+    // Prepare template data
     const templateData = {
       title,
       body,
@@ -500,22 +667,24 @@ const sendNotificationEmail = async (options) => {
 
     // ===== DECIDE HTML SOURCE =====
     let html;
-    if (customHtml && typeof customHtml === 'string' && customHtml.trim().length > 0) {
-      // Use custom HTML from frontend builder + personalize {{name}} tokens
+    if (
+      customHtml &&
+      typeof customHtml === 'string' &&
+      customHtml.trim().length > 0
+    ) {
       html = personalizeHtml(customHtml, recipientName);
       console.log('   ✨ Using custom HTML from builder');
     } else {
-      // Fallback → default template
       html = getNotificationEmailTemplate(templateData);
       console.log('   📋 Using default template');
     }
 
-    // Plain text version — try to generate from customHtml, else use fallback
+    // Plain text version
     const text = customHtml
       ? htmlToPlainText(personalizeHtml(customHtml, recipientName))
       : getPlainTextVersion(templateData);
 
-    // Email options
+    // Build mail options object (used by both Brevo and SMTP)
     const mailOptions = {
       from: `${FROM_EMAIL.name} <${FROM_EMAIL.address}>`,
       to,
@@ -523,17 +692,34 @@ const sendNotificationEmail = async (options) => {
       text,
       html,
       priority: priority === 'urgent' ? 'high' : 'normal',
-      // ===== ANTI-SPAM HEADERS =====
+      recipientName: recipientName || to.split('@')[0],
       headers: {
         'X-Mailer': 'UWE-Services-Admin',
-        'X-Priority': priority === 'urgent' ? '1' : priority === 'high' ? '2' : '3',
+        'X-Priority':
+          priority === 'urgent'
+            ? '1'
+            : priority === 'high'
+              ? '2'
+              : '3',
         'List-Unsubscribe': `<mailto:${process.env.EMAIL_SUPPORT_EMAIL || 'support@uweservices.com'}?subject=unsubscribe>`,
-        'Precedence': 'bulk',
+        Precedence: 'bulk',
       },
     };
 
-    // ===== SEND WITH RETRY (fixes timeout) =====
-    const info = await sendWithRetry(mailOptions);
+    // ===== SEND VIA BREVO OR SMTP =====
+    let info;
+
+    if (USE_BREVO) {
+      // ---- BREVO HTTP API (port 443 — works on Render!) ----
+      info = await sendViaBrevo(mailOptions);
+      incrementDailyCount();
+      console.log(
+        `   📊 Brevo daily usage: ${dailyEmailCount}/${BREVO_DAILY_LIMIT}`
+      );
+    } else {
+      // ---- SMTP FALLBACK (local dev only) ----
+      info = await sendViaSmtpWithRetry(mailOptions);
+    }
 
     console.log('✅ Email sent successfully');
     console.log('   Message ID:', info.messageId);
@@ -544,6 +730,7 @@ const sendNotificationEmail = async (options) => {
       messageId: info.messageId,
       priority,
       mode: customHtml ? 'custom' : 'template',
+      provider: USE_BREVO ? 'brevo' : 'smtp',
       timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
     });
 
@@ -559,6 +746,7 @@ const sendNotificationEmail = async (options) => {
       error: error.message,
       to,
       subject: finalSubject,
+      provider: USE_BREVO ? 'brevo' : 'smtp',
       stack: error.stack,
       timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
     });
@@ -573,17 +761,36 @@ const sendNotificationEmail = async (options) => {
 
 /**
  * Send bulk emails
- * @param {Array} recipients - Array of recipient objects (each may contain customHtml, subject, etc.)
+ * @param {Array} recipients - Array of recipient objects
  * @returns {Promise<Object>} - Bulk send results
  */
 const sendBulkEmails = async (recipients) => {
-  console.log(`\n📧 ===== SENDING BULK EMAILS (${recipients.length}) =====`);
+  console.log(
+    `\n📧 ===== SENDING BULK EMAILS (${recipients.length}) =====`
+  );
+  console.log(
+    `   Provider: ${USE_BREVO ? '🟢 Brevo HTTP API' : '🔵 Gmail SMTP'}`
+  );
 
-  // Ensure transporter is healthy before bulk send
-  await ensureTransporter();
+  if (USE_BREVO) {
+    const remaining = BREVO_DAILY_LIMIT - dailyEmailCount;
+    console.log(
+      `   📊 Brevo daily remaining: ${remaining}/${BREVO_DAILY_LIMIT}`
+    );
+    if (recipients.length > remaining) {
+      console.warn(
+        `   ⚠️ Requested ${recipients.length} but only ${remaining} remaining today!`
+      );
+      console.warn(
+        `   ⚠️ Will send ${remaining} and skip the rest.`
+      );
+    }
+  }
 
-  if (!transporter) {
-    console.warn('⚠️ Email transporter not available. Skipping bulk email send.');
+  if (!USE_BREVO && !transporter) {
+    console.warn(
+      '⚠️ No email provider available. Skipping bulk send.'
+    );
     return {
       success: false,
       message: 'Email service not configured',
@@ -605,7 +812,20 @@ const sendBulkEmails = async (recipients) => {
     const recipient = recipients[i];
     const batchNum = Math.floor(i / 50) + 1;
 
-    // Log batch progress
+    // Check daily limit mid-bulk
+    if (USE_BREVO && !checkDailyLimit()) {
+      console.warn(
+        `\n⚠️ Brevo daily limit hit at email ${i + 1}/${recipients.length}. Stopping.`
+      );
+      const skipped = recipients.length - i;
+      results.totalFailed += skipped;
+      results.failures.push({
+        email: `${skipped} remaining`,
+        error: 'Daily limit reached (300/day)',
+      });
+      break;
+    }
+
     if (i % 50 === 0) {
       console.log(`\n📧 Sending batch ${batchNum}/${totalBatches}`);
     }
@@ -623,19 +843,17 @@ const sendBulkEmails = async (recipients) => {
         });
       }
 
-      // ===== RATE LIMITING: 500ms between emails (was 100ms) =====
-      // Gmail allows ~500 emails/day for free accounts
-      // 500ms delay = 2 emails/sec = safe rate
+      // Rate limiting delay
       if (i < recipients.length - 1) {
         await sleep(BULK_EMAIL_DELAY_MS);
       }
 
-      // Every 50 emails, pause 5 seconds to let Gmail breathe
+      // Pause every 50 emails
       if ((i + 1) % 50 === 0 && i < recipients.length - 1) {
-        console.log(`   ⏸️ Pausing 5s after batch ${batchNum}...`);
+        console.log(
+          `   ⏸️ Pausing 5s after batch ${batchNum}...`
+        );
         await sleep(5000);
-        // Verify transporter is still alive
-        await ensureTransporter();
       }
     } catch (error) {
       results.totalFailed++;
@@ -646,7 +864,9 @@ const sendBulkEmails = async (recipients) => {
     }
   }
 
-  console.log(`\n✅ Bulk email complete: ${results.totalSent} sent, ${results.totalFailed} failed`);
+  console.log(
+    `\n✅ Bulk email complete: ${results.totalSent} sent, ${results.totalFailed} failed`
+  );
 
   if (results.failures.length > 0) {
     console.log(`⚠️ Failed emails:`);
@@ -662,6 +882,64 @@ const sendBulkEmails = async (recipients) => {
  * Verify email configuration
  */
 const verifyEmailConfig = async () => {
+  if (USE_BREVO) {
+    // Test Brevo API key with a lightweight call
+    try {
+      const result = await new Promise((resolve, reject) => {
+        const reqOptions = {
+          hostname: 'api.brevo.com',
+          port: 443,
+          path: '/v3/account',
+          method: 'GET',
+          headers: {
+            'api-key': BREVO_API_KEY,
+            Accept: 'application/json',
+          },
+        };
+        const req = https.request(reqOptions, (res) => {
+          let data = '';
+          res.on('data', (chunk) => {
+            data += chunk;
+          });
+          res.on('end', () => {
+            if (res.statusCode === 200) {
+              resolve(JSON.parse(data));
+            } else {
+              reject(new Error(`Brevo API ${res.statusCode}`));
+            }
+          });
+        });
+        req.on('error', reject);
+        req.setTimeout(10000, () => {
+          req.destroy();
+          reject(new Error('Brevo verify timeout'));
+        });
+        req.end();
+      });
+
+      console.log('✅ Brevo API key verified');
+      console.log(
+        `   Account: ${result.email || 'verified'}`
+      );
+      return {
+        success: true,
+        message: 'Brevo API configuration is valid',
+        provider: 'brevo',
+      };
+    } catch (error) {
+      console.error(
+        '❌ Brevo API key invalid:',
+        error.message
+      );
+      return {
+        success: false,
+        message: error.message,
+        provider: 'brevo',
+      };
+    }
+  }
+
+  // SMTP fallback verify
   if (!transporter) {
     return {
       success: false,
@@ -671,18 +949,23 @@ const verifyEmailConfig = async () => {
 
   try {
     await transporter.verify();
-    console.log('✅ Email configuration verified');
+    console.log('✅ SMTP configuration verified');
     transporterHealthy = true;
     return {
       success: true,
-      message: 'Email configuration is valid',
+      message: 'SMTP configuration is valid',
+      provider: 'smtp',
     };
   } catch (error) {
-    console.error('❌ Email configuration invalid:', error.message);
+    console.error(
+      '❌ SMTP configuration invalid:',
+      error.message
+    );
     transporterHealthy = false;
     return {
       success: false,
       message: error.message,
+      provider: 'smtp',
     };
   }
 };
