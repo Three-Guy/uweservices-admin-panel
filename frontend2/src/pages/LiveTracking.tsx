@@ -3,26 +3,24 @@ import {
   Radar, RefreshCw, Monitor, Users, Wrench, Mail, Activity,
   Search, X, MapPin, Wifi, WifiOff, ChevronLeft, ChevronRight,
   Copy, CheckCircle2, Smartphone, Clock, Shield, Globe, Eye,
+  Phone, User, Star, Loader2,
 } from 'lucide-react';
 import TrackingHeatmap, { type HeatmapPoint } from '../components/Maps/TrackingHeatmap';
-import { trackingApi } from '../lib/api';
+import { trackingApi, usersApi, providersApi } from '../lib/api';
 
 /* ════════════════════════════════════════════════════════════════════
-   THEME SYSTEM — mirrors admin panel's 6 themes
+   THEME SYSTEM
    ════════════════════════════════════════════════════════════════════ */
 interface PageTheme {
-  // backgrounds
   bgPage: string;
   bgCard: string;
   bgCardHover: string;
   bgInput: string;
   bgModal: string;
   bgOverlay: string;
-  // text
   textPrimary: string;
   textSecondary: string;
   textMuted: string;
-  // accents
   primary: string;
   primaryLight: string;
   primaryDark: string;
@@ -30,29 +28,22 @@ interface PageTheme {
   secondaryLight: string;
   accent: string;
   accentLight: string;
-  // gradients
   gradientPrimary: string;
   gradientSecondary: string;
   gradientActive: string;
   gradientHeader: string;
-  // borders
   border: string;
   borderLight: string;
-  // badges
   badgeLive: string;
   badgeLiveGlow: string;
-  // pill active / inactive
   pillActive: string;
   pillActiveBg: string;
   pillInactive: string;
   pillInactiveBg: string;
-  // tabs
   tabActive: string;
   tabInactive: string;
   tabIndicator: string;
-  // table header
   thBg: string;
-  // misc
   scrollThumb: string;
   ringFocus: string;
 }
@@ -223,10 +214,52 @@ interface TrackingStats {
   byPlatform: Record<string, number>;
 }
 
+/* ✨ Enriched user/provider detail (for the map-click modal) */
+interface EnrichedPersonDetail {
+  _id?: string;
+  type: 'customer' | 'provider' | 'lead';
+  name?: string;
+  email?: string;
+  phone?: string;
+  profilePicture?: string | null;
+  profileImage?: string | null;
+  gender?: string;
+  city?: string;
+  isActive?: boolean;
+  createdAt?: string;
+  lastLogin?: string | null;
+
+  deviceId?: string;
+  platform?: string;
+  appVersion?: string;
+  lat?: number;
+  lng?: number;
+  lastSeenAt?: number | null;
+  active?: boolean;
+  fcmToken?: string;
+  isServiceable?: boolean;
+
+  providerId?: string;
+  userId?: string;
+  profession?: string;
+  rating?: any;
+  completedJobs?: number;
+  totalBookings?: number;
+  wallet?: any;
+  verificationStatus?: string;
+  isVerified?: boolean;
+  isAvailable?: boolean;
+  isOnline?: boolean;
+  isBlocked?: boolean;
+  serviceRadius?: number;
+
+  [key: string]: any;
+}
+
 const PAGE_SIZE = 25;
 const AUTO_REFRESH = 30_000;
 
-function fmtDate(v?: number | null): string {
+function fmtDate(v?: number | string | null): string {
   if (!v) return '—';
   const d = new Date(v);
   if (isNaN(d.getTime())) return '—';
@@ -250,7 +283,6 @@ function timeAgo(v?: number | null): string {
    MAIN PAGE COMPONENT
    ════════════════════════════════════════════════════════════════════ */
 const LiveTracking: React.FC = () => {
-  /* ── theme state ───────────────────────────────────────────────── */
   const [themeName, setThemeName] = useState(getActiveThemeName);
   const t = PAGE_THEMES[themeName] || PAGE_THEMES.dark;
 
@@ -264,7 +296,6 @@ const LiveTracking: React.FC = () => {
     return () => { window.removeEventListener('storage', onStorage); clearInterval(iv); };
   }, []);
 
-  /* ── data states ───────────────────────────────────────────────── */
   const [stats, setStats] = useState<TrackingStats | null>(null);
   const [devices, setDevices] = useState<TrackingDevice[]>([]);
   const [leads, setLeads] = useState<TrackingLead[]>([]);
@@ -273,7 +304,6 @@ const LiveTracking: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<'heatmap' | 'devices' | 'leads'>('heatmap');
 
-  /* ── filters ───────────────────────────────────────────────────── */
   const [typeFilter, setTypeFilter] = useState<'all' | 'customer' | 'provider'>('all');
   const [cityFilter, setCityFilter] = useState('');
   const [platformFilter, setPlatformFilter] = useState('');
@@ -285,17 +315,19 @@ const LiveTracking: React.FC = () => {
   const [selectedDevice, setSelectedDevice] = useState<TrackingDevice | null>(null);
   const [copiedField, setCopiedField] = useState('');
 
+  const [mapPersonDetail, setMapPersonDetail] = useState<EnrichedPersonDetail | null>(null);
+  const [mapPersonLoading, setMapPersonLoading] = useState(false);
+  const [mapPersonError, setMapPersonError] = useState<string | null>(null);
+
   const refreshTimer = useRef<ReturnType<typeof setInterval>>();
 
-  /* ── fetch stats ───────────────────────────────────────────────── */
   const fetchStats = useCallback(async () => {
     try {
       const r = await trackingApi.getStats();
-      setStats(r.data || r);
+      setStats((r as any).data || r);
     } catch {}
   }, []);
 
-  /* ── fetch devices ─────────────────────────────────────────────── */
   const fetchDevices = useCallback(async () => {
     try {
       const r = await trackingApi.getDevices({
@@ -307,13 +339,12 @@ const LiveTracking: React.FC = () => {
         page,
         limit: PAGE_SIZE,
       });
-      const data = r.data || r;
+      const data = (r as any).data || r;
       setDevices(data.devices || []);
-      setTotalDevices(data.total || 0);
+      setTotalDevices(data.total || data.pagination?.total || 0);
     } catch {}
   }, [typeFilter, cityFilter, platformFilter, activeOnly, search, page]);
 
-  /* ── fetch leads ───────────────────────────────────────────────── */
   const fetchLeads = useCallback(async () => {
     try {
       const r = await trackingApi.getLeads({
@@ -322,13 +353,12 @@ const LiveTracking: React.FC = () => {
         page,
         limit: PAGE_SIZE,
       });
-      const data = r.data || r;
+      const data = (r as any).data || r;
       setLeads(data.leads || []);
-      setTotalLeads(data.total || 0);
+      setTotalLeads(data.total || data.pagination?.total || 0);
     } catch {}
   }, [cityFilter, search, page]);
 
-  /* ── fetch heatmap ─────────────────────────────────────────────── */
   const fetchHeatmap = useCallback(async () => {
     try {
       const r = await trackingApi.getHeatmap({
@@ -336,12 +366,11 @@ const LiveTracking: React.FC = () => {
         city: cityFilter || undefined,
         activeOnly: activeOnly ? 'true' : undefined,
       });
-      const data = r.data || r;
+      const data = (r as any).data || r;
       setHeatmapPoints(data.points || []);
     } catch {}
   }, [typeFilter, cityFilter, activeOnly]);
 
-  /* ── master fetch ──────────────────────────────────────────────── */
   const fetchAll = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -366,21 +395,95 @@ const LiveTracking: React.FC = () => {
 
   useEffect(() => { setPage(1); }, [typeFilter, cityFilter, platformFilter, activeOnly, search, tab]);
 
-  /* ── copy helper ───────────────────────────────────────────────── */
   const copyText = (label: string, text: string) => {
     navigator.clipboard.writeText(text);
     setCopiedField(label);
     setTimeout(() => setCopiedField(''), 1500);
   };
 
-  /* ── city chips (top 6) ────────────────────────────────────────── */
+  /* ✨ Handle marker click on map → fetch full person details */
+  const handleMapMarkerClick = useCallback(async (point: HeatmapPoint) => {
+    const initial: EnrichedPersonDetail = {
+      type: point.type,
+      name: point.name,
+      email: point.email,
+      phone: point.phone,
+      profilePicture: point.profilePicture,
+      profileImage: point.profileImage,
+      profession: point.profession,
+      rating: point.rating,
+      city: point.city,
+      deviceId: point.deviceId,
+      platform: point.platform,
+      appVersion: point.appVersion,
+      lat: point.lat,
+      lng: point.lng,
+      lastSeenAt: point.lastSeenAt,
+      active: point.active,
+      fcmToken: point.fcmToken,
+      isActive: point.isActive,
+      isServiceable: point.isServiceable,
+      providerId: point.providerId,
+      userId: point.userId,
+      createdAt: point.createdAt ? new Date(point.createdAt).toISOString() : undefined,
+    };
+
+    setMapPersonDetail(initial);
+    setMapPersonError(null);
+
+    if (point.type === 'lead') return;
+
+    setMapPersonLoading(true);
+    try {
+      if (point.type === 'provider' && point.providerId) {
+        const r = await providersApi.getFullDetails(point.providerId);
+        const prov = (r as any)?.data?.provider || (r as any)?.data;
+        if (prov) {
+          setMapPersonDetail((prev) => ({
+            ...(prev || initial),
+            ...prov,
+            type: 'provider',
+            lat: initial.lat,
+            lng: initial.lng,
+            active: initial.active,
+            lastSeenAt: initial.lastSeenAt,
+            deviceId: initial.deviceId,
+            platform: initial.platform,
+            appVersion: initial.appVersion,
+          }));
+        }
+      } else if (point.type === 'customer' && point.userId) {
+        const r = await usersApi.getById(point.userId);
+        const user = (r as any)?.data?.user || (r as any)?.data;
+        if (user) {
+          setMapPersonDetail((prev) => ({
+            ...(prev || initial),
+            ...user,
+            type: 'customer',
+            lat: initial.lat,
+            lng: initial.lng,
+            active: initial.active,
+            lastSeenAt: initial.lastSeenAt,
+            deviceId: initial.deviceId,
+            platform: initial.platform,
+            appVersion: initial.appVersion,
+          }));
+        }
+      }
+    } catch (e: any) {
+      console.warn('Failed to fetch full person details:', e);
+      setMapPersonError('Could not load full profile. Showing device info only.');
+    } finally {
+      setMapPersonLoading(false);
+    }
+  }, []);
+
   const topCities = stats
-    ? Object.entries(stats.byCity).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([c]) => c)
+    ? Object.entries(stats.byCity || {}).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([c]) => c)
     : [];
 
   const totalPages = tab === 'leads' ? Math.ceil(totalLeads / PAGE_SIZE) : Math.ceil(totalDevices / PAGE_SIZE);
 
-  /* ── clear filters ─────────────────────────────────────────────── */
   const clearFilters = () => {
     setTypeFilter('all');
     setCityFilter('');
@@ -392,15 +495,10 @@ const LiveTracking: React.FC = () => {
 
   const hasFilters = typeFilter !== 'all' || cityFilter || platformFilter || activeOnly || search;
 
-  /* ═══════════════════════════════════════════════════════════════════
-     RENDER
-     ═══════════════════════════════════════════════════════════════════ */
   return (
     <div className={`min-h-screen ${t.bgPage} p-4 md:p-6 transition-colors duration-300`}>
-      {/* ── header ─────────────────────────────────────────────────── */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
         <div className="flex items-center gap-3">
-          {/* animated radar */}
           <div className="relative">
             <div className="w-12 h-12 rounded-xl flex items-center justify-center bg-gradient-to-br" style={{ background: `linear-gradient(135deg, ${t.primary}, ${t.primaryDark})` }}>
               <Radar className="w-6 h-6 text-white animate-pulse" />
@@ -427,7 +525,6 @@ const LiveTracking: React.FC = () => {
         </button>
       </div>
 
-      {/* ── error banner ──────────────────────────────────────────── */}
       {error && (
         <div className="mb-4 p-3 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 text-sm flex items-center gap-2">
           <span>⚠️</span> {error}
@@ -435,7 +532,6 @@ const LiveTracking: React.FC = () => {
         </div>
       )}
 
-      {/* ── stat cards ────────────────────────────────────────────── */}
       {stats && (
         <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
           {([
@@ -468,7 +564,6 @@ const LiveTracking: React.FC = () => {
         </div>
       )}
 
-      {/* ── tabs ──────────────────────────────────────────────────── */}
       <div className={`flex items-center gap-1 mb-4 p-1 rounded-xl ${t.bgCard} ${t.border} border w-fit`}>
         {(['heatmap', 'devices', 'leads'] as const).map((tb) => (
           <button
@@ -488,10 +583,8 @@ const LiveTracking: React.FC = () => {
         ))}
       </div>
 
-      {/* ── filter bar ────────────────────────────────────────────── */}
       <div className={`${t.bgCard} rounded-xl p-4 ${t.border} border mb-4`}>
         <div className="flex flex-wrap items-center gap-3">
-          {/* type pills */}
           {tab !== 'leads' && (
             <div className="flex items-center gap-1">
               {(['all', 'customer', 'provider'] as const).map((tp) => (
@@ -509,7 +602,6 @@ const LiveTracking: React.FC = () => {
             </div>
           )}
 
-          {/* city input */}
           <div className="relative">
             <MapPin className={`absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 ${t.textMuted}`} />
             <input
@@ -520,7 +612,6 @@ const LiveTracking: React.FC = () => {
             />
           </div>
 
-          {/* platform select */}
           {tab !== 'leads' && (
             <select
               value={platformFilter}
@@ -534,7 +625,6 @@ const LiveTracking: React.FC = () => {
             </select>
           )}
 
-          {/* active only */}
           {tab !== 'leads' && (
             <label className={`flex items-center gap-2 text-xs ${t.textSecondary} cursor-pointer`}>
               <input
@@ -548,7 +638,6 @@ const LiveTracking: React.FC = () => {
             </label>
           )}
 
-          {/* search */}
           <div className="relative flex-1 min-w-[180px]">
             <Search className={`absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 ${t.textMuted}`} />
             <input
@@ -559,7 +648,6 @@ const LiveTracking: React.FC = () => {
             />
           </div>
 
-          {/* clear */}
           {hasFilters && (
             <button
               onClick={clearFilters}
@@ -570,7 +658,6 @@ const LiveTracking: React.FC = () => {
           )}
         </div>
 
-        {/* city quick-chips */}
         {topCities.length > 0 && (
           <div className="flex flex-wrap gap-2 mt-3">
             {topCities.map((c) => (
@@ -589,16 +676,20 @@ const LiveTracking: React.FC = () => {
         )}
       </div>
 
-      {/* ── TAB: HEATMAP ─────────────────────────────────────────── */}
       {tab === 'heatmap' && (
-        <TrackingHeatmap
-          points={heatmapPoints}
-          loading={loading}
-          activeFilter={typeFilter}
-        />
+        <>
+          <TrackingHeatmap
+            points={heatmapPoints}
+            loading={loading}
+            activeFilter={typeFilter}
+            onMarkerClick={handleMapMarkerClick}
+          />
+          <div className={`mt-3 text-center text-xs ${t.textMuted}`}>
+            💡 <strong>Tip:</strong> Hover over any pin to preview, click to see full details (name, email, phone, etc.)
+          </div>
+        </>
       )}
 
-      {/* ── TAB: DEVICES ─────────────────────────────────────────── */}
       {tab === 'devices' && (
         <>
           {loading && !devices.length ? (
@@ -621,7 +712,6 @@ const LiveTracking: React.FC = () => {
         </>
       )}
 
-      {/* ── TAB: LEADS ───────────────────────────────────────────── */}
       {tab === 'leads' && (
         <>
           <div className={`${t.bgCard} rounded-xl ${t.border} border overflow-hidden`}>
@@ -670,7 +760,6 @@ const LiveTracking: React.FC = () => {
         </>
       )}
 
-      {/* ── device detail modal ──────────────────────────────────── */}
       {selectedDevice && (
         <DeviceDetailModal
           device={selectedDevice}
@@ -678,6 +767,22 @@ const LiveTracking: React.FC = () => {
           copiedField={copiedField}
           onCopy={copyText}
           onClose={() => setSelectedDevice(null)}
+        />
+      )}
+
+      {mapPersonDetail && (
+        <MapPersonDetailModal
+          person={mapPersonDetail}
+          loading={mapPersonLoading}
+          errorMessage={mapPersonError}
+          theme={t}
+          copiedField={copiedField}
+          onCopy={copyText}
+          onClose={() => {
+            setMapPersonDetail(null);
+            setMapPersonError(null);
+            setMapPersonLoading(false);
+          }}
         />
       )}
     </div>
@@ -688,7 +793,6 @@ const LiveTracking: React.FC = () => {
    SUB-COMPONENTS
    ════════════════════════════════════════════════════════════════════ */
 
-/* ── Device Card ─────────────────────────────────────────────────── */
 const DeviceCard: React.FC<{
   device: TrackingDevice;
   theme: PageTheme;
@@ -703,7 +807,6 @@ const DeviceCard: React.FC<{
       className={`${t.bgCard} rounded-xl p-4 ${t.border} border cursor-pointer transition-all hover:scale-[1.01] hover:shadow-xl`}
     >
       <div className="flex items-start gap-3">
-        {/* avatar */}
         <div
           className="w-11 h-11 rounded-xl flex items-center justify-center text-white font-bold text-sm shrink-0"
           style={{
@@ -728,7 +831,6 @@ const DeviceCard: React.FC<{
             )}
           </div>
 
-          {/* info chips */}
           <div className="flex flex-wrap gap-1.5 mb-2">
             {device.city && (
               <span className={`flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium ${t.pillInactiveBg} ${t.textSecondary}`}>
@@ -747,7 +849,6 @@ const DeviceCard: React.FC<{
             )}
           </div>
 
-          {/* status row */}
           <div className="flex items-center gap-3">
             {isActive ? (
               <Wifi className="w-3.5 h-3.5" style={{ color: t.badgeLive }} />
@@ -765,7 +866,6 @@ const DeviceCard: React.FC<{
   );
 };
 
-/* ── Device Detail Modal ─────────────────────────────────────────── */
 const DeviceDetailModal: React.FC<{
   device: TrackingDevice;
   theme: PageTheme;
@@ -796,7 +896,6 @@ const DeviceDetailModal: React.FC<{
         className={`${t.bgModal} rounded-2xl w-full max-w-lg max-h-[85vh] overflow-y-auto border ${t.border} shadow-2xl`}
         onClick={(e) => e.stopPropagation()}
       >
-        {/* header */}
         <div className="p-5 rounded-t-2xl text-white" style={{ background: `linear-gradient(135deg, ${isProvider ? t.primary : t.secondary}, ${isProvider ? t.primaryDark : (t.secondaryLight || t.secondary)})` }}>
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
@@ -827,7 +926,6 @@ const DeviceDetailModal: React.FC<{
           </div>
         </div>
 
-        {/* body */}
         <div className="p-4 space-y-1">
           {rows.map((r) => (
             <div key={r.label} className={`flex items-center gap-3 px-3 py-2.5 rounded-lg ${t.bgCardHover} transition-colors group`}>
@@ -855,7 +953,245 @@ const DeviceDetailModal: React.FC<{
   );
 };
 
-/* ── Pagination ──────────────────────────────────────────────────── */
+/* ✨ MAP PERSON DETAIL MODAL — opened when a user clicks a map pin */
+const MapPersonDetailModal: React.FC<{
+  person: EnrichedPersonDetail;
+  loading: boolean;
+  errorMessage: string | null;
+  theme: PageTheme;
+  copiedField: string;
+  onCopy: (label: string, text: string) => void;
+  onClose: () => void;
+}> = ({ person, loading, errorMessage, theme: t, copiedField, onCopy, onClose }) => {
+  const isProvider = person.type === 'provider';
+  const isLead = person.type === 'lead';
+  const isCustomer = person.type === 'customer';
+
+  const ratingValue =
+    typeof person.rating === 'number'
+      ? person.rating
+      : (person.rating && typeof person.rating === 'object' ? (person.rating as any).average : undefined);
+  const ratingCount =
+    typeof person.rating === 'object' && person.rating ? (person.rating as any).count : person.totalRatings;
+
+  const walletBalance =
+    person.wallet && typeof person.wallet === 'object'
+      ? (person.wallet as any).balance
+      : person.walletBalance;
+
+  const totalEarnings =
+    person.wallet && typeof person.wallet === 'object'
+      ? (person.wallet as any).totalEarnings
+      : person.totalEarnings;
+
+  const avatarUrl = person.profilePicture || person.profileImage || null;
+  const displayName = person.name || (isProvider ? person.providerId : person.userId) || person.email || 'Unknown';
+
+  const headerGradient = isProvider
+    ? `linear-gradient(135deg, ${t.primary}, ${t.primaryDark})`
+    : isLead
+    ? `linear-gradient(135deg, ${t.accent}, ${t.accentLight})`
+    : `linear-gradient(135deg, ${t.secondary}, ${t.secondaryLight || t.secondary})`;
+
+  const rows: {
+    icon: React.ReactNode;
+    label: string;
+    value: string;
+    copyable?: boolean;
+    highlight?: boolean;
+  }[] = [];
+
+  if (person.name) rows.push({ icon: <User className="w-3.5 h-3.5" />, label: 'Name', value: person.name, highlight: true });
+  if (person.email) rows.push({ icon: <Mail className="w-3.5 h-3.5" />, label: 'Email', value: person.email, copyable: true });
+  if (person.phone) rows.push({ icon: <Phone className="w-3.5 h-3.5" />, label: 'Phone', value: person.phone, copyable: true });
+  if (person.gender) rows.push({ icon: <User className="w-3.5 h-3.5" />, label: 'Gender', value: person.gender });
+
+  if (isProvider) {
+    if (person.profession) rows.push({ icon: <Wrench className="w-3.5 h-3.5" />, label: 'Profession', value: person.profession });
+    if (ratingValue != null) rows.push({ icon: <Star className="w-3.5 h-3.5" />, label: 'Rating', value: `⭐ ${Number(ratingValue).toFixed(1)}${ratingCount ? ` (${ratingCount} reviews)` : ''}` });
+    if (person.completedJobs != null) rows.push({ icon: <CheckCircle2 className="w-3.5 h-3.5" />, label: 'Completed Jobs', value: String(person.completedJobs) });
+    if (person.totalBookings != null) rows.push({ icon: <Activity className="w-3.5 h-3.5" />, label: 'Total Bookings', value: String(person.totalBookings) });
+    if (walletBalance != null) rows.push({ icon: <Shield className="w-3.5 h-3.5" />, label: 'Wallet Balance', value: `₹${Number(walletBalance).toLocaleString('en-IN')}` });
+    if (totalEarnings != null) rows.push({ icon: <Shield className="w-3.5 h-3.5" />, label: 'Total Earnings', value: `₹${Number(totalEarnings).toLocaleString('en-IN')}` });
+    if (person.verificationStatus) rows.push({ icon: <Shield className="w-3.5 h-3.5" />, label: 'Verification', value: person.verificationStatus });
+    if (person.serviceRadius != null) rows.push({ icon: <MapPin className="w-3.5 h-3.5" />, label: 'Service Radius', value: `${person.serviceRadius} km` });
+    if (person.providerId) rows.push({ icon: <Users className="w-3.5 h-3.5" />, label: 'Provider ID', value: person.providerId, copyable: true });
+  }
+
+  if (isCustomer) {
+    if (person.userId || person._id) rows.push({ icon: <Users className="w-3.5 h-3.5" />, label: 'User ID', value: person.userId || person._id || '—', copyable: true });
+  }
+
+  if (person.city) rows.push({ icon: <MapPin className="w-3.5 h-3.5" />, label: 'City', value: person.city });
+
+  if (person.deviceId) rows.push({ icon: <Smartphone className="w-3.5 h-3.5" />, label: 'Device ID', value: person.deviceId, copyable: true });
+  if (person.platform) rows.push({ icon: <Monitor className="w-3.5 h-3.5" />, label: 'Platform', value: person.platform });
+  if (person.appVersion) rows.push({ icon: <Activity className="w-3.5 h-3.5" />, label: 'App Version', value: person.appVersion });
+
+  if (person.lat != null && person.lng != null) {
+    rows.push({
+      icon: <MapPin className="w-3.5 h-3.5" />,
+      label: 'Coordinates',
+      value: `${person.lat.toFixed(5)}, ${person.lng.toFixed(5)}`,
+      copyable: true,
+    });
+  }
+
+  if (person.lastSeenAt) rows.push({ icon: <Clock className="w-3.5 h-3.5" />, label: 'Last Seen', value: `${fmtDate(person.lastSeenAt)} (${timeAgo(person.lastSeenAt)})` });
+  if (person.lastLogin) rows.push({ icon: <Clock className="w-3.5 h-3.5" />, label: 'Last Login', value: fmtDate(person.lastLogin) });
+  if (person.createdAt) rows.push({ icon: <Clock className="w-3.5 h-3.5" />, label: 'Registered', value: fmtDate(person.createdAt) });
+
+  if (isProvider) {
+    if (person.isAvailable != null) rows.push({ icon: <Activity className="w-3.5 h-3.5" />, label: 'Available', value: person.isAvailable ? '✅ Yes' : '❌ No' });
+    if (person.isOnline != null) rows.push({ icon: <Wifi className="w-3.5 h-3.5" />, label: 'Online', value: person.isOnline ? '✅ Yes' : '❌ No' });
+    if (person.isVerified != null) rows.push({ icon: <Shield className="w-3.5 h-3.5" />, label: 'Verified', value: person.isVerified ? '✅ Yes' : '❌ No' });
+    if (person.isBlocked != null) rows.push({ icon: <Shield className="w-3.5 h-3.5" />, label: 'Blocked', value: person.isBlocked ? '🚫 Yes' : '✅ No' });
+  }
+  if (person.isActive != null) rows.push({ icon: <Activity className="w-3.5 h-3.5" />, label: 'Account Active', value: person.isActive ? '✅ Yes' : '❌ No' });
+  if (person.isServiceable != null) rows.push({ icon: <Shield className="w-3.5 h-3.5" />, label: 'Serviceable', value: person.isServiceable ? '✅ Yes' : '❌ No' });
+
+  if (person.fcmToken) {
+    rows.push({
+      icon: <Shield className="w-3.5 h-3.5" />,
+      label: 'FCM Token',
+      value: `${person.fcmToken.slice(0, 6)}…${person.fcmToken.slice(-4)}`,
+      copyable: true,
+    });
+  }
+
+  return (
+    <div className={`fixed inset-0 z-[9999] flex items-center justify-center p-4 ${t.bgOverlay}`} onClick={onClose}>
+      <div
+        className={`${t.bgModal} rounded-2xl w-full max-w-xl max-h-[90vh] overflow-y-auto border ${t.border} shadow-2xl`}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="p-5 rounded-t-2xl text-white relative" style={{ background: headerGradient }}>
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-center gap-3 min-w-0 flex-1">
+              <div className="w-16 h-16 rounded-2xl bg-white/20 flex items-center justify-center text-3xl shrink-0 overflow-hidden border-2 border-white/30">
+                {avatarUrl ? (
+                  <img
+                    src={avatarUrl}
+                    alt={displayName}
+                    className="w-full h-full object-cover"
+                    onError={(e) => {
+                      (e.currentTarget as HTMLImageElement).style.display = 'none';
+                    }}
+                  />
+                ) : (
+                  <span>{isProvider ? '🔧' : isLead ? '📧' : '👤'}</span>
+                )}
+              </div>
+
+              <div className="min-w-0 flex-1">
+                <div className="font-bold text-lg truncate">{displayName}</div>
+                <div className="text-white/80 text-xs font-medium uppercase tracking-wider">
+                  {isProvider ? 'Provider' : isLead ? 'Lead' : 'Customer'}
+                </div>
+                {person.email && (
+                  <div className="text-white/70 text-xs mt-1 truncate">{person.email}</div>
+                )}
+                {person.phone && (
+                  <div className="text-white/70 text-xs flex items-center gap-1 mt-0.5">
+                    <Phone className="w-3 h-3" /> {person.phone}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <button
+              onClick={onClose}
+              className="w-9 h-9 rounded-lg bg-white/20 flex items-center justify-center hover:bg-white/30 transition shrink-0"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          <div className="flex items-center gap-2 mt-3">
+            {person.active ? (
+              <>
+                <span className="w-2.5 h-2.5 rounded-full bg-green-400 animate-pulse shadow-lg shadow-green-400/50" />
+                <span className="text-sm font-semibold text-green-100">Currently Active on Map</span>
+              </>
+            ) : (
+              <>
+                <span className="w-2.5 h-2.5 rounded-full bg-red-400" />
+                <span className="text-sm font-semibold text-red-100">Offline</span>
+              </>
+            )}
+            {loading && (
+              <span className="ml-auto flex items-center gap-1.5 text-xs text-white/80">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading full profile…
+              </span>
+            )}
+          </div>
+        </div>
+
+        {errorMessage && (
+          <div className="mx-4 mt-3 p-2.5 rounded-lg bg-yellow-500/10 border border-yellow-500/30 text-yellow-500 text-xs">
+            ⚠️ {errorMessage}
+          </div>
+        )}
+
+        <div className="p-4 space-y-1">
+          {rows.length === 0 ? (
+            <div className={`text-center py-8 ${t.textSecondary} text-sm`}>No details available</div>
+          ) : (
+            rows.map((r, idx) => (
+              <div
+                key={`${r.label}-${idx}`}
+                className={`flex items-center gap-3 px-3 py-2.5 rounded-lg ${t.bgCardHover} transition-colors group`}
+              >
+                <span style={{ color: r.highlight ? t.primary : t.primaryLight }}>{r.icon}</span>
+                <span className={`text-xs font-medium ${t.textSecondary} w-32 shrink-0`}>{r.label}</span>
+                <span
+                  className={`text-xs ${r.highlight ? 'font-bold' : 'font-semibold'} ${t.textPrimary} flex-1 truncate`}
+                  title={r.value}
+                >
+                  {r.value}
+                </span>
+                {r.copyable && r.value !== '—' && (
+                  <button
+                    onClick={() => onCopy(r.label, r.value)}
+                    className="opacity-0 group-hover:opacity-100 transition-opacity shrink-0"
+                    title="Copy"
+                  >
+                    {copiedField === r.label ? (
+                      <CheckCircle2 className="w-3.5 h-3.5 text-green-400" />
+                    ) : (
+                      <Copy className={`w-3.5 h-3.5 ${t.textMuted}`} />
+                    )}
+                  </button>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+
+        <div className={`p-4 border-t ${t.border} flex items-center justify-end gap-2`}>
+          {person.lat != null && person.lng != null && (
+            <a
+              href={`https://www.google.com/maps?q=${person.lat},${person.lng}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="px-4 py-2 rounded-lg text-xs font-semibold text-white transition-all hover:scale-105"
+              style={{ background: t.primary }}
+            >
+              📍 Open in Google Maps
+            </a>
+          )}
+          <button
+            onClick={onClose}
+            className={`px-4 py-2 rounded-lg text-xs font-semibold ${t.pillInactiveBg} ${t.textSecondary} hover:scale-105 transition-all`}
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const Pagination: React.FC<{
   page: number;
   total: number;
