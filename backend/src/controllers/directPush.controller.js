@@ -1,158 +1,365 @@
 // backend/src/controllers/directPush.controller.js
-// 🚀 Direct Push Controller — full feature set with detailed error reporting
+// Direct FCM Push Controller — with FCM token browser for users & providers
+// v3.0 — Added listFcmUsers, listFcmProviders, auto-cleanup dead tokens
 
-const DirectPushLog = require('../models/DirectPushLog');
+const mongoose = require('mongoose');
+const DirectPushLog = require('../models/directPushLog.model');
+const { getUserConnection, getProviderModel } = require('../config/database');
 const {
   sendToSingleToken,
   sendToManyTokens,
-  normalizeTokens,
+  normalizeTokens
 } = require('../services/directPushSender');
 
-const database = require('../config/database');
-
-/**
- * Safely get provider model
- */
+// ────────────────────────────────────────────────────────────────
+// Safe model accessors
+// ────────────────────────────────────────────────────────────────
 function getProviderModelSafe() {
   try {
-    if (typeof database.getProviderModel === 'function') {
-      return database.getProviderModel();
-    }
-  } catch (e) {}
-  return null;
+    return getProviderModel();
+  } catch (err) {
+    console.error('[DirectPush] Provider model unavailable:', err.message);
+    return null;
+  }
 }
 
-/**
- * Safely get user collection (raw) — users schema uses fcmTokens[] array
- */
 function getUserCollectionSafe() {
   try {
-    if (typeof database.getUserConnection === 'function') {
-      const conn = database.getUserConnection();
-      if (conn && conn.collection) return conn.collection('users');
-    }
-  } catch (e) {}
-  return null;
+    const conn = getUserConnection();
+    if (!conn) return null;
+    return conn.collection('users');
+  } catch (err) {
+    console.error('[DirectPush] User collection unavailable:', err.message);
+    return null;
+  }
 }
 
-/**
- * Collect FCM tokens from all active providers
- * Provider schema: single `fcmToken` field (string)
- */
+// ────────────────────────────────────────────────────────────────
+// Token collectors
+// ────────────────────────────────────────────────────────────────
 async function collectProviderTokens() {
   const Provider = getProviderModelSafe();
-  if (!Provider) {
-    console.warn('[DirectPush] ⚠️  Provider model unavailable');
-    return [];
-  }
-  try {
-    const providers = await Provider.find({
+  if (!Provider) return [];
+
+  const providers = await Provider.find(
+    {
       fcmToken: { $exists: true, $ne: null, $ne: '' },
-      isActive: true,
-    }).select('fcmToken providerId email name').lean();
+      isActive: true
+    },
+    { fcmToken: 1, _id: 1, providerId: 1, name: 1 }
+  ).lean();
 
-    const tokens = providers
-      .map(p => (p.fcmToken || '').trim())
-      .filter(Boolean);
-
-    console.log(`[DirectPush] 📱 Collected ${tokens.length} provider tokens (from ${providers.length} providers)`);
-    return tokens;
-  } catch (e) {
-    console.error('[DirectPush] ❌ collectProviderTokens error:', e.message);
-    return [];
-  }
+  return providers
+    .map(p => p.fcmToken)
+    .filter(Boolean);
 }
 
-/**
- * 🔥 FIXED: Collect FCM tokens from all active users
- * User schema: fcmTokens: [{ token: "...", isActive: true, platform: "android", ... }]
- * (NOT a single fcmToken field — it's an ARRAY of objects)
- */
 async function collectUserTokens() {
-  const coll = getUserCollectionSafe();
-  if (!coll) {
-    console.warn('[DirectPush] ⚠️  Users collection unavailable');
-    return [];
-  }
-  try {
-    // Query users who have at least one active token in the fcmTokens array
-    const cursor = coll.find({
+  const users = getUserCollectionSafe();
+  if (!users) return [];
+
+  const docs = await users.find(
+    {
       fcmTokens: {
         $elemMatch: {
           token: { $exists: true, $ne: null, $ne: '' },
-          isActive: true,
-        },
-      },
-      $or: [{ isActive: { $exists: false } }, { isActive: true }],
-    }, { projection: { fcmTokens: 1, name: 1, email: 1 } });
-
-    const tokens = [];
-    let userCount = 0;
-    await cursor.forEach(doc => {
-      userCount++;
-      if (!Array.isArray(doc.fcmTokens)) return;
-      for (const entry of doc.fcmTokens) {
-        if (!entry || entry.isActive === false) continue;
-        const t = (entry.token || '').toString().trim();
-        if (t) tokens.push(t);
+          isActive: true
+        }
       }
-    });
+    },
+    { projection: { fcmTokens: 1, _id: 1, email: 1 } }
+  ).toArray();
 
-    // Deduplicate
-    const unique = Array.from(new Set(tokens));
-
-    console.log(`[DirectPush] 📱 Collected ${unique.length} user tokens from ${userCount} users (fcmTokens[] array)`);
-    return unique;
-  } catch (e) {
-    console.error('[DirectPush] ❌ collectUserTokens error:', e.message);
-    return [];
-  }
-}
-
-/**
- * Collect token for a specific provider by _id or providerId
- */
-async function collectSpecificProviderTokens(providerIds) {
-  const Provider = getProviderModelSafe();
-  if (!Provider) return [];
-  if (!Array.isArray(providerIds)) providerIds = [providerIds];
-
-  try {
-    const mongoose = require('mongoose');
-    const objectIds = [];
-    const codes = [];
-    for (const id of providerIds) {
-      if (!id) continue;
-      const s = String(id).trim();
-      if (mongoose.Types.ObjectId.isValid(s) && s.length === 24) {
-        objectIds.push(new mongoose.Types.ObjectId(s));
-      } else {
-        codes.push(s);
+  const allTokens = [];
+  for (const doc of docs) {
+    if (!Array.isArray(doc.fcmTokens)) continue;
+    for (const entry of doc.fcmTokens) {
+      if (entry && entry.token && entry.isActive !== false) {
+        allTokens.push(entry.token);
       }
     }
+  }
 
-    const or = [];
-    if (objectIds.length) or.push({ _id: { $in: objectIds } });
-    if (codes.length) or.push({ providerId: { $in: codes } });
-    if (or.length === 0) return [];
+  return Array.from(new Set(allTokens));
+}
 
-    const providers = await Provider.find({
-      $or: or,
-      fcmToken: { $exists: true, $ne: null, $ne: '' },
-    }).select('fcmToken providerId').lean();
+async function collectSpecificProviderTokens(providerIdOrArray) {
+  const Provider = getProviderModelSafe();
+  if (!Provider) return [];
 
-    return providers.map(p => (p.fcmToken || '').trim()).filter(Boolean);
-  } catch (e) {
-    console.error('[DirectPush] ❌ collectSpecificProviderTokens error:', e.message);
-    return [];
+  const ids = Array.isArray(providerIdOrArray) ? providerIdOrArray : [providerIdOrArray];
+  const objectIds = [];
+  const codeIds = [];
+
+  for (const id of ids) {
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      objectIds.push(new mongoose.Types.ObjectId(id));
+    } else {
+      codeIds.push(id);
+    }
+  }
+
+  const query = { $or: [] };
+  if (objectIds.length) query.$or.push({ _id: { $in: objectIds } });
+  if (codeIds.length) query.$or.push({ providerId: { $in: codeIds } });
+
+  if (!query.$or.length) return [];
+
+  const providers = await Provider.find(
+    { ...query, fcmToken: { $exists: true, $ne: null, $ne: '' } },
+    { fcmToken: 1 }
+  ).lean();
+
+  return providers.map(p => p.fcmToken).filter(Boolean);
+}
+
+// ────────────────────────────────────────────────────────────────
+// AUTO-CLEANUP: Remove dead tokens from database
+// ────────────────────────────────────────────────────────────────
+async function cleanupDeadTokens(failures) {
+  if (!Array.isArray(failures) || failures.length === 0) return { users: 0, providers: 0 };
+
+  const deadTokens = failures
+    .filter(f => f && f.invalidToken && f.token)
+    .map(f => f.token);
+
+  if (deadTokens.length === 0) return { users: 0, providers: 0 };
+
+  console.log(`[DirectPush] 🧹 Auto-cleaning ${deadTokens.length} dead token(s) from DB...`);
+
+  let usersCleaned = 0;
+  let providersCleaned = 0;
+
+  // Clean from users.fcmTokens[] array
+  try {
+    const users = getUserCollectionSafe();
+    if (users) {
+      const result = await users.updateMany(
+        { 'fcmTokens.token': { $in: deadTokens } },
+        {
+          $pull: {
+            fcmTokens: { token: { $in: deadTokens } }
+          }
+        }
+      );
+      usersCleaned = result.modifiedCount || 0;
+      if (usersCleaned > 0) {
+        console.log(`[DirectPush] ✅ Removed dead tokens from ${usersCleaned} user(s)`);
+      }
+    }
+  } catch (err) {
+    console.error('[DirectPush] ❌ User cleanup error:', err.message);
+  }
+
+  // Clean from providers.fcmToken (single field)
+  try {
+    const Provider = getProviderModelSafe();
+    if (Provider) {
+      const result = await Provider.updateMany(
+        { fcmToken: { $in: deadTokens } },
+        { $unset: { fcmToken: 1 } }
+      );
+      providersCleaned = result.modifiedCount || 0;
+      if (providersCleaned > 0) {
+        console.log(`[DirectPush] ✅ Removed dead tokens from ${providersCleaned} provider(s)`);
+      }
+    }
+  } catch (err) {
+    console.error('[DirectPush] ❌ Provider cleanup error:', err.message);
+  }
+
+  return { users: usersCleaned, providers: providersCleaned };
+}
+
+// ────────────────────────────────────────────────────────────────
+// LIST USERS WITH FCM TOKENS
+// ────────────────────────────────────────────────────────────────
+async function listFcmUsers(req, res) {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const skip = (page - 1) * limit;
+    const search = (req.query.search || '').trim();
+
+    const users = getUserCollectionSafe();
+    if (!users) {
+      return res.json({ success: true, users: [], total: 0, page, limit });
+    }
+
+    // Build query — users who have at least one active FCM token
+    const matchQuery = {
+      fcmTokens: {
+        $elemMatch: {
+          token: { $exists: true, $ne: null, $ne: '' },
+          isActive: true
+        }
+      }
+    };
+
+    // Add search filter
+    if (search.length >= 2) {
+      const regex = new RegExp(search, 'i');
+      matchQuery.$or = [
+        { name: regex },
+        { email: regex },
+        { phone: regex }
+      ];
+    }
+
+    const [docs, total] = await Promise.all([
+      users.find(matchQuery, {
+        projection: {
+          name: 1,
+          email: 1,
+          phone: 1,
+          profilePicture: 1,
+          isActive: 1,
+          lastLogin: 1,
+          createdAt: 1,
+          fcmTokens: 1
+        }
+      })
+        .sort({ lastLogin: -1, createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .toArray(),
+      users.countDocuments(matchQuery)
+    ]);
+
+    const result = docs.map(doc => {
+      const activeTokens = (doc.fcmTokens || []).filter(
+        t => t && t.token && t.isActive !== false
+      );
+      return {
+        _id: doc._id.toString(),
+        name: doc.name || 'Unknown',
+        email: doc.email || '',
+        phone: doc.phone || '',
+        profilePicture: doc.profilePicture || null,
+        isActive: doc.isActive !== false,
+        lastLogin: doc.lastLogin || doc.createdAt || null,
+        tokenCount: activeTokens.length,
+        tokens: activeTokens.map(t => ({
+          token: t.token,
+          platform: t.platform || 'unknown',
+          deviceId: t.deviceId || null,
+          deviceModel: t.deviceInfo?.model || null,
+          appVersion: t.deviceInfo?.appVersion || null,
+          createdAt: t.createdAt || null,
+          lastUsedAt: t.lastUsedAt || null
+        }))
+      };
+    });
+
+    return res.json({
+      success: true,
+      users: result,
+      total,
+      page,
+      limit,
+      pages: Math.ceil(total / limit)
+    });
+  } catch (err) {
+    console.error('[DirectPush] listFcmUsers error:', err);
+    return res.status(500).json({ success: false, message: err.message });
   }
 }
 
-// ============================================================
-// POST /api/v1/admin/direct-push/send
-// ============================================================
-exports.sendDirectPush = async (req, res) => {
-  const startedAt = Date.now();
+// ────────────────────────────────────────────────────────────────
+// LIST PROVIDERS WITH FCM TOKENS
+// ────────────────────────────────────────────────────────────────
+async function listFcmProviders(req, res) {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const skip = (page - 1) * limit;
+    const search = (req.query.search || '').trim();
+
+    const Provider = getProviderModelSafe();
+    if (!Provider) {
+      return res.json({ success: true, providers: [], total: 0, page, limit });
+    }
+
+    // Build query — providers who have an fcmToken
+    const matchQuery = {
+      fcmToken: { $exists: true, $ne: null, $ne: '' }
+    };
+
+    // Add search filter
+    if (search.length >= 2) {
+      const regex = new RegExp(search, 'i');
+      matchQuery.$or = [
+        { name: regex },
+        { email: regex },
+        { phone: regex },
+        { providerId: regex },
+        { profession: regex },
+        { city: regex }
+      ];
+    }
+
+    const [docs, total] = await Promise.all([
+      Provider.find(matchQuery, {
+        name: 1,
+        email: 1,
+        phone: 1,
+        providerId: 1,
+        profession: 1,
+        city: 1,
+        profilePicture: 1,
+        isActive: 1,
+        isOnline: 1,
+        isAvailable: 1,
+        lastLogin: 1,
+        lastOnlineAt: 1,
+        createdAt: 1,
+        fcmToken: 1,
+        verificationStatus: 1
+      })
+        .sort({ lastLogin: -1, lastOnlineAt: -1, createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Provider.countDocuments(matchQuery)
+    ]);
+
+    const result = docs.map(doc => ({
+      _id: doc._id.toString(),
+      providerId: doc.providerId || '',
+      name: doc.name || 'Unknown',
+      email: doc.email || '',
+      phone: doc.phone || '',
+      profession: doc.profession || '',
+      city: doc.city || '',
+      profilePicture: doc.profilePicture || null,
+      isActive: doc.isActive !== false,
+      isOnline: !!doc.isOnline,
+      isAvailable: !!doc.isAvailable,
+      verificationStatus: doc.verificationStatus || 'pending',
+      lastLogin: doc.lastLogin || doc.lastOnlineAt || doc.createdAt || null,
+      token: doc.fcmToken,
+      tokenPreview: doc.fcmToken ? doc.fcmToken.substring(0, 20) + '...' : null
+    }));
+
+    return res.json({
+      success: true,
+      providers: result,
+      total,
+      page,
+      limit,
+      pages: Math.ceil(total / limit)
+    });
+  } catch (err) {
+    console.error('[DirectPush] listFcmProviders error:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+}
+
+// ────────────────────────────────────────────────────────────────
+// Main send controller
+// ────────────────────────────────────────────────────────────────
+async function sendDirectPush(req, res) {
+  const startTime = Date.now();
   const {
     title,
     body,
@@ -163,39 +370,72 @@ exports.sendDirectPush = async (req, res) => {
     token,
     tokens,
     providerId,
-    providerIds,
-  } = req.body || {};
+    providerIds
+  } = req.body;
 
-  // ---- Validation ----
-  if (!title || !String(title).trim()) {
-    return res.status(400).json({ success: false, message: 'Title is required' });
-  }
-  if (!body || !String(body).trim()) {
-    return res.status(400).json({ success: false, message: 'Body is required' });
-  }
-  if (!targetMode) {
-    return res.status(400).json({ success: false, message: 'targetMode is required' });
-  }
-
-  console.log(`\n[DirectPush] 🚀 NEW SEND REQUEST`);
+  console.log('\n[DirectPush] 🚀 NEW SEND REQUEST');
   console.log(`[DirectPush]   Mode: ${targetMode}`);
   console.log(`[DirectPush]   Title: ${title}`);
   console.log(`[DirectPush]   Body: ${body}`);
+  if (customData && Object.keys(customData).length > 0) {
+    console.log(`[DirectPush]   CustomData keys: ${Object.keys(customData).join(', ')}`);
+  }
 
-  // ---- Collect target tokens ----
+  // Validation
+  if (!title || !body) {
+    return res.status(400).json({
+      success: false,
+      message: 'title and body are required'
+    });
+  }
+
+  if (!targetMode) {
+    return res.status(400).json({
+      success: false,
+      message: 'targetMode is required (single/multiple/all_providers/all_users/specific_provider/specific_providers)'
+    });
+  }
+
+  // Parse customData — accept both string and object
+  let parsedCustomData = {};
+  if (customData) {
+    try {
+      if (typeof customData === 'string') {
+        parsedCustomData = JSON.parse(customData);
+      } else if (typeof customData === 'object' && !Array.isArray(customData)) {
+        parsedCustomData = customData;
+      }
+      // Ensure all values are strings (FCM requirement)
+      const stringified = {};
+      for (const [key, val] of Object.entries(parsedCustomData)) {
+        if (val === null || val === undefined) continue;
+        stringified[key] = typeof val === 'string' ? val : JSON.stringify(val);
+      }
+      parsedCustomData = stringified;
+    } catch (err) {
+      console.error('[DirectPush] ⚠️ customData parse error:', err.message);
+      return res.status(400).json({
+        success: false,
+        message: 'customData must be a valid JSON object: ' + err.message
+      });
+    }
+  }
+
+  // Collect target tokens
   let targetTokens = [];
+
   try {
     switch (targetMode) {
       case 'single':
         if (!token) {
-          return res.status(400).json({ success: false, message: 'token required for single mode' });
+          return res.status(400).json({ success: false, message: 'token is required for single mode' });
         }
-        targetTokens = [String(token).trim()];
+        targetTokens = [token];
         break;
 
       case 'multiple':
-        if (!tokens || !Array.isArray(tokens) || tokens.length === 0) {
-          return res.status(400).json({ success: false, message: 'tokens array required for multiple mode' });
+        if (!Array.isArray(tokens) || tokens.length === 0) {
+          return res.status(400).json({ success: false, message: 'tokens array is required for multiple mode' });
         }
         targetTokens = normalizeTokens(tokens);
         break;
@@ -210,266 +450,265 @@ exports.sendDirectPush = async (req, res) => {
 
       case 'specific_provider':
         if (!providerId) {
-          return res.status(400).json({ success: false, message: 'providerId required' });
+          return res.status(400).json({ success: false, message: 'providerId is required for specific_provider mode' });
         }
-        targetTokens = await collectSpecificProviderTokens([providerId]);
+        targetTokens = await collectSpecificProviderTokens(providerId);
         break;
 
       case 'specific_providers':
-        if (!providerIds || !Array.isArray(providerIds) || providerIds.length === 0) {
-          return res.status(400).json({ success: false, message: 'providerIds array required' });
+        if (!Array.isArray(providerIds) || providerIds.length === 0) {
+          return res.status(400).json({ success: false, message: 'providerIds array is required for specific_providers mode' });
         }
         targetTokens = await collectSpecificProviderTokens(providerIds);
         break;
 
       default:
-        return res.status(400).json({ success: false, message: `Invalid targetMode: ${targetMode}` });
+        return res.status(400).json({ success: false, message: `Unknown targetMode: ${targetMode}` });
     }
-  } catch (e) {
-    console.error('[DirectPush] ❌ Token collection failed:', e);
+  } catch (err) {
+    console.error('[DirectPush] ❌ Token collection error:', err);
     return res.status(500).json({
       success: false,
       message: 'Failed to collect target tokens',
-      error: e.message,
+      error: err.message
     });
   }
 
-  targetTokens = normalizeTokens(targetTokens);
   console.log(`[DirectPush] 🎯 Final target count: ${targetTokens.length}`);
 
   if (targetTokens.length === 0) {
-    const durationMs = Date.now() - startedAt;
-    try {
-      await DirectPushLog.create({
-        title, body, imageUrl: imageUrl || null, clickAction: clickAction || null,
-        customData: customData || {},
-        targetMode, targetCount: 0, successCount: 0, failureCount: 0, invalidTokenCount: 0,
-        failures: [], successes: [],
-        status: 'failed',
-        sentBy: {
-          adminId: req.admin?.adminId,
-          email: req.admin?.email,
-          name: req.admin?.name,
-        },
-        startedAt: new Date(startedAt),
-        completedAt: new Date(),
-        durationMs,
-        errorMessage: 'No valid FCM tokens found for target',
-      });
-    } catch (e) { console.error('[DirectPush] log save error:', e.message); }
-
     return res.status(400).json({
       success: false,
-      message: 'No valid FCM tokens found for the selected target',
-      data: { targetCount: 0, successCount: 0, failureCount: 0 },
+      message: 'No valid tokens found for the selected target'
     });
   }
 
-  // ---- Create pending log ----
+  // Create pending log
+  const adminId = req.admin?.adminId || req.admin?._id || null;
+  const adminEmail = req.admin?.email || 'unknown';
+  const adminName = req.admin?.name || 'unknown';
+
   let logDoc;
   try {
     logDoc = await DirectPushLog.create({
-      title, body, imageUrl: imageUrl || null, clickAction: clickAction || null,
-      customData: customData || {},
+      adminId,
+      adminEmail,
+      adminName,
+      title,
+      body,
+      imageUrl: imageUrl || null,
+      clickAction: clickAction || null,
+      customData: parsedCustomData,
       targetMode,
       targetCount: targetTokens.length,
-      successCount: 0, failureCount: 0, invalidTokenCount: 0,
-      failures: [], successes: [],
-      status: 'sending',
-      sentBy: {
-        adminId: req.admin?.adminId,
-        email: req.admin?.email,
-        name: req.admin?.name,
-      },
-      startedAt: new Date(startedAt),
+      status: 'pending',
+      createdAt: new Date()
     });
-  } catch (e) {
-    console.error('[DirectPush] ⚠️  Could not create log (continuing):', e.message);
+  } catch (err) {
+    console.error('[DirectPush] ❌ Log creation failed:', err);
   }
 
-  // ---- Send ----
+  // Send notifications
   let result;
   try {
     if (targetTokens.length === 1) {
-      const r = await sendToSingleToken(targetTokens[0], {
-        title, body, imageUrl, clickAction, customData,
+      result = await sendToSingleToken(targetTokens[0], {
+        title,
+        body,
+        imageUrl,
+        clickAction,
+        data: parsedCustomData
       });
-      result = {
-        total: 1,
-        successCount: r.success ? 1 : 0,
-        failureCount: r.success ? 0 : 1,
-        invalidTokenCount: r.invalidToken ? 1 : 0,
-        successes: r.success ? [{ token: r.token, messageId: r.messageId, firebaseProject: r.firebaseProject }] : [],
-        failures: r.success ? [] : [{ token: r.token, error: r.error, invalidToken: r.invalidToken }],
-      };
+
+      // Normalize single-token result into bulk format
+      if (result.success) {
+        result = {
+          successCount: 1,
+          failureCount: 0,
+          invalidTokenCount: 0,
+          successes: [{ token: targetTokens[0], messageId: result.messageId, firebaseProject: result.firebaseProject }],
+          failures: []
+        };
+      } else {
+        result = {
+          successCount: 0,
+          failureCount: 1,
+          invalidTokenCount: result.invalidToken ? 1 : 0,
+          successes: [],
+          failures: [{
+            token: targetTokens[0],
+            error: result.errors?.[0]?.message || result.error || 'Unknown error',
+            code: result.errors?.[0]?.code || result.code || 'unknown',
+            invalidToken: !!result.invalidToken
+          }]
+        };
+      }
     } else {
       result = await sendToManyTokens(targetTokens, {
-        title, body, imageUrl, clickAction, customData,
+        title,
+        body,
+        imageUrl,
+        clickAction,
+        data: parsedCustomData
       });
     }
-  } catch (e) {
-    console.error('[DirectPush] ❌ FATAL send error:', e);
+  } catch (err) {
+    console.error('[DirectPush] ❌ Send failed:', err);
     if (logDoc) {
-      try {
-        logDoc.status = 'failed';
-        logDoc.errorMessage = e.message;
-        logDoc.completedAt = new Date();
-        logDoc.durationMs = Date.now() - startedAt;
-        await logDoc.save();
-      } catch {}
+      await DirectPushLog.findByIdAndUpdate(logDoc._id, {
+        status: 'failed',
+        error: err.message,
+        durationMs: Date.now() - startTime,
+        completedAt: new Date()
+      });
     }
     return res.status(500).json({
       success: false,
-      message: 'Send failed catastrophically',
-      error: e.message,
-      stack: process.env.NODE_ENV !== 'production' ? e.stack : undefined,
+      message: 'Send failed',
+      error: err.message
     });
   }
 
-  const durationMs = Date.now() - startedAt;
+  const durationMs = Date.now() - startTime;
   const finalStatus =
-    result.failureCount === 0
-      ? 'completed'
-      : result.successCount === 0
-        ? 'failed'
-        : 'completed_with_errors';
+    result.successCount > 0 && result.failureCount === 0 ? 'completed'
+    : result.successCount > 0 ? 'partial'
+    : 'failed';
 
-  // ---- Update log ----
+  // AUTO-CLEANUP dead tokens
+  const cleanupResult = await cleanupDeadTokens(result.failures || []);
+
+  // Update log
   if (logDoc) {
     try {
-      logDoc.successCount = result.successCount;
-      logDoc.failureCount = result.failureCount;
-      logDoc.invalidTokenCount = result.invalidTokenCount || 0;
-      logDoc.failures = (result.failures || []).slice(0, 100).map(f => ({
-        token: f.token,
-        errorCode: f.error?.code || 'unknown',
-        errorMessage: f.error?.message || 'Unknown',
-        invalidToken: !!f.invalidToken,
-      }));
-      logDoc.successes = (result.successes || []).slice(0, 100).map(s => ({
-        token: s.token,
-        messageId: s.messageId,
-      }));
-      logDoc.status = finalStatus;
-      logDoc.completedAt = new Date();
-      logDoc.durationMs = durationMs;
-      await logDoc.save();
-    } catch (e) {
-      console.error('[DirectPush] ⚠️  log update error:', e.message);
+      await DirectPushLog.findByIdAndUpdate(logDoc._id, {
+        status: finalStatus,
+        successCount: result.successCount || 0,
+        failureCount: result.failureCount || 0,
+        invalidTokenCount: result.invalidTokenCount || 0,
+        successes: (result.successes || []).slice(0, 100),
+        failures: (result.failures || []).slice(0, 100),
+        durationMs,
+        cleanedUpUsers: cleanupResult.users,
+        cleanedUpProviders: cleanupResult.providers,
+        completedAt: new Date()
+      });
+    } catch (err) {
+      console.error('[DirectPush] ❌ Log update failed:', err);
     }
   }
 
   console.log(`[DirectPush] ✅ DONE in ${durationMs}ms — status: ${finalStatus}`);
   console.log(`[DirectPush]    Success: ${result.successCount}, Failed: ${result.failureCount}, Invalid: ${result.invalidTokenCount}`);
+  if (cleanupResult.users + cleanupResult.providers > 0) {
+    console.log(`[DirectPush]    🧹 Cleaned ${cleanupResult.users} user(s) + ${cleanupResult.providers} provider(s)`);
+  }
 
   return res.json({
     success: finalStatus !== 'failed',
-    message:
-      finalStatus === 'completed' ? '✅ Notification sent successfully!' :
-      finalStatus === 'completed_with_errors' ? `⚠️ Sent with ${result.failureCount} failures` :
-      `❌ All ${result.failureCount} sends failed`,
-    data: {
-      logId: logDoc?._id,
-      targetMode,
-      targetCount: targetTokens.length,
-      successCount: result.successCount,
-      failureCount: result.failureCount,
-      invalidTokenCount: result.invalidTokenCount || 0,
-      durationMs,
-      status: finalStatus,
-      successes: result.successes || [],
-      failures: result.failures || [],
-    },
+    status: finalStatus,
+    logId: logDoc?._id || null,
+    targetMode,
+    targetCount: targetTokens.length,
+    successCount: result.successCount || 0,
+    failureCount: result.failureCount || 0,
+    invalidTokenCount: result.invalidTokenCount || 0,
+    cleanedUp: cleanupResult,
+    durationMs,
+    failures: (result.failures || []).slice(0, 20),
+    message: finalStatus === 'completed'
+      ? `✅ Delivered to all ${result.successCount} device(s)`
+      : finalStatus === 'partial'
+      ? `⚠️ Delivered to ${result.successCount}/${targetTokens.length} device(s)`
+      : result.invalidTokenCount === targetTokens.length
+      ? `❌ All ${targetTokens.length} token(s) are dead/expired. User must re-login to generate new tokens.`
+      : `❌ Failed to deliver to any device`
   });
-};
+}
 
-// ============================================================
-// GET /api/v1/admin/direct-push/preview-count?targetMode=xxx
-// ============================================================
-exports.previewCount = async (req, res) => {
-  const { targetMode, providerId } = req.query;
+// ────────────────────────────────────────────────────────────────
+// Preview count (no actual sending)
+// ────────────────────────────────────────────────────────────────
+async function previewCount(req, res) {
+  const { targetMode, providerId, providerIds } = req.body;
+
   try {
     let count = 0;
-    let tokens = [];
     switch (targetMode) {
       case 'all_providers':
-        tokens = await collectProviderTokens();
-        count = tokens.length;
+        count = (await collectProviderTokens()).length;
         break;
       case 'all_users':
-        tokens = await collectUserTokens();
-        count = tokens.length;
+        count = (await collectUserTokens()).length;
         break;
       case 'specific_provider':
-        if (providerId) {
-          tokens = await collectSpecificProviderTokens([providerId]);
-          count = tokens.length;
-        }
+        count = (await collectSpecificProviderTokens(providerId)).length;
+        break;
+      case 'specific_providers':
+        count = (await collectSpecificProviderTokens(providerIds || [])).length;
         break;
       default:
-        return res.json({ success: true, data: { count: 0, message: 'Count applies only to bulk modes' } });
+        count = 0;
     }
-    return res.json({ success: true, data: { count, tokensAvailable: count } });
-  } catch (e) {
-    console.error('[DirectPush] previewCount error:', e.message);
-    return res.status(500).json({ success: false, message: e.message });
-  }
-};
 
-// ============================================================
-// GET /api/v1/admin/direct-push/search-providers?q=xxx
-// ============================================================
-exports.searchProviders = async (req, res) => {
-  const { q = '' } = req.query;
-  const query = String(q).trim();
-  if (query.length < 2) {
-    return res.json({ success: true, data: { providers: [] } });
+    return res.json({ success: true, count, targetMode });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+}
+
+// ────────────────────────────────────────────────────────────────
+// Search providers for autocomplete
+// ────────────────────────────────────────────────────────────────
+async function searchProviders(req, res) {
+  const { q } = req.query;
+  if (!q || q.length < 2) {
+    return res.json({ success: true, providers: [] });
   }
 
   const Provider = getProviderModelSafe();
-  if (!Provider) {
-    return res.json({ success: true, data: { providers: [] } });
-  }
+  if (!Provider) return res.json({ success: true, providers: [] });
 
   try {
-    const regex = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-    const providers = await Provider.find({
-      $or: [
-        { name: regex },
-        { email: regex },
-        { phone: regex },
-        { providerId: regex },
-      ],
-    })
-      .select('name email phone providerId fcmToken categoryName isActive isAvailable')
+    const regex = new RegExp(q, 'i');
+    const providers = await Provider.find(
+      {
+        $or: [
+          { name: regex },
+          { email: regex },
+          { phone: regex },
+          { providerId: regex }
+        ]
+      },
+      { name: 1, email: 1, phone: 1, providerId: 1, fcmToken: 1, profession: 1, city: 1 }
+    )
       .limit(20)
       .lean();
 
-    const mapped = providers.map(p => ({
-      _id: p._id,
-      providerId: p.providerId,
-      name: p.name,
-      email: p.email,
-      phone: p.phone,
-      categoryName: p.categoryName,
-      hasFcmToken: !!(p.fcmToken && p.fcmToken.trim()),
-      isActive: p.isActive,
-      isAvailable: p.isAvailable,
-    }));
-
-    return res.json({ success: true, data: { providers: mapped } });
-  } catch (e) {
-    console.error('[DirectPush] searchProviders error:', e.message);
-    return res.status(500).json({ success: false, message: e.message });
+    return res.json({
+      success: true,
+      providers: providers.map(p => ({
+        _id: p._id,
+        providerId: p.providerId,
+        name: p.name,
+        email: p.email,
+        phone: p.phone,
+        profession: p.profession,
+        city: p.city,
+        hasToken: !!p.fcmToken
+      }))
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
   }
-};
+}
 
-// ============================================================
-// GET /api/v1/admin/direct-push/history
-// ============================================================
-exports.getHistory = async (req, res) => {
-  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+// ────────────────────────────────────────────────────────────────
+// History list (paginated)
+// ────────────────────────────────────────────────────────────────
+async function getHistory(req, res) {
+  const page = parseInt(req.query.page) || 1;
+  const limit = Math.min(parseInt(req.query.limit) || 20, 100);
   const skip = (page - 1) * limit;
 
   try {
@@ -478,36 +717,47 @@ exports.getHistory = async (req, res) => {
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
-        .select('-failures -successes')
+        .select('-successes -failures')
         .lean(),
-      DirectPushLog.countDocuments({}),
+      DirectPushLog.countDocuments({})
     ]);
 
     return res.json({
       success: true,
-      data: items,
+      items,
       pagination: {
-        page, limit, total,
-        pages: Math.ceil(total / limit) || 1,
-      },
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit)
+      }
     });
-  } catch (e) {
-    console.error('[DirectPush] getHistory error:', e.message);
-    return res.status(500).json({ success: false, message: e.message });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
   }
-};
+}
 
-// ============================================================
-// GET /api/v1/admin/direct-push/history/:id
-// ============================================================
-exports.getHistoryDetail = async (req, res) => {
-  const { id } = req.params;
+// ────────────────────────────────────────────────────────────────
+// History detail (full failures/successes)
+// ────────────────────────────────────────────────────────────────
+async function getHistoryDetail(req, res) {
   try {
-    const doc = await DirectPushLog.findById(id).lean();
-    if (!doc) return res.status(404).json({ success: false, message: 'Not found' });
-    return res.json({ success: true, data: doc });
-  } catch (e) {
-    console.error('[DirectPush] getHistoryDetail error:', e.message);
-    return res.status(500).json({ success: false, message: e.message });
+    const log = await DirectPushLog.findById(req.params.id).lean();
+    if (!log) {
+      return res.status(404).json({ success: false, message: 'Log not found' });
+    }
+    return res.json({ success: true, log });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
   }
+}
+
+module.exports = {
+  sendDirectPush,
+  previewCount,
+  searchProviders,
+  getHistory,
+  getHistoryDetail,
+  listFcmUsers,
+  listFcmProviders
 };
