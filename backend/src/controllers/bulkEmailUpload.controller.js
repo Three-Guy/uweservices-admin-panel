@@ -1,16 +1,40 @@
 // backend/src/controllers/bulkEmailUpload.controller.js
 // ============================================================
-// 📧 BULK EMAIL UPLOAD CONTROLLER v3.1
-// Uses existing emailService.js (Brevo SMTP + Fake Filter + Retry)
+// 📧 BULK EMAIL UPLOAD CONTROLLER v3.2
+// Uses existing emailService.js (Brevo SMTP/HTTP + Fake Filter + Retry)
+// FIXED: database import path (../config not ../../config)
 // ============================================================
 
 const mongoose = require('mongoose');
-const {
-  sendNotificationEmail,
-  isGenuineEmail,
-  personalizeHtml,
-} = require('../utils/emailService');
-const { getAdminConnection } = require('../../config/database');
+
+// ─── Safe emailService load ──────────────────────────────────
+let sendNotificationEmail = null;
+try {
+  const svc = require('../utils/emailService');
+  sendNotificationEmail = svc.sendNotificationEmail;
+  console.log('[BulkEmail] ✅ emailService loaded');
+} catch (err) {
+  console.error('[BulkEmail] ❌ emailService load failed:', err.message);
+}
+
+// ─── Safe database load ──────────────────────────────────────
+let getAdminConnection = null;
+try {
+  const dbModule = require('../config/database');
+  getAdminConnection = dbModule.getAdminConnection;
+  if (typeof getAdminConnection !== 'function') {
+    throw new Error('getAdminConnection is not a function');
+  }
+  console.log('[BulkEmail] ✅ database module loaded');
+} catch (err) {
+  console.error('[BulkEmail] ❌ database module load failed:', err.message);
+  // Try alternate paths
+  try {
+    const dbModule = require('../../config/database');
+    getAdminConnection = dbModule.getAdminConnection;
+    console.log('[BulkEmail] ✅ database loaded from alternate path (../../config/database)');
+  } catch {}
+}
 
 // ============================================================
 // BULK EMAIL JOB MODEL (admin_panel DB)
@@ -20,6 +44,7 @@ let BulkEmailJob = null;
 function getJobModel() {
   if (BulkEmailJob) return BulkEmailJob;
   try {
+    if (!getAdminConnection) throw new Error('getAdminConnection not available');
     const conn = getAdminConnection();
     if (!conn) throw new Error('admin_panel DB not connected');
     try {
@@ -74,15 +99,21 @@ function getJobModel() {
 }
 
 // ============================================================
-// CSV / TXT PARSER (inline — no external packages)
+// CSV / TXT PARSER
 // ============================================================
+function cleanName(raw) {
+  if (!raw) return '';
+  let n = raw.replace(/^["']|["']$/g, '').trim();
+  n = n.replace(/<[^>]+>/g, '').trim();
+  n = n.replace(/\s+/g, ' ');
+  if (/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(n)) return '';
+  return n.substring(0, 100);
+}
+
 function parseEmailFile(buffer, originalName) {
   let raw = buffer.toString('utf-8');
 
-  // Strip BOM
   if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
-
-  // Normalize line endings
   raw = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
   const allLines = raw.split('\n').map(l => l.trim()).filter(l => l.length > 0);
@@ -93,7 +124,6 @@ function parseEmailFile(buffer, originalName) {
   console.log(`[BulkEmail] 📝 Total non-empty lines: ${allLines.length}`);
   console.log(`[BulkEmail] 📝 First line: "${allLines[0].substring(0, 120)}"`);
 
-  // Detect separator
   const firstLine = allLines[0];
   let separator = ',';
   if (firstLine.includes('\t')) separator = '\t';
@@ -103,7 +133,6 @@ function parseEmailFile(buffer, originalName) {
 
   const sepName = separator === '\t' ? 'tab' : separator === ';' ? 'semicolon' : separator === '|' ? 'pipe' : 'comma';
 
-  // Detect header
   const emailRegex = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$/;
   const angleBracketRegex = /<?([a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})>?/;
 
@@ -126,7 +155,6 @@ function parseEmailFile(buffer, originalName) {
 
   const dataLines = hasHeader ? allLines.slice(1) : allLines;
 
-  // Detect columns
   let emailColIdx = 0;
   let nameColIdx = -1;
 
@@ -159,7 +187,6 @@ function parseEmailFile(buffer, originalName) {
 
   console.log(`[BulkEmail] 📊 Format: csv-${sepName}, Separator: ${sepName}`);
 
-  // Parse rows
   const valid = [];
   const invalid = [];
   const seenEmails = new Set();
@@ -172,7 +199,6 @@ function parseEmailFile(buffer, originalName) {
     let currentEmail = '';
     let currentName = '';
 
-    // Extract email
     const rawEmail = cols[emailColIdx] || '';
     const angleMatch = rawEmail.match(angleBracketRegex);
     if (angleMatch) {
@@ -181,7 +207,6 @@ function parseEmailFile(buffer, originalName) {
       currentEmail = rawEmail.toLowerCase().trim();
     }
 
-    // Extract name
     if (nameColIdx >= 0 && cols[nameColIdx]) {
       currentName = cleanName(cols[nameColIdx]);
     } else if (angleBracketRegex.test(rawEmail)) {
@@ -191,7 +216,6 @@ function parseEmailFile(buffer, originalName) {
 
     if (currentName) hasNames = true;
 
-    // Validate
     if (!currentEmail || !emailRegex.test(currentEmail)) {
       invalid.push({ email: rawEmail || line.substring(0, 50), reason: 'invalid-email' });
       continue;
@@ -227,23 +251,29 @@ function parseEmailFile(buffer, originalName) {
   };
 }
 
-function cleanName(raw) {
-  if (!raw) return '';
-  let n = raw.replace(/^["']|["']$/g, '').trim();
-  n = n.replace(/<[^>]+>/g, '').trim();
-  n = n.replace(/\s+/g, ' ');
-  if (/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(n)) return '';
-  return n.substring(0, 100);
-}
-
 // ============================================================
-// BACKGROUND JOB PROCESSOR (uses emailService.js)
+// BACKGROUND JOB PROCESSOR
 // ============================================================
 const activeJobs = new Map();
 
 async function processJob(jobId) {
   const Model = getJobModel();
-  if (!Model) return;
+  if (!Model) {
+    console.error(`[BulkEmail] ❌ Cannot process job ${jobId}: model not ready`);
+    return;
+  }
+
+  if (!sendNotificationEmail) {
+    console.error(`[BulkEmail] ❌ Cannot process job ${jobId}: emailService not loaded`);
+    try {
+      await Model.findByIdAndUpdate(jobId, {
+        status: 'failed',
+        errorMessage: 'Email service not available',
+        completedAt: new Date(),
+      });
+    } catch {}
+    return;
+  }
 
   try {
     const job = await Model.findById(jobId);
@@ -259,7 +289,7 @@ async function processJob(jobId) {
     await job.save();
 
     console.log(`[BulkEmail] 🏃 Processing job ${jobId}, ${job.totalRecipients} recipients`);
-    activeJobs.set(jobId, true);
+    activeJobs.set(jobId.toString(), true);
 
     const BATCH_SIZE = 50;
     const BATCH_DELAY_MS = 2000;
@@ -270,7 +300,7 @@ async function processJob(jobId) {
     let skippedCount = 0;
 
     for (let i = 0; i < job.recipients.length; i++) {
-      if (!activeJobs.get(jobId)) {
+      if (!activeJobs.get(jobId.toString())) {
         console.log(`[BulkEmail] ⛔ Job ${jobId} cancelled at ${i}/${job.recipients.length}`);
         job.status = 'cancelled';
         job.completedAt = new Date();
@@ -334,7 +364,7 @@ async function processJob(jobId) {
     job.skippedCount = skippedCount;
     await job.save();
 
-    activeJobs.delete(jobId);
+    activeJobs.delete(jobId.toString());
     console.log(`[BulkEmail] ✅ Job ${jobId} complete: ${sentCount} sent, ${failedCount} failed, ${skippedCount} skipped`);
   } catch (err) {
     console.error(`[BulkEmail] ❌ Job ${jobId} error:`, err.message);
@@ -348,12 +378,12 @@ async function processJob(jobId) {
         });
       }
     } catch {}
-    activeJobs.delete(jobId);
+    activeJobs.delete(jobId.toString());
   }
 }
 
 // ============================================================
-// CONTROLLERS — EXPORT NAMES MATCH ROUTE FILE EXACTLY
+// CONTROLLERS — Export names MUST match route file
 // ============================================================
 
 // POST /preview
@@ -450,7 +480,6 @@ exports.startBulkSend = async (req, res) => {
     await job.save();
     console.log(`[BulkEmail] ✅ Job created: ${job._id}, ${parsed.valid.length} recipients`);
 
-    // Start background processing
     processJob(job._id).catch(err => {
       console.error(`[BulkEmail] ❌ Background process error:`, err.message);
     });
@@ -544,7 +573,7 @@ exports.getJobProgress = async (req, res) => {
 exports.cancelJob = async (req, res) => {
   try {
     const jobId = req.params.id;
-    activeJobs.delete(jobId);
+    activeJobs.delete(jobId.toString());
 
     const Model = getJobModel();
     if (Model) {
