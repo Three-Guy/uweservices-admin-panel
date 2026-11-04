@@ -1,6 +1,7 @@
 // backend/src/controllers/bulkEmailUpload.controller.js
 // Bulk Email Controller — FULL COMPLETE with robust CSV/TXT parser
 // Handles: CSV (comma/semicolon/tab/pipe separated), TXT (one per line), with/without headers
+// v2.1 — Fixed `name is not defined` bug
 
 const mongoose = require('mongoose');
 const nodemailer = require('nodemailer');
@@ -24,6 +25,14 @@ function extractEmailFromText(text) {
   return match ? match[0].trim().toLowerCase() : null;
 }
 
+function cleanName(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  let n = raw.trim().replace(/^["']|["']$/g, '').trim();
+  if (!n || n.length < 1 || n.length > 100) return null;
+  if (isValidEmail(n)) return null; // Not a name — it's an email
+  return n;
+}
+
 // ════════════════════════════════════════════════════════════════
 // ROBUST CSV/TXT PARSER — handles ALL common formats
 // ════════════════════════════════════════════════════════════════
@@ -31,8 +40,8 @@ function parseRecipientFile(fileContent, fileName) {
   console.log(`[BulkEmail] 📄 Parsing file: ${fileName}, size: ${fileContent.length} bytes`);
 
   const results = {
-    recipients: [],        // { email, name, row }
-    invalidRows: [],       // { row, rawLine, email, name, reason }
+    recipients: [],
+    invalidRows: [],
     totalRows: 0,
     hasNameColumn: false,
     detectedFormat: 'unknown',
@@ -45,8 +54,15 @@ function parseRecipientFile(fileContent, fileName) {
     return results;
   }
 
+  // Strip BOM if present
+  let content = fileContent;
+  if (content.charCodeAt(0) === 0xFEFF) {
+    content = content.slice(1);
+    console.log('[BulkEmail] 🧹 Stripped BOM');
+  }
+
   // Normalize line endings + split
-  const rawLines = fileContent
+  const rawLines = content
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
     .split('\n')
@@ -54,12 +70,16 @@ function parseRecipientFile(fileContent, fileName) {
     .filter(l => l.length > 0);
 
   console.log(`[BulkEmail] 📝 Total non-empty lines: ${rawLines.length}`);
+  if (rawLines.length > 0) {
+    console.log(`[BulkEmail] 📝 First line: "${rawLines[0].substring(0, 150)}"`);
+  }
 
   if (rawLines.length === 0) return results;
 
   // ─── Detect if first line is a header ───
   const firstLine = rawLines[0].toLowerCase();
-  const isHeader = (
+  const firstLineHasEmail = firstLine.includes('@') && isValidEmail(extractEmailFromText(rawLines[0]) || '');
+  const isHeader = !firstLineHasEmail && (
     firstLine.includes('email') ||
     firstLine.includes('e-mail') ||
     firstLine.includes('mail') ||
@@ -70,8 +90,7 @@ function parseRecipientFile(fileContent, fileName) {
     firstLine.includes('contact') ||
     firstLine.includes('subscriber') ||
     firstLine.includes('address') ||
-    // Check if first line has NO @ sign (likely header)
-    (!firstLine.includes('@') && rawLines.length > 1 && rawLines[1].includes('@'))
+    (rawLines.length > 1 && rawLines[1].includes('@'))
   );
 
   let dataLines = rawLines;
@@ -79,6 +98,8 @@ function parseRecipientFile(fileContent, fileName) {
     results.headerRow = rawLines[0];
     dataLines = rawLines.slice(1);
     console.log(`[BulkEmail] 📋 Header detected: "${rawLines[0]}"`);
+  } else {
+    console.log(`[BulkEmail] 📋 No header — treating all lines as data`);
   }
 
   // ─── Detect separator ───
@@ -92,35 +113,27 @@ function parseRecipientFile(fileContent, fileName) {
   let bestSeparator = null;
   let bestScore = 0;
 
-  // Sample first few data lines to detect separator
   const sampleLines = dataLines.slice(0, Math.min(10, dataLines.length));
   for (const sep of separators) {
     let score = 0;
-    let consistent = true;
-    let firstCount = -1;
-
     for (const line of sampleLines) {
       const count = line.split(sep.char).length;
-      if (count > 1) {
-        score += count;
-        if (firstCount === -1) firstCount = count;
-        else if (count !== firstCount) consistent = false;
-      }
+      if (count > 1) score += count;
     }
-
-    // Prefer consistent separators with multiple columns
-    if (score > bestScore && consistent) {
+    if (score > bestScore) {
       bestScore = score;
       bestSeparator = sep;
     }
   }
 
-  // ─── Detect column positions ───
+  // ─── Detect column positions from header ───
   let emailColIndex = 0;
   let nameColIndex = -1;
 
   if (bestSeparator && results.headerRow) {
-    const headerCols = results.headerRow.split(bestSeparator.char).map(h => h.trim().toLowerCase().replace(/^["']|["']$/g, ''));
+    const headerCols = results.headerRow
+      .split(bestSeparator.char)
+      .map(h => h.trim().toLowerCase().replace(/^["']|["']$/g, ''));
     console.log(`[BulkEmail] 📊 Header columns: [${headerCols.join(', ')}]`);
 
     // Find email column
@@ -130,7 +143,6 @@ function parseRecipientFile(fileContent, fileName) {
       h === 'subscriber_email' || h === 'user_email' || h === 'contact_email'
     );
     if (emailColIndex === -1) {
-      // Fallback: find first column that looks like it contains emails
       for (let i = 0; i < headerCols.length; i++) {
         if (headerCols[i].includes('email') || headerCols[i].includes('mail')) {
           emailColIndex = i;
@@ -138,7 +150,7 @@ function parseRecipientFile(fileContent, fileName) {
         }
       }
     }
-    if (emailColIndex === -1) emailColIndex = 0; // Default to first column
+    if (emailColIndex === -1) emailColIndex = 0;
 
     // Find name column
     nameColIndex = headerCols.findIndex(h =>
@@ -149,41 +161,43 @@ function parseRecipientFile(fileContent, fileName) {
     );
 
     if (nameColIndex >= 0) results.hasNameColumn = true;
-
-    console.log(`[BulkEmail] 📊 Email col: ${emailColIndex}, Name col: ${nameColIndex}`);
+    console.log(`[BulkEmail] 📊 Email col index: ${emailColIndex}, Name col index: ${nameColIndex}`);
   }
 
   results.detectedSeparator = bestSeparator?.name || 'none';
-  results.detectedFormat = bestSeparator ? `csv-${bestSeparator.name}` : 'txt-line';
-
+  results.detectedFormat = bestSeparator && bestScore > 0 ? `csv-${bestSeparator.name}` : 'txt-line';
   console.log(`[BulkEmail] 📊 Format: ${results.detectedFormat}, Separator: ${results.detectedSeparator}`);
 
-  // ─── Parse each line ───
+  // ─── Parse each data line ───
   const seen = new Set();
 
   for (let i = 0; i < dataLines.length; i++) {
     const rawLine = dataLines[i];
     results.totalRows++;
-    let email = null;
-    let name = null;
 
-    if (bestSeparator && bestScore > dataLines.length) {
-      // CSV mode — split by separator
+    // Local variables scoped to this iteration — fixes "name is not defined"
+    let currentEmail = null;
+    let currentName = null;
+
+    const useCsvMode = bestSeparator && bestScore > 0;
+
+    if (useCsvMode) {
+      // CSV mode
       const cols = rawLine.split(bestSeparator.char).map(c =>
         c.trim().replace(/^["']|["']$/g, '').trim()
       );
 
-      // Get email from detected column
+      // Get email from detected column first
       const rawEmail = cols[emailColIndex] || '';
-      email = rawEmail.trim().toLowerCase();
+      currentEmail = rawEmail.trim().toLowerCase();
 
-      // If the detected email column doesn't have a valid email, scan ALL columns
-      if (!isValidEmail(email)) {
-        email = null;
+      // If no valid email in detected col, scan ALL columns
+      if (!isValidEmail(currentEmail)) {
+        currentEmail = null;
         for (const col of cols) {
           const extracted = extractEmailFromText(col);
           if (extracted && isValidEmail(extracted)) {
-            email = extracted;
+            currentEmail = extracted;
             break;
           }
         }
@@ -191,95 +205,95 @@ function parseRecipientFile(fileContent, fileName) {
 
       // Get name from detected column
       if (nameColIndex >= 0 && cols[nameColIndex]) {
-        name = cols[nameColIndex].trim();
-        if (name && isValidEmail(name)) name = null; // Name column accidentally has email
+        currentName = cleanName(cols[nameColIndex]);
       }
 
-      // If no name column detected, try to find one
-      if (!name && cols.length > 1) {
+      // If no name column, try to find a name in other columns
+      if (!currentName && cols.length > 1) {
         for (let j = 0; j < cols.length; j++) {
           if (j === emailColIndex) continue;
           const val = cols[j].trim();
-          if (val && !isValidEmail(val) && val.length > 1 && val.length < 100 && /^[a-zA-Z\s.\-']+$/.test(val)) {
-            name = val;
-            if (!results.hasNameColumn) results.hasNameColumn = true;
-            break;
+          if (val && !isValidEmail(val) && val.length > 1 && val.length < 100) {
+            const cleaned = cleanName(val);
+            if (cleaned) {
+              currentName = cleaned;
+              if (!results.hasNameColumn) results.hasNameColumn = true;
+              break;
+            }
           }
         }
       }
     } else {
-      // TXT / single-column mode — each line is an email (possibly with name)
-      // Try common patterns:
-      // "Name <email>" or "email name" or just "email"
-
+      // TXT / single-column mode
+      // Pattern 1: "Name <email@domain.com>"
       const angleBracketMatch = rawLine.match(/^(.+?)\s*<([^>]+)>/);
       if (angleBracketMatch) {
-        name = angleBracketMatch[1].trim().replace(/^["']|["']$/g, '').trim();
-        email = angleBracketMatch[2].trim().toLowerCase();
+        currentName = cleanName(angleBracketMatch[1]);
+        currentEmail = angleBracketMatch[2].trim().toLowerCase();
       } else {
-        // Try to extract email from anywhere in the line
-        email = extractEmailFromText(rawLine);
+        // Pattern 2: Just an email, or email with surrounding text
+        currentEmail = extractEmailFromText(rawLine);
 
-        // If the whole line is just the email, no name
-        if (email && rawLine.trim().toLowerCase() !== email) {
+        if (currentEmail && rawLine.trim().toLowerCase() !== currentEmail) {
           // There might be a name in the remaining text
-          const remaining = rawLine.replace(email, '').trim().replace(/^[,;|\t\s]+|[,;|\t\s]+$/g, '').trim();
-          if (remaining && remaining.length > 1 && remaining.length < 100 && /^[a-zA-Z\s.\-']+$/.test(remaining)) {
-            name = remaining;
-            results.hasNameColumn = true;
+          const remaining = rawLine
+            .replace(currentEmail, '')
+            .trim()
+            .replace(/^[,;|\t\s]+|[,;|\t\s]+$/g, '')
+            .trim();
+          if (remaining) {
+            const cleaned = cleanName(remaining);
+            if (cleaned) {
+              currentName = cleaned;
+              results.hasNameColumn = true;
+            }
           }
         }
       }
     }
 
     // Clean email
-    if (email) {
-      email = email.trim().toLowerCase().replace(/^["'<]|["'>]$/g, '').trim();
+    if (currentEmail) {
+      currentEmail = currentEmail.trim().toLowerCase().replace(/^["'<]|["'>]$/g, '').trim();
     }
 
-    // Validate
-    if (!email || !isValidEmail(email)) {
+    // Validate email
+    if (!currentEmail || !isValidEmail(currentEmail)) {
       results.invalidRows.push({
         row: i + 1 + (isHeader ? 1 : 0),
         rawLine: rawLine.substring(0, 200),
-        email: email || rawLine.substring(0, 50),
-        name: name || null,
-        reason: !email ? 'No email found in this line' : `Invalid email format: ${email}`
+        email: currentEmail || rawLine.substring(0, 50),
+        name: currentName || null,
+        reason: !currentEmail ? 'No email found in this line' : `Invalid email format: ${currentEmail}`
       });
       continue;
     }
 
     // Deduplicate
-    if (seen.has(email)) {
+    if (seen.has(currentEmail)) {
       results.invalidRows.push({
         row: i + 1 + (isHeader ? 1 : 0),
         rawLine: rawLine.substring(0, 200),
-        email,
-        name,
+        email: currentEmail,
+        name: currentName,
         reason: 'Duplicate email'
       });
       continue;
     }
 
-    seen.add(email);
+    seen.add(currentEmail);
     results.recipients.push({
-      email,
-      name: name || null,
+      email: currentEmail,
+      name: currentName || null,
       row: i + 1 + (isHeader ? 1 : 0)
     });
-  }
-
-  // Clean name
-  if (name) {
-    name = name.replace(/^["']|["']$/g, '').trim();
-    if (!name || name.length < 1) name = null;
   }
 
   const dupeCount = results.invalidRows.filter(r => r.reason === 'Duplicate email').length;
   const invalidCount = results.invalidRows.length - dupeCount;
 
   console.log(`[BulkEmail] ✅ Parse complete:`);
-  console.log(`[BulkEmail]    Total rows: ${results.totalRows}`);
+  console.log(`[BulkEmail]    Total data rows: ${results.totalRows}`);
   console.log(`[BulkEmail]    Valid: ${results.recipients.length}`);
   console.log(`[BulkEmail]    Invalid: ${invalidCount}`);
   console.log(`[BulkEmail]    Duplicates: ${dupeCount}`);
@@ -287,7 +301,7 @@ function parseRecipientFile(fileContent, fileName) {
   console.log(`[BulkEmail]    Format: ${results.detectedFormat}`);
 
   if (results.recipients.length > 0) {
-    console.log(`[BulkEmail]    First recipient: ${results.recipients[0].email} (${results.recipients[0].name || 'no name'})`);
+    console.log(`[BulkEmail]    Sample: ${results.recipients[0].email} (${results.recipients[0].name || 'no name'})`);
   }
 
   return results;
@@ -402,7 +416,7 @@ function renderTemplate(template, vars) {
 // CONTROLLERS
 // ════════════════════════════════════════════════════════════════
 
-// ─── Preview Upload (parse file, return stats) ───
+// ─── Preview Upload ───
 async function previewUpload(req, res) {
   console.log('[BulkEmail] 📤 Preview upload request');
 
@@ -415,8 +429,7 @@ async function previewUpload(req, res) {
     console.log(`[BulkEmail] 📄 File: ${originalname}, size: ${size} bytes`);
 
     const content = buffer.toString('utf-8');
-    console.log(`[BulkEmail] 📝 Content length: ${content.length} chars`);
-    console.log(`[BulkEmail] 📝 First 500 chars:\n${content.substring(0, 500)}`);
+    console.log(`[BulkEmail] 📝 Content preview (first 500 chars):\n${content.substring(0, 500)}`);
 
     const parsed = parseRecipientFile(content, originalname);
 
@@ -443,7 +456,7 @@ async function previewUpload(req, res) {
           row: r.row
         })),
         invalidSamples: invalidOnly.slice(0, 10).map(r => ({
-          email: r.email || r.rawLine?.substring(0, 50),
+          email: r.email || (r.rawLine ? r.rawLine.substring(0, 50) : ''),
           name: r.name,
           isValid: false,
           invalidReason: r.reason,
@@ -452,12 +465,13 @@ async function previewUpload(req, res) {
       }
     };
 
-    console.log(`[BulkEmail] ✅ Preview response: ${parsed.recipients.length} valid, ${invalidOnly.length} invalid, ${dupeCount} dupes`);
+    console.log(`[BulkEmail] ✅ Preview OK: ${parsed.recipients.length} valid, ${invalidOnly.length} invalid, ${dupeCount} dupes`);
 
     return res.json(response);
   } catch (err) {
     console.error('[BulkEmail] ❌ Preview error:', err);
-    return res.status(500).json({ success: false, message: err.message });
+    console.error('[BulkEmail] Stack:', err.stack);
+    return res.status(500).json({ success: false, message: err.message || 'Preview failed' });
   }
 }
 
@@ -538,7 +552,8 @@ async function startBulkSend(req, res) {
     });
   } catch (err) {
     console.error('[BulkEmail] ❌ Start send error:', err);
-    return res.status(500).json({ success: false, message: err.message });
+    console.error('[BulkEmail] Stack:', err.stack);
+    return res.status(500).json({ success: false, message: err.message || 'Send failed' });
   }
 }
 
@@ -577,7 +592,7 @@ async function processJobInBackground(jobId) {
   let failed = 0;
   const failures = [];
   const BATCH_SIZE = 50;
-  const BATCH_DELAY = 2000; // 2s between batches
+  const BATCH_DELAY = 2000;
 
   for (let i = 0; i < job.recipients.length; i += BATCH_SIZE) {
     const batch = job.recipients.slice(i, i + BATCH_SIZE);
@@ -615,16 +630,14 @@ async function processJobInBackground(jobId) {
       }
     }
 
-    // Update progress after each batch
     const progress = Math.round(((i + batch.length) / job.recipients.length) * 100);
     await BulkEmailJob.findByIdAndUpdate(jobId, {
       sent, failed, progress,
-      failures: failures.slice(-100) // Keep last 100 failures
+      failures: failures.slice(-100)
     });
 
     console.log(`[BulkEmail] 📊 Progress: ${progress}% (${sent} sent, ${failed} failed)`);
 
-    // Rate limit between batches
     if (i + BATCH_SIZE < job.recipients.length) {
       await new Promise(r => setTimeout(r, BATCH_DELAY));
     }
@@ -700,7 +713,7 @@ async function getJob(req, res) {
   }
 }
 
-// ─── List Jobs (paginated) ───
+// ─── List Jobs ───
 async function listJobs(req, res) {
   try {
     const BulkEmailJob = getBulkEmailJobModel();
