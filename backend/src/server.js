@@ -185,7 +185,7 @@ app.get('/health', (req, res) => {
       overall: isDbConnected() ? 'connected' : 'disconnected',
     },
     environment: process.env.NODE_ENV || 'development',
-    version: '2.2.3',
+    version: '2.2.4',
     serverIP: LOCAL_IP,
   });
 });
@@ -370,7 +370,7 @@ const HOST = '0.0.0.0';
 
 async function startServer() {
   try {
-    logger.info('Starting Admin Panel Backend Server v2.2.3 ...');
+    logger.info('Starting Admin Panel Backend Server v2.2.4 ...');
     console.log('\n🔌 Connecting to databases...');
     await connectDB();
     console.log('✅ All databases connected successfully\n');
@@ -474,6 +474,32 @@ async function startServer() {
     app.use('/api/v1/admin/checkout', checkoutRoutes);
     app.use('/api/v1/system', systemRoutes);
 
+    // ═══════════════════════════════════════════════════════════════
+    // 🚀 DIRECT PUSH + BULK EMAIL ROUTES — NEW FEATURES (v2.2.4)
+    // MOUNTED BEFORE 404 HANDLER — isolated, non-destructive
+    // ═══════════════════════════════════════════════════════════════
+    try {
+      const directPushRoutes = require('./routes/directPush.routes');
+      app.use('/api/v1/admin/direct-push', directPushRoutes);
+      console.log('✅ [Routes] Direct Push mounted at /api/v1/admin/direct-push');
+      logger.info('✓ Direct Push routes loaded');
+    } catch (e) {
+      console.error('❌ [Routes] Direct Push failed to load:', e.message);
+      console.error(e.stack);
+      logger.error('❌ Direct Push routes failed to load: ' + e.message);
+    }
+
+    try {
+      const bulkEmailUploadRoutes = require('./routes/bulkEmailUpload.routes');
+      app.use('/api/v1/admin/bulk-email', bulkEmailUploadRoutes);
+      console.log('✅ [Routes] Bulk Email Upload mounted at /api/v1/admin/bulk-email');
+      logger.info('✓ Bulk Email Upload routes loaded');
+    } catch (e) {
+      console.error('❌ [Routes] Bulk Email Upload failed to load:', e.message);
+      console.error(e.stack);
+      logger.error('❌ Bulk Email Upload routes failed to load: ' + e.message);
+    }
+
     logger.info('✓ All routes initialized successfully');
 
     // ═══════════════════════════════════════════════════════════════
@@ -533,13 +559,15 @@ async function startServer() {
       const { isProviderFirebaseReady, isAdminWebFirebaseReady } = require('./config/firebase');
       console.log(`
 ╔════════════════════════════════════════════════════════════════╗
-║  🚀 Admin Panel Backend v2.2.3 (NOTIFICATION BAR FIX)          ║
+║  🚀 Admin Panel Backend v2.2.4 (DIRECT PUSH + BULK EMAIL)      ║
 ╠════════════════════════════════════════════════════════════════╣
 ║  Port:                  ${PORT.toString().padEnd(39)}║
 ║  Database:              ✅ Connected                            ║
 ║  Provider Firebase:     ${isProviderFirebaseReady() ? '✅ Ready    ' : '⚠️  Not Ready'}                            ║
 ║  Admin Web Firebase:    ${isAdminWebFirebaseReady() ? '✅ Ready    ' : '⚠️  Not Ready'}                            ║
 ║  Dispatch:              ${process.env.DISPATCH_ENABLED === 'true' ? '✅ RUNNING  ' : '⚠️  DISABLED '}                            ║
+║  Direct Push:           /api/v1/admin/direct-push               ║
+║  Bulk Email:            /api/v1/admin/bulk-email                ║
 ║  Test URL:              /api/v1/admin/test-notification         ║
 ╚════════════════════════════════════════════════════════════════╝
       `);
