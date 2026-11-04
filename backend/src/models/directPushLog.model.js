@@ -63,7 +63,7 @@ function getModel() {
   const conn = getAdminConnection();
   if (!conn) throw new Error('[DirectPushLog] Admin connection not available');
   DirectPushLogModel = conn.models.DirectPushLog || conn.model('DirectPushLog', directPushLogSchema);
-  console.log('[DirectPushLog] ✅ Model ready on: admin_panel');
+  console.log('[DirectPushLog] ✅ Model ready on admin_panel DB');
   return DirectPushLogModel;
 }
 
