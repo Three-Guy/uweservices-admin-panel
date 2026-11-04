@@ -1,6 +1,6 @@
 // backend/src/controllers/bulkEmailUpload.controller.js
 // ============================================================
-// 📧 BULK EMAIL UPLOAD CONTROLLER v3.0
+// 📧 BULK EMAIL UPLOAD CONTROLLER v3.1
 // Uses existing emailService.js (Brevo SMTP + Fake Filter + Retry)
 // ============================================================
 
@@ -137,7 +137,6 @@ function parseEmailFile(buffer, originalName) {
       if (lc.includes('name') || lc.includes('first')) nameColIdx = i;
     }
   } else {
-    // Auto-detect: find which column has emails
     const sampleLines = dataLines.slice(0, Math.min(5, dataLines.length));
     for (let col = 0; col < 5; col++) {
       let emailHits = 0;
@@ -151,7 +150,6 @@ function parseEmailFile(buffer, originalName) {
         break;
       }
     }
-    // If email is col 0, name might be col 1
     if (emailColIdx === 0 && firstCols.length > 1) {
       nameColIdx = 1;
     } else if (emailColIdx === 1) {
@@ -187,7 +185,6 @@ function parseEmailFile(buffer, originalName) {
     if (nameColIdx >= 0 && cols[nameColIdx]) {
       currentName = cleanName(cols[nameColIdx]);
     } else if (angleBracketRegex.test(rawEmail)) {
-      // "John Doe <john@example.com>" format
       const namePart = rawEmail.replace(/<[^>]+>/, '').trim().replace(/^["']|["']$/g, '');
       if (namePart) currentName = cleanName(namePart);
     }
@@ -273,7 +270,6 @@ async function processJob(jobId) {
     let skippedCount = 0;
 
     for (let i = 0; i < job.recipients.length; i++) {
-      // Check cancellation
       if (!activeJobs.get(jobId)) {
         console.log(`[BulkEmail] ⛔ Job ${jobId} cancelled at ${i}/${job.recipients.length}`);
         job.status = 'cancelled';
@@ -283,17 +279,15 @@ async function processJob(jobId) {
       }
 
       const recipient = job.recipients[i];
-
       if (recipient.status !== 'pending') continue;
 
       try {
-        // Use the existing emailService — it handles Brevo SMTP, retry, fake filter
         const result = await sendNotificationEmail({
           to: recipient.email,
           subject: job.subject,
           customHtml: job.htmlBody,
           recipientName: recipient.name || '',
-          skipValidation: false, // Let emailService filter fakes
+          skipValidation: false,
         });
 
         if (result.success) {
@@ -319,17 +313,14 @@ async function processJob(jobId) {
       job.failedCount = failedCount;
       job.skippedCount = skippedCount;
 
-      // Save progress every 5 emails or at the end
       if ((i + 1) % 5 === 0 || i === job.recipients.length - 1) {
         await job.save();
       }
 
-      // Rate limit between emails
       if (i < job.recipients.length - 1) {
         await new Promise(r => setTimeout(r, EMAIL_DELAY_MS));
       }
 
-      // Batch pause
       if ((i + 1) % BATCH_SIZE === 0 && i < job.recipients.length - 1) {
         console.log(`[BulkEmail] ⏸️ Batch pause after ${i + 1} emails...`);
         await new Promise(r => setTimeout(r, BATCH_DELAY_MS));
@@ -362,11 +353,11 @@ async function processJob(jobId) {
 }
 
 // ============================================================
-// CONTROLLERS
+// CONTROLLERS — EXPORT NAMES MATCH ROUTE FILE EXACTLY
 // ============================================================
 
-// POST /preview — Parse file and show preview
-exports.previewBulkEmail = async (req, res) => {
+// POST /preview
+exports.previewUpload = async (req, res) => {
   try {
     console.log('[BulkEmail] 📤 Preview upload request');
 
@@ -404,8 +395,8 @@ exports.previewBulkEmail = async (req, res) => {
   }
 };
 
-// POST /send — Parse, create job, start processing
-exports.sendBulkEmail = async (req, res) => {
+// POST /send
+exports.startBulkSend = async (req, res) => {
   try {
     console.log('[BulkEmail] 🚀 Start bulk send request');
     console.log(`[BulkEmail] 📦 Body keys: ${Object.keys(req.body).join(', ')}`);
@@ -433,7 +424,6 @@ exports.sendBulkEmail = async (req, res) => {
       });
     }
 
-    // Create job in DB
     const Model = getJobModel();
     if (!Model) {
       return res.status(500).json({ success: false, message: 'Database not ready' });
@@ -460,7 +450,7 @@ exports.sendBulkEmail = async (req, res) => {
     await job.save();
     console.log(`[BulkEmail] ✅ Job created: ${job._id}, ${parsed.valid.length} recipients`);
 
-    // Start background processing (don't await)
+    // Start background processing
     processJob(job._id).catch(err => {
       console.error(`[BulkEmail] ❌ Background process error:`, err.message);
     });
@@ -483,8 +473,8 @@ exports.sendBulkEmail = async (req, res) => {
   }
 };
 
-// GET /jobs — List all jobs
-exports.getJobs = async (req, res) => {
+// GET /jobs
+exports.listJobs = async (req, res) => {
   try {
     const Model = getJobModel();
     if (!Model) return res.json({ success: true, data: [] });
@@ -501,8 +491,8 @@ exports.getJobs = async (req, res) => {
   }
 };
 
-// GET /jobs/:id — Job detail with recipients
-exports.getJobDetail = async (req, res) => {
+// GET /jobs/:id
+exports.getJob = async (req, res) => {
   try {
     const Model = getJobModel();
     if (!Model) return res.status(404).json({ success: false, message: 'DB not ready' });
@@ -516,7 +506,7 @@ exports.getJobDetail = async (req, res) => {
   }
 };
 
-// GET /jobs/:id/progress — Lightweight progress polling
+// GET /jobs/:id/progress
 exports.getJobProgress = async (req, res) => {
   try {
     const Model = getJobModel();
@@ -550,7 +540,7 @@ exports.getJobProgress = async (req, res) => {
   }
 };
 
-// POST /jobs/:id/cancel — Cancel a running job
+// POST /jobs/:id/cancel
 exports.cancelJob = async (req, res) => {
   try {
     const jobId = req.params.id;

@@ -64,7 +64,7 @@ if (authMiddleware) {
   console.warn('[BulkEmailRoutes] ⚠️ NO AUTH — routes unprotected!');
 }
 
-// Routes
+// Routes — these names MUST match controller exports
 router.post('/preview', upload.single('file'), ctrl.previewUpload);
 router.post('/send', upload.single('file'), ctrl.startBulkSend);
 router.get('/jobs', ctrl.listJobs);
