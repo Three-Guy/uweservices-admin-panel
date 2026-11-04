@@ -41,7 +41,9 @@ import {
   Zap,
   Radar,
   Radio,
-  Target, // ✅ NEW — Manual Dispatch icon
+  Target,
+  Mail,      // ✅ NEW — Bulk Email icon
+  Rocket,    // ✅ NEW — Direct Push icon
 } from 'lucide-react';
 import { useAuth } from '../../store/AuthContext';
 import { usersApi, providersApi, bookingsApi } from '../../lib/api';
@@ -72,7 +74,7 @@ interface NavItem {
   badgeType?: string;
   isHot?: boolean;
   isPinned?: boolean;
-  isCritical?: boolean; // ✅ NEW — for emergency items
+  isCritical?: boolean;
 }
 
 // ─── Hooks ───
@@ -224,11 +226,14 @@ const navigation: NavItem[] = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
   { name: 'Bookings', href: '/bookings', icon: Calendar, hasBadge: true, badgeType: 'booking', isHot: true, isPinned: true },
   { name: 'Live Tracking', href: '/tracking', icon: Radar, hasBadge: true, badgeType: 'tracking', isHot: true, isPinned: true },
-  // ✅ DISPATCH SYSTEM (4 items)
+  // ✅ DISPATCH SYSTEM
   { name: 'Dispatch Monitor', href: '/dispatch', icon: Zap, isHot: true, isPinned: true },
-  { name: '🚨 Manual Dispatch', href: '/manual-dispatch', icon: Target, isCritical: true, isPinned: true }, // ✅ NEW
+  { name: '🚨 Manual Dispatch', href: '/manual-dispatch', icon: Target, isCritical: true, isPinned: true },
   { name: 'Offer History', href: '/provider-offers', icon: Send },
   { name: 'Alerts Center', href: '/notifications', icon: Radio },
+  // ✅ NEW — Direct Push + Bulk Email (Communication Tools)
+  { name: 'Direct Push', href: '/direct-push', icon: Rocket, isHot: true, isPinned: true },
+  { name: 'Bulk Email', href: '/bulk-email', icon: Mail, isHot: true, isPinned: true },
   { name: 'Providers', href: '/providers', icon: Briefcase, hasBadge: true, badgeType: 'provider' },
   { name: 'Verifications', href: '/verifications', icon: ClipboardCheck },
   { name: 'Users', href: '/users', icon: UserPlus, hasBadge: true, badgeType: 'user' },
@@ -266,7 +271,7 @@ const otherNavigation: NavItem[] = [
 const bottomNavItems: NavItem[] = [
   { name: 'Home', href: '/', icon: Home },
   { name: 'Bookings', href: '/bookings', icon: Calendar },
-  { name: 'Dispatch', href: '/manual-dispatch', icon: Target }, // ✅ Updated to Manual Dispatch
+  { name: 'Dispatch', href: '/manual-dispatch', icon: Target },
   { name: 'Providers', href: '/providers', icon: Briefcase },
 ];
 
@@ -869,6 +874,49 @@ export default function Sidebar() {
               </div>
             </div>
           </NavLink>
+        </div>
+      )}
+
+      {/* ✅ ─── Communication Tools Quick Access Card (NEW) ─── */}
+      {(!isCollapsed || isMobile) && (
+        <div className="px-3 pt-1 pb-1 flex-shrink-0">
+          <div className="grid grid-cols-2 gap-1.5">
+            <NavLink
+              to="/direct-push"
+              onClick={handleNavClick}
+              className={`block p-2 rounded-xl ${theme.cardBg} border ${theme.border} relative overflow-hidden
+                hover:scale-[1.02] transition-transform duration-200 group`}
+            >
+              <div className={`absolute -top-3 -right-3 w-14 h-14 bg-indigo-500 opacity-10 rounded-full blur-xl`} />
+              <div className="relative flex flex-col items-start gap-1">
+                <div className={`w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500 to-blue-500 flex items-center justify-center shadow-sm`}>
+                  <Rocket className="w-3.5 h-3.5 text-white" strokeWidth={2.5} />
+                </div>
+                <div className="min-w-0 w-full">
+                  <p className={`text-[9.5px] font-bold uppercase tracking-wider ${theme.textMuted} truncate`}>Direct Push</p>
+                  <p className={`text-[10px] font-semibold ${theme.textActive} truncate leading-tight`}>FCM Sender</p>
+                </div>
+              </div>
+            </NavLink>
+
+            <NavLink
+              to="/bulk-email"
+              onClick={handleNavClick}
+              className={`block p-2 rounded-xl ${theme.cardBg} border ${theme.border} relative overflow-hidden
+                hover:scale-[1.02] transition-transform duration-200 group`}
+            >
+              <div className={`absolute -top-3 -right-3 w-14 h-14 bg-purple-500 opacity-10 rounded-full blur-xl`} />
+              <div className="relative flex flex-col items-start gap-1">
+                <div className={`w-7 h-7 rounded-lg bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center shadow-sm`}>
+                  <Mail className="w-3.5 h-3.5 text-white" strokeWidth={2.5} />
+                </div>
+                <div className="min-w-0 w-full">
+                  <p className={`text-[9.5px] font-bold uppercase tracking-wider ${theme.textMuted} truncate`}>Bulk Email</p>
+                  <p className={`text-[10px] font-semibold ${theme.textActive} truncate leading-tight`}>CSV Upload</p>
+                </div>
+              </div>
+            </NavLink>
+          </div>
         </div>
       )}
 

@@ -46,8 +46,12 @@ import DispatchMonitor from './pages/DispatchMonitor';
 import ProviderOfferHistory from './pages/ProviderOfferHistory';
 import NotificationCenter from './pages/NotificationCenter';
 
-// ✅ ==================== MANUAL DISPATCH (NEW) ====================
+// ✅ ==================== MANUAL DISPATCH ====================
 import ManualDispatch from './pages/ManualDispatch';
+
+// ✅ ==================== NEW: DIRECT PUSH + BULK EMAIL ====================
+import DirectPushCenter from './pages/DirectPushCenter';
+import BulkEmailCenter from './pages/BulkEmailCenter';
 
 // ==================== REALTIME BELL (CRITICAL FIX) ====================
 import RealtimeAlertBell from './components/RealtimeAlertBell';
@@ -235,7 +239,7 @@ function App() {
               }
             />
 
-            {/* ✅ ==================== MANUAL DISPATCH (NEW ROUTE) ==================== */}
+            {/* ✅ ==================== MANUAL DISPATCH ==================== */}
             <Route
               path="/manual-dispatch"
               element={
@@ -263,6 +267,30 @@ function App() {
                 <ProtectedRoute>
                   <AppLayout>
                     <NotificationCenter />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+
+            {/* ✅ ==================== DIRECT PUSH (NEW) ==================== */}
+            <Route
+              path="/direct-push"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <DirectPushCenter />
+                  </AppLayout>
+                </ProtectedRoute>
+              }
+            />
+
+            {/* ✅ ==================== BULK EMAIL (NEW) ==================== */}
+            <Route
+              path="/bulk-email"
+              element={
+                <ProtectedRoute>
+                  <AppLayout>
+                    <BulkEmailCenter />
                   </AppLayout>
                 </ProtectedRoute>
               }
