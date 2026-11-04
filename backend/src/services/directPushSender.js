@@ -1,265 +1,314 @@
 // backend/src/services/directPushSender.js
-// Reusable FCM sender for Direct Push feature.
-// Uses provider Firebase messaging (same as fcmService.js pattern).
+// 🚀 Direct Push Sender — multi-strategy FCM delivery with full error capture
 
-const logger = require('../utils/logger');
-
-let firebaseConfig = null;
-try {
-  firebaseConfig = require('../config/firebase');
-} catch (e) {
-  console.warn('[directPushSender] firebase config not loadable:', e.message);
-}
+const firebaseConfig = require('../config/firebase');
 
 /**
- * Get the provider messaging instance (fallback to admin web if provider missing).
+ * Get the best available Firebase Messaging instance.
+ * Tries in order: Provider → AdminWeb → default admin SDK
  */
 function getMessaging() {
-  if (!firebaseConfig) {
-    throw new Error('Firebase config not available');
-  }
+  const strategies = [
+    { name: 'providerMessaging', fn: 'getProviderMessaging' },
+    { name: 'adminWebMessaging', fn: 'getAdminWebMessaging' },
+    { name: 'defaultMessaging', fn: 'getMessaging' },
+  ];
 
-  // Try provider messaging first
-  if (typeof firebaseConfig.getProviderMessaging === 'function') {
+  for (const s of strategies) {
     try {
-      const m = firebaseConfig.getProviderMessaging();
-      if (m) return m;
-    } catch (_) {}
-  }
-
-  // Fallback to admin web messaging
-  if (typeof firebaseConfig.getAdminWebMessaging === 'function') {
-    try {
-      const m = firebaseConfig.getAdminWebMessaging();
-      if (m) return m;
-    } catch (_) {}
-  }
-
-  // Legacy fallback
-  if (typeof firebaseConfig.getMessaging === 'function') {
-    try {
-      const m = firebaseConfig.getMessaging();
-      if (m) return m;
-    } catch (_) {}
-  }
-
-  throw new Error('No Firebase messaging instance available');
-}
-
-/**
- * Build the FCM message payload.
- */
-function buildMessage({ title, body, imageUrl, clickAction, customData }) {
-  const notification = {
-    title: String(title || ''),
-    body: String(body || ''),
-  };
-  if (imageUrl && typeof imageUrl === 'string' && imageUrl.trim()) {
-    notification.imageUrl = imageUrl.trim();
-  }
-
-  // Normalize data payload — FCM requires all values to be strings
-  const data = {};
-  if (customData && typeof customData === 'object') {
-    for (const [k, v] of Object.entries(customData)) {
-      if (v === null || v === undefined) continue;
-      data[String(k)] = typeof v === 'string' ? v : JSON.stringify(v);
+      if (typeof firebaseConfig[s.fn] === 'function') {
+        const msg = firebaseConfig[s.fn]();
+        if (msg && typeof msg.send === 'function') {
+          console.log(`[DirectPushSender] ✅ Using ${s.name}`);
+          return { messaging: msg, source: s.name };
+        }
+      }
+    } catch (e) {
+      console.warn(`[DirectPushSender] ⚠️ ${s.name} unavailable: ${e.message}`);
     }
   }
-  if (clickAction && typeof clickAction === 'string' && clickAction.trim()) {
-    data.click_action = clickAction.trim();
-    data.clickAction = clickAction.trim();
-    data.url = clickAction.trim();
-  }
-  data.sentAt = new Date().toISOString();
-  data.source = 'direct_push';
 
-  const android = {
-    priority: 'high',
-    notification: {
-      sound: 'default',
-      channelId: 'default',
-    },
-  };
-  if (imageUrl) android.notification.imageUrl = imageUrl;
-  if (clickAction) android.notification.clickAction = clickAction;
-
-  const apns = {
-    headers: { 'apns-priority': '10' },
-    payload: {
-      aps: {
-        alert: { title: notification.title, body: notification.body },
-        sound: 'default',
-        badge: 1,
-      },
-    },
-  };
-  if (imageUrl) {
-    apns.fcmOptions = { imageUrl };
+  // Last-resort: direct admin SDK
+  try {
+    const admin = require('firebase-admin');
+    if (admin.apps && admin.apps.length > 0) {
+      const msg = admin.messaging();
+      if (msg && typeof msg.send === 'function') {
+        console.log('[DirectPushSender] ✅ Using firebase-admin default app');
+        return { messaging: msg, source: 'admin-default' };
+      }
+    }
+  } catch (e) {
+    console.error('[DirectPushSender] ❌ firebase-admin fallback failed:', e.message);
   }
 
-  const webpush = {
-    headers: { Urgency: 'high' },
-    notification: {
-      title: notification.title,
-      body: notification.body,
-      icon: imageUrl || undefined,
-      requireInteraction: false,
-    },
-    fcmOptions: clickAction ? { link: clickAction } : undefined,
-  };
-
-  return { notification, data, android, apns, webpush };
+  throw new Error('No Firebase Messaging instance available. Check firebase initialization.');
 }
 
 /**
- * Normalize token list: dedupe, trim, filter empty strings.
+ * Normalize an array of tokens: trim, dedupe, filter non-strings/empty
  */
 function normalizeTokens(tokens) {
   if (!Array.isArray(tokens)) tokens = [tokens];
+  const clean = [];
   const seen = new Set();
-  const result = [];
   for (const t of tokens) {
     if (!t || typeof t !== 'string') continue;
     const trimmed = t.trim();
     if (!trimmed) continue;
     if (seen.has(trimmed)) continue;
     seen.add(trimmed);
-    result.push(trimmed);
+    clean.push(trimmed);
   }
-  return result;
+  return clean;
 }
 
 /**
- * Send to a single token (uses .send()).
+ * Convert all data payload values to strings (FCM requirement)
  */
-async function sendToSingleToken(token, payload) {
-  const messaging = getMessaging();
-  const base = buildMessage(payload);
-  const msg = { token, ...base };
+function stringifyData(data) {
+  if (!data || typeof data !== 'object') return {};
+  const out = {};
+  for (const [k, v] of Object.entries(data)) {
+    if (v === null || v === undefined) continue;
+    if (typeof v === 'string') out[k] = v;
+    else if (typeof v === 'number' || typeof v === 'boolean') out[k] = String(v);
+    else {
+      try { out[k] = JSON.stringify(v); } catch { out[k] = String(v); }
+    }
+  }
+  return out;
+}
 
+/**
+ * Build the FCM message payload for a single token
+ */
+function buildMessage({ token, title, body, imageUrl, clickAction, customData }) {
+  const dataPayload = stringifyData({
+    ...(customData || {}),
+    ...(clickAction ? { click_action: clickAction, actionUrl: clickAction } : {}),
+    sentAt: new Date().toISOString(),
+    source: 'admin-direct-push',
+  });
+
+  const message = {
+    token,
+    notification: {
+      title: String(title || ''),
+      body: String(body || ''),
+      ...(imageUrl ? { imageUrl: String(imageUrl) } : {}),
+    },
+    data: dataPayload,
+    android: {
+      priority: 'high',
+      notification: {
+        channelId: 'default',
+        sound: 'default',
+        priority: 'high',
+        ...(imageUrl ? { imageUrl: String(imageUrl) } : {}),
+        ...(clickAction ? { clickAction: 'FLUTTER_NOTIFICATION_CLICK' } : {}),
+      },
+    },
+    apns: {
+      headers: { 'apns-priority': '10' },
+      payload: {
+        aps: {
+          alert: {
+            title: String(title || ''),
+            body: String(body || ''),
+          },
+          sound: 'default',
+          badge: 1,
+          'mutable-content': 1,
+          'content-available': 1,
+        },
+      },
+      ...(imageUrl ? { fcm_options: { image: String(imageUrl) } } : {}),
+    },
+    webpush: {
+      headers: { Urgency: 'high' },
+      notification: {
+        title: String(title || ''),
+        body: String(body || ''),
+        ...(imageUrl ? { icon: String(imageUrl), image: String(imageUrl) } : {}),
+        ...(clickAction ? { click_action: clickAction } : {}),
+      },
+      ...(clickAction ? { fcmOptions: { link: clickAction } } : {}),
+    },
+  };
+
+  return message;
+}
+
+/**
+ * Check if an error means the token is invalid/unregistered
+ */
+function isInvalidTokenError(err) {
+  if (!err) return false;
+  const code = err.code || err.errorInfo?.code || '';
+  const msg = (err.message || '').toLowerCase();
+  return (
+    code === 'messaging/invalid-registration-token' ||
+    code === 'messaging/registration-token-not-registered' ||
+    code === 'messaging/invalid-argument' ||
+    msg.includes('invalid registration') ||
+    msg.includes('not registered') ||
+    msg.includes('invalid-registration-token') ||
+    msg.includes('registration-token-not-registered') ||
+    msg.includes('requested entity was not found')
+  );
+}
+
+/**
+ * Extract a clean, detailed error payload from a Firebase error
+ */
+function extractErrorDetails(err) {
+  if (!err) return { code: 'unknown', message: 'Unknown error' };
+  return {
+    code: err.code || err.errorInfo?.code || 'unknown',
+    message: err.message || err.errorInfo?.message || String(err),
+    details: err.errorInfo || null,
+    stack: process.env.NODE_ENV !== 'production' ? err.stack : undefined,
+  };
+}
+
+/**
+ * Send to a single token — returns { success, messageId?, error? }
+ */
+async function sendToSingleToken(token, { title, body, imageUrl, clickAction, customData }) {
+  const cleanToken = (token || '').trim();
+  if (!cleanToken) {
+    return { success: false, token: '', error: { code: 'empty-token', message: 'Token is empty' } };
+  }
+
+  let messaging;
   try {
-    const messageId = await messaging.send(msg);
-    return { success: true, messageId, token };
-  } catch (err) {
+    const result = getMessaging();
+    messaging = result.messaging;
+  } catch (e) {
+    console.error('[DirectPushSender] ❌ No messaging available:', e.message);
     return {
       success: false,
-      token,
-      errorCode: err?.code || err?.errorInfo?.code || 'unknown',
-      errorMessage: err?.message || String(err),
+      token: cleanToken,
+      error: { code: 'messaging-unavailable', message: e.message },
+    };
+  }
+
+  const message = buildMessage({
+    token: cleanToken,
+    title, body, imageUrl, clickAction, customData,
+  });
+
+  console.log(`[DirectPushSender] 📤 Sending to token: ${cleanToken.substring(0, 30)}...`);
+  console.log(`[DirectPushSender] 📦 Payload:`, JSON.stringify({
+    title, body, imageUrl: imageUrl || null, clickAction: clickAction || null,
+  }));
+
+  try {
+    const messageId = await messaging.send(message);
+    console.log(`[DirectPushSender] ✅ SUCCESS — messageId: ${messageId}`);
+    return { success: true, token: cleanToken, messageId };
+  } catch (err) {
+    const details = extractErrorDetails(err);
+    const invalid = isInvalidTokenError(err);
+    console.error(`[DirectPushSender] ❌ FAILED (invalid=${invalid}):`, JSON.stringify(details, null, 2));
+    return {
+      success: false,
+      token: cleanToken,
+      error: details,
+      invalidToken: invalid,
     };
   }
 }
 
 /**
- * Send to many tokens using sendEachForMulticast (max 500 per call).
- * Automatically batches larger lists.
+ * Send to multiple tokens — processes in batches of 500 using sendEach
  */
-async function sendToManyTokens(tokens, payload, tokenMetaMap = new Map()) {
-  const messaging = getMessaging();
-  const base = buildMessage(payload);
-  const normalized = normalizeTokens(tokens);
-
-  const results = {
-    total: normalized.length,
-    success: 0,
-    failure: 0,
-    invalidTokens: 0,
+async function sendToManyTokens(tokens, payload) {
+  const clean = normalizeTokens(tokens);
+  const result = {
+    total: clean.length,
+    successCount: 0,
+    failureCount: 0,
+    invalidTokenCount: 0,
     successes: [],
     failures: [],
   };
 
-  if (normalized.length === 0) {
-    return results;
+  if (clean.length === 0) {
+    console.warn('[DirectPushSender] ⚠️  No valid tokens to send to');
+    return result;
   }
 
-  const BATCH_SIZE = 500;
-  for (let i = 0; i < normalized.length; i += BATCH_SIZE) {
-    const batch = normalized.slice(i, i + BATCH_SIZE);
-    const multicast = {
-      tokens: batch,
-      ...base,
-    };
+  let messaging;
+  try {
+    const r = getMessaging();
+    messaging = r.messaging;
+  } catch (e) {
+    console.error('[DirectPushSender] ❌ Messaging unavailable:', e.message);
+    for (const t of clean) {
+      result.failureCount++;
+      result.failures.push({
+        token: t,
+        error: { code: 'messaging-unavailable', message: e.message },
+      });
+    }
+    return result;
+  }
 
-    let response;
+  const BATCH = 500;
+  console.log(`[DirectPushSender] 📤 Bulk send to ${clean.length} tokens in ${Math.ceil(clean.length / BATCH)} batches`);
+
+  for (let i = 0; i < clean.length; i += BATCH) {
+    const batchTokens = clean.slice(i, i + BATCH);
+    const messages = batchTokens.map(token => buildMessage({ token, ...payload }));
+
     try {
-      if (typeof messaging.sendEachForMulticast === 'function') {
-        response = await messaging.sendEachForMulticast(multicast);
-      } else if (typeof messaging.sendMulticast === 'function') {
-        response = await messaging.sendMulticast(multicast);
+      // Try sendEach first (modern)
+      let response;
+      if (typeof messaging.sendEach === 'function') {
+        response = await messaging.sendEach(messages);
+      } else if (typeof messaging.sendAll === 'function') {
+        response = await messaging.sendAll(messages);
       } else {
-        // Fallback: send individually
-        response = { responses: [], successCount: 0, failureCount: 0 };
-        for (const t of batch) {
-          const r = await sendToSingleToken(t, payload);
-          if (r.success) {
-            response.responses.push({ success: true, messageId: r.messageId });
-            response.successCount++;
-          } else {
-            response.responses.push({
-              success: false,
-              error: { code: r.errorCode, message: r.errorMessage },
-            });
-            response.failureCount++;
+        // Fallback: send one-by-one
+        response = { responses: [] };
+        for (const m of messages) {
+          try {
+            const id = await messaging.send(m);
+            response.responses.push({ success: true, messageId: id });
+          } catch (e) {
+            response.responses.push({ success: false, error: e });
           }
         }
       }
+
+      response.responses.forEach((r, idx) => {
+        const token = batchTokens[idx];
+        if (r.success) {
+          result.successCount++;
+          result.successes.push({ token, messageId: r.messageId });
+        } else {
+          const details = extractErrorDetails(r.error);
+          const invalid = isInvalidTokenError(r.error);
+          if (invalid) result.invalidTokenCount++;
+          result.failureCount++;
+          result.failures.push({ token, error: details, invalidToken: invalid });
+        }
+      });
+
+      console.log(`[DirectPushSender] Batch ${Math.floor(i / BATCH) + 1}: ${response.responses.filter(r => r.success).length}/${batchTokens.length} succeeded`);
     } catch (err) {
-      // Entire batch failed
-      logger.error(`[directPushSender] batch send failed: ${err.message}`);
-      for (const t of batch) {
-        const meta = tokenMetaMap.get(t) || {};
-        results.failure++;
-        results.failures.push({
-          token: t,
-          tokenPreview: t.substring(0, 20) + '...',
-          recipientId: meta.recipientId || null,
-          recipientType: meta.recipientType || 'unknown',
-          recipientLabel: meta.recipientLabel || '',
-          errorCode: err?.code || 'batch_failure',
-          errorMessage: err?.message || String(err),
-        });
+      console.error('[DirectPushSender] ❌ Batch send threw:', err.message);
+      for (const t of batchTokens) {
+        result.failureCount++;
+        result.failures.push({ token: t, error: extractErrorDetails(err) });
       }
-      continue;
     }
-
-    response.responses.forEach((resp, idx) => {
-      const token = batch[idx];
-      const meta = tokenMetaMap.get(token) || {};
-
-      if (resp.success) {
-        results.success++;
-        results.successes.push({
-          tokenPreview: token.substring(0, 20) + '...',
-          recipientId: meta.recipientId || null,
-          recipientType: meta.recipientType || 'unknown',
-          recipientLabel: meta.recipientLabel || '',
-          messageId: resp.messageId || '',
-        });
-      } else {
-        results.failure++;
-        const code = resp.error?.code || resp.error?.errorInfo?.code || 'unknown';
-        const invalidCodes = [
-          'messaging/invalid-registration-token',
-          'messaging/registration-token-not-registered',
-          'messaging/invalid-argument',
-        ];
-        if (invalidCodes.includes(code)) results.invalidTokens++;
-
-        results.failures.push({
-          token,
-          tokenPreview: token.substring(0, 20) + '...',
-          recipientId: meta.recipientId || null,
-          recipientType: meta.recipientType || 'unknown',
-          recipientLabel: meta.recipientLabel || '',
-          errorCode: code,
-          errorMessage: resp.error?.message || 'Unknown error',
-        });
-      }
-    });
   }
 
-  return results;
+  console.log(`[DirectPushSender] ✅ Final: ${result.successCount} success, ${result.failureCount} failed, ${result.invalidTokenCount} invalid`);
+  return result;
 }
 
 module.exports = {
@@ -268,4 +317,6 @@ module.exports = {
   buildMessage,
   normalizeTokens,
   getMessaging,
+  isInvalidTokenError,
+  extractErrorDetails,
 };
