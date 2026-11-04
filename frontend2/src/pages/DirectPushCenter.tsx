@@ -1,6 +1,6 @@
 // src/pages/DirectPushCenter.tsx
 // Direct Push Center — FCM sender + User/Provider browser with FCM tokens
-// v3.0 — Added FCM token browser tabs, fixed custom data JSON, Swiggy-style templates
+// v3.1 — Fixed "Objects are not valid as React child" crash in failure rendering
 
 import React, { useState, useEffect, useCallback } from 'react';
 import {
@@ -47,6 +47,33 @@ const useDebounce = <T,>(value: T, delay: number): T => {
 };
 const copyToClipboard = (text: string) => {
   navigator.clipboard.writeText(text).then(() => toast.success('Copied!')).catch(() => toast.error('Copy failed'));
+};
+
+// ═══════════════════════════════════════════════════════════
+// 🔒 SAFE STRING — converts ANY value to a string for JSX
+// This is the FIX for "Objects are not valid as React child"
+// ═══════════════════════════════════════════════════════════
+const safe = (val: any): string => {
+  if (val === null || val === undefined) return '';
+  if (typeof val === 'string') return val;
+  if (typeof val === 'number' || typeof val === 'boolean') return String(val);
+  if (val instanceof Error) return val.message || 'Unknown error';
+  if (typeof val === 'object') {
+    // Extract the most readable field from common error shapes
+    if (typeof val.message === 'string') return val.message;
+    if (typeof val.error === 'string') return val.error;
+    if (typeof val.msg === 'string') return val.msg;
+    if (typeof val.details === 'string') return val.details;
+    if (typeof val.code === 'string') return val.code;
+    // Fallback: JSON
+    try {
+      const s = JSON.stringify(val);
+      return s.length > 300 ? s.substring(0, 300) + '…' : s;
+    } catch {
+      return '[Object]';
+    }
+  }
+  return String(val);
 };
 
 // ─── Swiggy-style templates ───
@@ -155,7 +182,7 @@ export default function DirectPushCenter() {
       if (typeof p !== 'object' || Array.isArray(p) || p === null) setCustomDataError('Must be a JSON object');
       else setCustomDataError(null);
     } catch (e: any) {
-      setCustomDataError('Invalid JSON: ' + e.message);
+      setCustomDataError('Invalid JSON: ' + (e?.message || 'parse error'));
     }
   }, [customDataText]);
 
@@ -282,10 +309,10 @@ export default function DirectPushCenter() {
         setLastResult(res.data);
         toast.success(`✅ ${res.data.successCount} success · ❌ ${res.data.failureCount} failed`);
       } else {
-        toast.error(res.message || 'Send failed');
+        toast.error(safe(res.message) || 'Send failed');
       }
     } catch (e: any) {
-      toast.error(e.response?.data?.message || e.message || 'Send failed');
+      toast.error(safe(e.response?.data?.message) || safe(e.message) || 'Send failed');
     } finally { setSending(false); }
   };
 
@@ -337,6 +364,45 @@ export default function DirectPushCenter() {
       </div>
     </div>
   );
+
+  // ═══════════════════════════════════════════════════════════
+  // 🔒 SAFE FAILURE RENDERER — handles object errors properly
+  // ═══════════════════════════════════════════════════════════
+  const renderFailure = (f: any, idx: number) => {
+    // f can be: { code, error, token, project, message, details, invalidToken, allErrors }
+    // any of these fields can be string OR object
+    const errorCode = safe(f?.code || f?.project || '');
+    const errorMsg = safe(f?.error || f?.message || f?.details || 'Unknown error');
+    const tokenStr = safe(f?.token || f?.invalidToken || '');
+
+    return (
+      <div key={idx} className="p-2 bg-red-50 border border-red-100 rounded text-[10px]">
+        <p className="font-semibold text-red-700">
+          {errorCode ? `${errorCode}: ` : ''}{errorMsg}
+        </p>
+        {tokenStr && (
+          <p className="text-gray-500 truncate font-mono mt-0.5">
+            {tokenStr.length > 60 ? tokenStr.substring(0, 60) + '...' : tokenStr}
+          </p>
+        )}
+        {f?.allErrors && Array.isArray(f.allErrors) && f.allErrors.length > 0 && (
+          <details className="mt-1">
+            <summary className="text-[9px] text-red-600 cursor-pointer font-semibold">
+              All project attempts ({f.allErrors.length})
+            </summary>
+            <div className="mt-1 space-y-0.5 pl-2 border-l-2 border-red-200">
+              {f.allErrors.map((a: any, i: number) => (
+                <p key={i} className="text-[9px] text-red-600">
+                  <span className="font-semibold">{safe(a?.project || 'unknown')}:</span>{' '}
+                  {safe(a?.message || a?.error || a?.code || 'failed')}
+                </p>
+              ))}
+            </div>
+          </details>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div className="p-6 bg-gray-50 min-h-screen">
@@ -472,8 +538,8 @@ export default function DirectPushCenter() {
                     <div className="mt-3 p-3 bg-indigo-50 border border-indigo-200 rounded-lg flex items-center gap-3">
                       <div className="w-9 h-9 rounded-full bg-indigo-600 text-white flex items-center justify-center font-bold text-sm">{selectedProvider.name?.charAt(0) || '?'}</div>
                       <div className="flex-1 min-w-0">
-                        <p className="text-sm font-semibold text-indigo-900 truncate">{selectedProvider.name}</p>
-                        <p className="text-xs text-indigo-700 truncate">{selectedProvider.phone} · {selectedProvider.city || '—'}</p>
+                        <p className="text-sm font-semibold text-indigo-900 truncate">{safe(selectedProvider.name)}</p>
+                        <p className="text-xs text-indigo-700 truncate">{safe(selectedProvider.phone)} · {safe(selectedProvider.city) || '—'}</p>
                       </div>
                       {selectedProvider.hasToken ? <span className="px-2 py-0.5 bg-emerald-100 text-emerald-700 text-[10px] font-bold rounded">FCM OK</span> : <span className="px-2 py-0.5 bg-red-100 text-red-700 text-[10px] font-bold rounded">NO TOKEN</span>}
                       <button onClick={() => setSelectedProvider(null)} className="p-1 text-indigo-600 hover:bg-indigo-100 rounded"><X className="w-4 h-4" /></button>
@@ -483,10 +549,10 @@ export default function DirectPushCenter() {
                     <div className="mt-3 border border-gray-200 rounded-lg max-h-64 overflow-y-auto">
                       {searchResults.map(p => (
                         <button key={p._id} onClick={() => { setSelectedProvider(p); setSearchQuery(''); setSearchResults([]); }} className="w-full flex items-center gap-3 p-2.5 hover:bg-gray-50 border-b border-gray-100 last:border-b-0 text-left">
-                          <div className="w-8 h-8 rounded-full bg-gray-200 flex items-center justify-center font-bold text-xs text-gray-700">{p.name?.charAt(0) || '?'}</div>
+                          <div className="w-8 h-8 rounded-full bg-gray-200 flex items-center justify-center font-bold text-xs text-gray-700">{safe(p.name)?.charAt(0) || '?'}</div>
                           <div className="flex-1 min-w-0">
-                            <p className="text-sm font-medium text-gray-900 truncate">{p.name}</p>
-                            <p className="text-xs text-gray-500 truncate">{p.phone} · {p.profession || '—'}</p>
+                            <p className="text-sm font-medium text-gray-900 truncate">{safe(p.name)}</p>
+                            <p className="text-xs text-gray-500 truncate">{safe(p.phone)} · {safe(p.profession) || '—'}</p>
                           </div>
                           {p.hasToken ? <CheckCircle2 className="w-4 h-4 text-emerald-500" /> : <XCircle className="w-4 h-4 text-red-400" />}
                         </button>
@@ -537,7 +603,7 @@ export default function DirectPushCenter() {
                   <label className="block text-sm font-semibold text-gray-900 mb-1.5 flex items-center gap-1.5"><Code className="w-3.5 h-3.5" /> Custom Data (JSON)</label>
                   <textarea value={customDataText} onChange={e => setCustomDataText(e.target.value)} rows={5} placeholder='{"type": "offer", "code": "SAVE50"}'
                     className={`w-full px-3 py-2 border rounded-lg text-sm font-mono focus:ring-2 focus:border-transparent resize-none ${customDataError ? 'border-red-400 focus:ring-red-400' : 'border-gray-300 focus:ring-indigo-500'}`} />
-                  {customDataError && <p className="text-[11px] text-red-600 mt-1">{customDataError}</p>}
+                  {customDataError && <p className="text-[11px] text-red-600 mt-1">{safe(customDataError)}</p>}
                   <p className="text-[11px] text-gray-500 mt-1">All values auto-converted to strings for FCM</p>
                 </div>
               </div>
@@ -583,6 +649,7 @@ export default function DirectPushCenter() {
               </div>
             </div>
 
+            {/* Last Result — uses safe() for all dynamic values */}
             {lastResult && (
               <div className="bg-white rounded-xl border border-gray-200 p-4">
                 <div className="flex items-center gap-2 mb-3"><TrendingUp className="w-4 h-4 text-indigo-600" /><h3 className="text-sm font-bold text-gray-900">Last Result</h3></div>
@@ -593,16 +660,16 @@ export default function DirectPushCenter() {
                 </div>
                 <div className="text-[11px] text-gray-500 flex items-center justify-between">
                   <span>Duration: {formatDuration(lastResult.durationMs)}</span>
-                  <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${statusColor(lastResult.status)}`}>{lastResult.status}</span>
+                  <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${statusColor(safe(lastResult.status))}`}>{safe(lastResult.status)}</span>
                 </div>
-                {lastResult.failures?.length > 0 && (
+                {lastResult.failures && Array.isArray(lastResult.failures) && lastResult.failures.length > 0 && (
                   <div className="mt-3 max-h-40 overflow-y-auto space-y-1">
-                    {lastResult.failures.slice(0, 10).map((f, i) => (
-                      <div key={i} className="p-2 bg-red-50 border border-red-100 rounded text-[10px]">
-                        <p className="font-semibold text-red-700">{f.code || 'error'}: {f.error}</p>
-                        {f.token && <p className="text-gray-500 truncate font-mono">{f.token.substring(0, 40)}...</p>}
-                      </div>
-                    ))}
+                    {lastResult.failures.slice(0, 10).map((f: any, i: number) => renderFailure(f, i))}
+                    {lastResult.failures.length > 10 && (
+                      <p className="text-[9px] text-gray-500 text-center py-1">
+                        ...and {lastResult.failures.length - 10} more
+                      </p>
+                    )}
                   </div>
                 )}
               </div>
@@ -639,11 +706,11 @@ export default function DirectPushCenter() {
                 <div key={user._id} className="hover:bg-gray-50 transition">
                   <div className="p-4 flex items-center gap-3 cursor-pointer" onClick={() => setExpandedUser(expandedUser === user._id ? null : user._id)}>
                     <div className="w-10 h-10 rounded-full bg-gradient-to-br from-orange-400 to-red-500 flex items-center justify-center text-white font-bold text-sm flex-shrink-0">
-                      {user.profilePicture ? <img src={user.profilePicture} alt="" className="w-10 h-10 rounded-full object-cover" /> : (user.name?.charAt(0)?.toUpperCase() || '?')}
+                      {user.profilePicture ? <img src={user.profilePicture} alt="" className="w-10 h-10 rounded-full object-cover" /> : (safe(user.name)?.charAt(0)?.toUpperCase() || '?')}
                     </div>
                     <div className="flex-1 min-w-0">
-                      <p className="text-sm font-semibold text-gray-900 truncate">{user.name}</p>
-                      <p className="text-xs text-gray-500 truncate">{user.email} · {user.phone || '—'}</p>
+                      <p className="text-sm font-semibold text-gray-900 truncate">{safe(user.name)}</p>
+                      <p className="text-xs text-gray-500 truncate">{safe(user.email)} · {safe(user.phone) || '—'}</p>
                     </div>
                     <div className="flex items-center gap-2 flex-shrink-0">
                       <span className="px-2 py-0.5 bg-indigo-100 text-indigo-700 text-[10px] font-bold rounded">
@@ -659,16 +726,16 @@ export default function DirectPushCenter() {
                         <div key={i} className="p-3 bg-gray-50 border border-gray-200 rounded-lg">
                           <div className="flex items-center justify-between gap-2 mb-1.5">
                             <div className="flex items-center gap-2">
-                              <span className="px-1.5 py-0.5 bg-blue-100 text-blue-700 text-[9px] font-bold rounded uppercase">{t.platform}</span>
-                              {t.deviceModel && <span className="text-[10px] text-gray-500">{t.deviceModel}</span>}
-                              {t.appVersion && <span className="text-[10px] text-gray-400">v{t.appVersion}</span>}
+                              <span className="px-1.5 py-0.5 bg-blue-100 text-blue-700 text-[9px] font-bold rounded uppercase">{safe(t.platform)}</span>
+                              {t.deviceModel && <span className="text-[10px] text-gray-500">{safe(t.deviceModel)}</span>}
+                              {t.appVersion && <span className="text-[10px] text-gray-400">v{safe(t.appVersion)}</span>}
                             </div>
                             <div className="flex items-center gap-1">
                               <button onClick={() => copyToClipboard(t.token)} className="p-1 text-gray-400 hover:text-indigo-600 hover:bg-indigo-50 rounded" title="Copy token"><Copy className="w-3.5 h-3.5" /></button>
                               <button onClick={() => useTokenForSend(t.token)} className="px-2 py-0.5 bg-indigo-600 text-white text-[10px] font-bold rounded hover:bg-indigo-700 transition">Send Push</button>
                             </div>
                           </div>
-                          <p className="text-[10px] font-mono text-gray-600 break-all leading-relaxed">{t.token}</p>
+                          <p className="text-[10px] font-mono text-gray-600 break-all leading-relaxed">{safe(t.token)}</p>
                           <div className="flex gap-3 mt-1.5 text-[9px] text-gray-400">
                             <span>Created: {formatDate(t.createdAt)}</span>
                             <span>Last used: {formatDate(t.lastUsedAt)}</span>
@@ -727,16 +794,16 @@ export default function DirectPushCenter() {
                       <td className="p-3">
                         <div className="flex items-center gap-2.5">
                           <div className="w-8 h-8 rounded-full bg-gradient-to-br from-emerald-400 to-teal-500 flex items-center justify-center text-white font-bold text-xs flex-shrink-0">
-                            {p.profilePicture ? <img src={p.profilePicture} alt="" className="w-8 h-8 rounded-full object-cover" /> : (p.name?.charAt(0)?.toUpperCase() || '?')}
+                            {p.profilePicture ? <img src={p.profilePicture} alt="" className="w-8 h-8 rounded-full object-cover" /> : (safe(p.name)?.charAt(0)?.toUpperCase() || '?')}
                           </div>
                           <div className="min-w-0">
-                            <p className="text-sm font-semibold text-gray-900 truncate">{p.name}</p>
-                            <p className="text-[10px] text-gray-500 truncate">{p.providerId} · {p.phone}</p>
+                            <p className="text-sm font-semibold text-gray-900 truncate">{safe(p.name)}</p>
+                            <p className="text-[10px] text-gray-500 truncate">{safe(p.providerId)} · {safe(p.phone)}</p>
                           </div>
                         </div>
                       </td>
-                      <td className="p-3 text-xs text-gray-700">{p.profession || '—'}</td>
-                      <td className="p-3 text-xs text-gray-700">{p.city || '—'}</td>
+                      <td className="p-3 text-xs text-gray-700">{safe(p.profession) || '—'}</td>
+                      <td className="p-3 text-xs text-gray-700">{safe(p.city) || '—'}</td>
                       <td className="p-3">
                         <div className="flex items-center gap-1">
                           {p.isOnline ? <span className="w-2 h-2 rounded-full bg-emerald-500" /> : <span className="w-2 h-2 rounded-full bg-gray-300" />}
@@ -745,7 +812,7 @@ export default function DirectPushCenter() {
                       </td>
                       <td className="p-3 text-[10px] text-gray-500">{formatDate(p.lastLogin)}</td>
                       <td className="p-3">
-                        <p className="text-[9px] font-mono text-gray-500 truncate max-w-[140px]" title={p.token}>{p.token}</p>
+                        <p className="text-[9px] font-mono text-gray-500 truncate max-w-[140px]" title={p.token}>{safe(p.token)}</p>
                       </td>
                       <td className="p-3 text-center">
                         <div className="flex items-center justify-center gap-1">
@@ -783,10 +850,10 @@ export default function DirectPushCenter() {
                     <button key={log._id} onClick={() => loadHistoryDetail(log._id)} className="w-full p-4 hover:bg-gray-50 text-left transition">
                       <div className="flex items-start justify-between gap-3">
                         <div className="flex-1 min-w-0">
-                          <p className="text-sm font-semibold text-gray-900 truncate">{log.title}</p>
-                          <p className="text-xs text-gray-500 truncate mt-0.5">{log.body}</p>
+                          <p className="text-sm font-semibold text-gray-900 truncate">{safe(log.title)}</p>
+                          <p className="text-xs text-gray-500 truncate mt-0.5">{safe(log.body)}</p>
                           <div className="flex items-center gap-2 mt-2 flex-wrap">
-                            <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold border ${statusColor(log.status)}`}>{log.status}</span>
+                            <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold border ${statusColor(safe(log.status))}`}>{safe(log.status)}</span>
                             <span className="text-[10px] text-gray-500"><span className="font-bold text-emerald-600">{log.successCount}</span>/<span className="font-bold text-red-600">{log.failureCount}</span>/<span className="font-bold text-gray-700">{log.targetCount}</span></span>
                             <span className="text-[10px] text-gray-400"><Clock className="w-2.5 h-2.5 inline mr-0.5" />{formatDate(log.createdAt)}</span>
                           </div>
@@ -801,7 +868,7 @@ export default function DirectPushCenter() {
         </div>
       )}
 
-      {/* ═══════ HISTORY DETAIL MODAL ═══════ */}
+      {/* ═══════ HISTORY DETAIL MODAL — uses safe() + renderFailure() ═══════ */}
       {historyDetailId && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center p-4" onClick={() => { setHistoryDetailId(null); setHistoryDetail(null); }}>
           <div className="absolute inset-0 bg-black/70" />
@@ -813,7 +880,10 @@ export default function DirectPushCenter() {
             <div className="flex-1 overflow-y-auto p-4">
               {!historyDetail ? <div className="flex items-center justify-center p-8"><Loader2 className="w-6 h-6 animate-spin text-gray-400" /></div>
               : <div className="space-y-4">
-                  <div><p className="text-sm font-bold text-gray-900">{historyDetail.title}</p><p className="text-xs text-gray-600 mt-1">{historyDetail.body}</p></div>
+                  <div>
+                    <p className="text-sm font-bold text-gray-900">{safe(historyDetail.title)}</p>
+                    <p className="text-xs text-gray-600 mt-1">{safe(historyDetail.body)}</p>
+                  </div>
                   <div className="grid grid-cols-4 gap-2">
                     <div className="p-2 bg-gray-50 rounded text-center"><p className="text-[10px] uppercase font-bold text-gray-500">Target</p><p className="text-lg font-black text-gray-900">{historyDetail.targetCount}</p></div>
                     <div className="p-2 bg-emerald-50 rounded text-center"><p className="text-[10px] uppercase font-bold text-emerald-600">Success</p><p className="text-lg font-black text-emerald-700">{historyDetail.successCount}</p></div>
@@ -821,24 +891,31 @@ export default function DirectPushCenter() {
                     <div className="p-2 bg-amber-50 rounded text-center"><p className="text-[10px] uppercase font-bold text-amber-600">Invalid</p><p className="text-lg font-black text-amber-700">{historyDetail.invalidTokenCount}</p></div>
                   </div>
                   <div className="text-xs text-gray-500 space-y-1">
-                    <p>Mode: <span className="font-semibold text-gray-700">{historyDetail.targetMode}</span></p>
+                    <p>Mode: <span className="font-semibold text-gray-700">{safe(historyDetail.targetMode)}</span></p>
                     <p>Created: {formatDate(historyDetail.createdAt)}</p>
                     <p>Completed: {formatDate(historyDetail.completedAt)}</p>
                     <p>Duration: {formatDuration(historyDetail.durationMs)}</p>
                   </div>
-                  {historyDetail.failures && historyDetail.failures.length > 0 && (
+
+                  {/* ══ FAILURES — uses renderFailure() for safe rendering ══ */}
+                  {historyDetail.failures && Array.isArray(historyDetail.failures) && historyDetail.failures.length > 0 && (
                     <div>
                       <h4 className="text-sm font-bold text-red-700 mb-2">Failures ({historyDetail.failures.length})</h4>
                       <div className="max-h-64 overflow-y-auto space-y-1">
-                        {historyDetail.failures.map((f, i) => (
-                          <div key={i} className="p-2 bg-red-50 border border-red-100 rounded text-[10px]">
-                            <p className="font-semibold text-red-700">{f.code || 'error'}: {f.error}</p>
-                            {f.token && <p className="text-gray-500 truncate font-mono">{f.token.substring(0, 60)}...</p>}
-                          </div>
-                        ))}
+                        {historyDetail.failures.map((f: any, i: number) => renderFailure(f, i))}
                       </div>
                     </div>
                   )}
+
+                  {/* Raw data for debug */}
+                  <details>
+                    <summary className="text-xs font-bold text-gray-500 cursor-pointer hover:text-gray-700">
+                      🔧 Raw Response (debug)
+                    </summary>
+                    <pre className="mt-2 p-3 bg-gray-900 text-green-400 rounded-lg text-[10px] overflow-auto max-h-64 font-mono">
+                      {JSON.stringify(historyDetail, null, 2)}
+                    </pre>
+                  </details>
                 </div>}
             </div>
           </div>
