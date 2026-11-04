@@ -23,7 +23,7 @@ function getProviderModelSafe() {
 }
 
 /**
- * Safely get user collection (raw) — users schema may not have fcmToken field
+ * Safely get user collection (raw) — users schema uses fcmTokens[] array
  */
 function getUserCollectionSafe() {
   try {
@@ -37,6 +37,7 @@ function getUserCollectionSafe() {
 
 /**
  * Collect FCM tokens from all active providers
+ * Provider schema: single `fcmToken` field (string)
  */
 async function collectProviderTokens() {
   const Provider = getProviderModelSafe();
@@ -63,7 +64,9 @@ async function collectProviderTokens() {
 }
 
 /**
- * Collect FCM tokens from all active users (raw collection query)
+ * 🔥 FIXED: Collect FCM tokens from all active users
+ * User schema: fcmTokens: [{ token: "...", isActive: true, platform: "android", ... }]
+ * (NOT a single fcmToken field — it's an ARRAY of objects)
  */
 async function collectUserTokens() {
   const coll = getUserCollectionSafe();
@@ -72,19 +75,34 @@ async function collectUserTokens() {
     return [];
   }
   try {
+    // Query users who have at least one active token in the fcmTokens array
     const cursor = coll.find({
-      fcmToken: { $exists: true, $ne: null, $ne: '' },
+      fcmTokens: {
+        $elemMatch: {
+          token: { $exists: true, $ne: null, $ne: '' },
+          isActive: true,
+        },
+      },
       $or: [{ isActive: { $exists: false } }, { isActive: true }],
-    }, { projection: { fcmToken: 1 } });
+    }, { projection: { fcmTokens: 1, name: 1, email: 1 } });
 
     const tokens = [];
+    let userCount = 0;
     await cursor.forEach(doc => {
-      const t = (doc.fcmToken || '').toString().trim();
-      if (t) tokens.push(t);
+      userCount++;
+      if (!Array.isArray(doc.fcmTokens)) return;
+      for (const entry of doc.fcmTokens) {
+        if (!entry || entry.isActive === false) continue;
+        const t = (entry.token || '').toString().trim();
+        if (t) tokens.push(t);
+      }
     });
 
-    console.log(`[DirectPush] 📱 Collected ${tokens.length} user tokens`);
-    return tokens;
+    // Deduplicate
+    const unique = Array.from(new Set(tokens));
+
+    console.log(`[DirectPush] 📱 Collected ${unique.length} user tokens from ${userCount} users (fcmTokens[] array)`);
+    return unique;
   } catch (e) {
     console.error('[DirectPush] ❌ collectUserTokens error:', e.message);
     return [];
@@ -221,7 +239,6 @@ exports.sendDirectPush = async (req, res) => {
 
   if (targetTokens.length === 0) {
     const durationMs = Date.now() - startedAt;
-    // Still log it
     try {
       await DirectPushLog.create({
         title, body, imageUrl: imageUrl || null, clickAction: clickAction || null,
@@ -282,7 +299,7 @@ exports.sendDirectPush = async (req, res) => {
         successCount: r.success ? 1 : 0,
         failureCount: r.success ? 0 : 1,
         invalidTokenCount: r.invalidToken ? 1 : 0,
-        successes: r.success ? [{ token: r.token, messageId: r.messageId }] : [],
+        successes: r.success ? [{ token: r.token, messageId: r.messageId, firebaseProject: r.firebaseProject }] : [],
         failures: r.success ? [] : [{ token: r.token, error: r.error, invalidToken: r.invalidToken }],
       };
     } else {

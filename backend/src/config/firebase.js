@@ -3,6 +3,7 @@ const admin = require('firebase-admin');
 
 let adminWebApp = null;
 let providerApp = null;
+let userApp = null; // 🆕 USER APP (myapp-9d672)
 
 /**
  * Find cert() function — works for firebase-admin v10, v11, v12, v13, v14+
@@ -174,10 +175,53 @@ function initializeFirebase() {
   } else {
     console.warn('⚠️  No Provider Firebase credentials found. Provider FCM disabled.');
   }
+
+  // ─── 🆕 USER FIREBASE (myapp-9d672) ───
+  let userServiceAccount =
+    loadServiceAccountFromEnv('USER_FIREBASE_SERVICE_ACCOUNT_BASE64') ||
+    loadServiceAccountFromEnv('USER_FIREBASE_SERVICE_ACCOUNT_JSON') ||
+    loadServiceAccountFromEnv('FIREBASE_USER_SERVICE_ACCOUNT_B64') ||
+    loadServiceAccountFromEnv('FIREBASE_USER_SERVICE_ACCOUNT') ||
+    loadServiceAccountFromFile('../user-firebase-adminsdk.json') ||
+    loadServiceAccountFromFile('./user-firebase-adminsdk.json') ||
+    loadServiceAccountFromFile('../myapp-9d672-firebase-adminsdk.json') ||
+    loadServiceAccountFromFile('./myapp-9d672-firebase-adminsdk.json') ||
+    loadServiceAccountFromFile('../firebase-user-key.json') ||
+    loadServiceAccountFromFile('./firebase-user-key.json');
+
+  if (userServiceAccount && userServiceAccount.project_id) {
+    try {
+      userApp = initializeApp(
+        { credential: certFn(userServiceAccount) },
+        'userApp'
+      );
+      console.info(`✅ User Firebase initialized (project: ${userServiceAccount.project_id})`);
+    } catch (e) {
+      if (e.code === 'app/duplicate-app' && getApp) {
+        try {
+          userApp = getApp('userApp');
+          console.info('✅ User Firebase already initialized (reused)');
+        } catch {}
+      } else {
+        console.error('❌ User Firebase init failed:', e.message);
+      }
+    }
+  } else {
+    console.warn('⚠️  No User Firebase credentials found. User FCM disabled.');
+    console.warn('    Set USER_FIREBASE_SERVICE_ACCOUNT_BASE64 env var to enable user push notifications!');
+  }
+
+  // ─── Summary ───
+  console.info('\n🔥 Firebase Apps Summary:');
+  console.info(`   Admin Web:  ${adminWebApp ? '✅ ready' : '❌ not initialized'}`);
+  console.info(`   Provider:   ${providerApp ? '✅ ready' : '❌ not initialized'}`);
+  console.info(`   User:       ${userApp ? '✅ ready' : '❌ not initialized'}`);
+  console.info(`   Total:      ${admin.apps.length} app(s)\n`);
 }
 
 function isAdminWebFirebaseReady() { return !!adminWebApp; }
 function isProviderFirebaseReady() { return !!providerApp; }
+function isUserFirebaseReady() { return !!userApp; } // 🆕
 
 function getAdminWebMessaging() {
   if (!adminWebApp) return null;
@@ -196,6 +240,17 @@ function getProviderMessaging() {
     return getMessaging(providerApp);
   } catch (e) {
     return admin.messaging(providerApp);
+  }
+}
+
+// 🆕 NEW: Get User Firebase Messaging (myapp-9d672)
+function getUserMessaging() {
+  if (!userApp) return null;
+  try {
+    const { getMessaging } = require('firebase-admin/messaging');
+    return getMessaging(userApp);
+  } catch (e) {
+    return admin.messaging(userApp);
   }
 }
 
@@ -397,14 +452,72 @@ async function sendProviderFcmNotification(token, title, body, data = {}) {
   }
 }
 
+// 🆕 NEW: Send FCM notification to user app (myapp-9d672)
+async function sendUserFcmNotification(token, title, body, data = {}) {
+  if (!userApp) return { success: false, error: 'User Firebase not initialized' };
+  if (!token || typeof token !== 'string') {
+    return { success: false, error: 'Invalid token (must be string)' };
+  }
+
+  const safeTitle = typeof title === 'string' ? title : String(title || 'UWE Services');
+  const safeBody = typeof body === 'string' ? body : String(body || 'New notification');
+  const safeData = {};
+  if (data && typeof data === 'object') {
+    for (const [k, v] of Object.entries(data)) {
+      safeData[k] = String(v == null ? '' : v);
+    }
+  }
+
+  try {
+    const messaging = getUserMessaging();
+    if (!messaging) return { success: false, error: 'User messaging unavailable' };
+
+    const message = {
+      token,
+      notification: { title: safeTitle, body: safeBody },
+      data: safeData,
+      android: {
+        priority: 'high',
+        notification: {
+          title: safeTitle,
+          body: safeBody,
+          sound: 'default',
+          channelId: 'user_notifications',
+          priority: 'max',
+        },
+      },
+      apns: {
+        headers: { 'apns-priority': '10' },
+        payload: {
+          aps: {
+            alert: { title: safeTitle, body: safeBody },
+            sound: 'default',
+            badge: 1,
+          },
+        },
+      },
+    };
+
+    const response = await messaging.send(message);
+    return { success: true, messageId: response };
+  } catch (e) {
+    console.error('❌ User FCM send failed:', e.message);
+    return { success: false, error: e.code || e.message };
+  }
+}
+
 module.exports = {
   initializeFirebase,
   isAdminWebFirebaseReady,
   isProviderFirebaseReady,
+  isUserFirebaseReady, // 🆕
   sendAdminFcmNotification,
   sendProviderFcmNotification,
+  sendUserFcmNotification, // 🆕
   getAdminApp: () => adminWebApp,
   getProviderApp: () => providerApp,
+  getUserApp: () => userApp, // 🆕
   getAdminWebMessaging,
   getProviderMessaging,
+  getUserMessaging, // 🆕
 };
