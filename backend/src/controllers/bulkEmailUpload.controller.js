@@ -1,8 +1,8 @@
 // backend/src/controllers/bulkEmailUpload.controller.js
 // ============================================================
-// 📧 BULK EMAIL UPLOAD CONTROLLER v3.2
-// Uses existing emailService.js (Brevo SMTP/HTTP + Fake Filter + Retry)
-// FIXED: database import path (../config not ../../config)
+// 📧 BULK EMAIL UPLOAD CONTROLLER v4.0 — BULLETPROOF EMAIL EXTRACTOR
+// Extracts EVERY email from file (CSV, TXT, mixed garbage, multi-per-line)
+// Returns ALL recipients (not just sample)
 // ============================================================
 
 const mongoose = require('mongoose');
@@ -28,11 +28,10 @@ try {
   console.log('[BulkEmail] ✅ database module loaded');
 } catch (err) {
   console.error('[BulkEmail] ❌ database module load failed:', err.message);
-  // Try alternate paths
   try {
     const dbModule = require('../../config/database');
     getAdminConnection = dbModule.getAdminConnection;
-    console.log('[BulkEmail] ✅ database loaded from alternate path (../../config/database)');
+    console.log('[BulkEmail] ✅ database loaded from alternate path');
   } catch {}
 }
 
@@ -50,45 +49,56 @@ function getJobModel() {
     try {
       BulkEmailJob = conn.model('BulkEmailJob');
     } catch {
-      const schema = new mongoose.Schema(
-        {
-          adminId: { type: String, default: 'system' },
-          adminEmail: { type: String, default: '' },
-          fileName: { type: String, required: true },
-          subject: { type: String, required: true },
-          htmlBody: { type: String, default: '' },
-          totalRecipients: { type: Number, default: 0 },
-          validCount: { type: Number, default: 0 },
-          invalidCount: { type: Number, default: 0 },
-          duplicateCount: { type: Number, default: 0 },
-          sentCount: { type: Number, default: 0 },
-          failedCount: { type: Number, default: 0 },
-          skippedCount: { type: Number, default: 0 },
-          status: {
-            type: String,
-            enum: ['queued', 'processing', 'completed', 'failed', 'cancelled'],
-            default: 'queued',
-          },
-          recipients: [
-            {
-              email: String,
-              name: String,
-              status: {
-                type: String,
-                enum: ['pending', 'sent', 'failed', 'skipped'],
-                default: 'pending',
-              },
-              error: String,
-              sentAt: Date,
+      // Try loading the proper model file
+      try {
+        BulkEmailJob = require('../models/BulkEmailJob');
+      } catch {
+        const schema = new mongoose.Schema(
+          {
+            adminId: { type: String, default: 'system' },
+            adminEmail: { type: String, default: '' },
+            fileName: { type: String, required: true },
+            fileSizeBytes: { type: Number, default: 0 },
+            subject: { type: String, required: true },
+            htmlBody: { type: String, default: '' },
+            textBody: { type: String, default: '' },
+            totalRecipients: { type: Number, default: 0 },
+            validRecipients: { type: Number, default: 0 },
+            invalidRecipients: { type: Number, default: 0 },
+            duplicateRecipients: { type: Number, default: 0 },
+            sent: { type: Number, default: 0 },
+            failed: { type: Number, default: 0 },
+            skipped: { type: Number, default: 0 },
+            progress: { type: Number, default: 0 },
+            status: {
+              type: String,
+              enum: ['queued', 'running', 'processing', 'completed', 'completed_with_errors', 'failed', 'cancelled'],
+              default: 'queued',
             },
-          ],
-          startedAt: Date,
-          completedAt: Date,
-          errorMessage: String,
-        },
-        { timestamps: true, collection: 'bulkemailjobs' }
-      );
-      BulkEmailJob = conn.model('BulkEmailJob', schema);
+            recipients: [
+              {
+                email: String,
+                name: String,
+                status: {
+                  type: String,
+                  enum: ['pending', 'sent', 'failed', 'skipped'],
+                  default: 'pending',
+                },
+                errorMessage: String,
+                sentAt: Date,
+              },
+            ],
+            failures: [{ email: String, errorMessage: String }],
+            createdBy: { adminId: String, email: String, name: String },
+            startedAt: Date,
+            completedAt: Date,
+            durationMs: Number,
+            errorMessage: String,
+          },
+          { timestamps: true, collection: 'bulkemailjobs' }
+        );
+        BulkEmailJob = conn.model('BulkEmailJob', schema);
+      }
     }
     console.log('[BulkEmail] ✅ BulkEmailJob model ready');
     return BulkEmailJob;
@@ -99,154 +109,308 @@ function getJobModel() {
 }
 
 // ============================================================
-// CSV / TXT PARSER
+// BULLETPROOF EMAIL EXTRACTOR
 // ============================================================
+
+// Strict validator (RFC 5322 simplified but practical)
+const EMAIL_VALIDATE_REGEX = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,24}$/;
+
+// Global extractor — finds ALL email-looking substrings in any text
+const EMAIL_EXTRACT_REGEX = /[a-zA-Z0-9._%+\-!#$&'*+/=?^`{|}~]+@[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,24}/g;
+
 function cleanName(raw) {
   if (!raw) return '';
-  let n = raw.replace(/^["']|["']$/g, '').trim();
+  let n = String(raw).replace(/^["'<(\[]+|["'>)\]]+$/g, '').trim();
   n = n.replace(/<[^>]+>/g, '').trim();
-  n = n.replace(/\s+/g, ' ');
-  if (/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(n)) return '';
-  return n.substring(0, 100);
+  n = n.replace(/\([^)]*\)/g, '').trim();
+  n = n.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ');
+  // If the "name" is actually an email, discard it
+  if (EMAIL_VALIDATE_REGEX.test(n)) return '';
+  // If it contains @, it's probably email garbage
+  if (n.includes('@')) return '';
+  return n.substring(0, 100).trim();
 }
 
-function parseEmailFile(buffer, originalName) {
-  let raw = buffer.toString('utf-8');
-
-  if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
-  raw = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-
-  const allLines = raw.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-  if (allLines.length === 0) {
-    return { valid: [], invalid: [], duplicates: 0, hasNames: false, format: 'empty', error: 'File is empty' };
+/**
+ * MAIN PARSER — Uses a 2-pass approach:
+ * PASS 1: Try structured parsing (CSV/TSV) to capture name+email pairs
+ * PASS 2: Scan EVERY line with regex to catch any email missed by pass 1
+ * This guarantees no email is lost.
+ */
+function parseEmailFile(buffer, originalName = 'file.txt') {
+  let raw;
+  try {
+    raw = buffer.toString('utf-8');
+  } catch {
+    raw = buffer.toString('latin1');
   }
 
-  console.log(`[BulkEmail] 📝 Total non-empty lines: ${allLines.length}`);
-  console.log(`[BulkEmail] 📝 First line: "${allLines[0].substring(0, 120)}"`);
+  // Remove BOM
+  if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
 
-  const firstLine = allLines[0];
+  // Normalize all line endings
+  raw = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+  // Pre-process: unescape quoted content and normalize unicode
+  raw = raw.normalize('NFKC');
+
+  const allLines = raw.split('\n');
+  const nonEmptyLines = allLines.map(l => l.trim()).filter(l => l.length > 0);
+
+  if (nonEmptyLines.length === 0) {
+    return {
+      valid: [],
+      invalid: [],
+      duplicates: 0,
+      hasNames: false,
+      format: 'empty',
+      separator: null,
+      hasHeader: false,
+      totalLinesScanned: 0,
+      totalEmailsFound: 0,
+      error: 'File is empty',
+    };
+  }
+
+  console.log(`[BulkEmail] 📝 Total non-empty lines: ${nonEmptyLines.length}`);
+  console.log(`[BulkEmail] 📝 First line sample: "${nonEmptyLines[0].substring(0, 150)}"`);
+
+  // ─── DETECT SEPARATOR ───
+  const firstLine = nonEmptyLines[0];
+  const separators = [
+    { char: '\t', name: 'tab' },
+    { char: ';', name: 'semicolon' },
+    { char: '|', name: 'pipe' },
+    { char: ',', name: 'comma' },
+  ];
   let separator = ',';
-  if (firstLine.includes('\t')) separator = '\t';
-  else if (firstLine.includes(';')) separator = ';';
-  else if (firstLine.includes('|')) separator = '|';
-  else if (firstLine.includes(',')) separator = ',';
-
-  const sepName = separator === '\t' ? 'tab' : separator === ';' ? 'semicolon' : separator === '|' ? 'pipe' : 'comma';
-
-  const emailRegex = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$/;
-  const angleBracketRegex = /<?([a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})>?/;
-
-  let hasHeader = false;
-  const firstCols = firstLine.split(separator).map(c => c.trim().replace(/^["']|["']$/g, ''));
-  const firstColHasEmail = emailRegex.test(firstCols[0]) || angleBracketRegex.test(firstCols[0]);
-
-  if (!firstColHasEmail && firstCols.length >= 1) {
-    const headerKeywords = ['email', 'e-mail', 'mail', 'name', 'first', 'last', 'contact'];
-    const isHeader = firstCols.some(c => headerKeywords.includes(c.toLowerCase()));
-    if (isHeader) {
-      hasHeader = true;
-      console.log(`[BulkEmail] 📋 Header detected: "${firstLine}"`);
+  let sepName = 'comma';
+  let maxCount = 0;
+  for (const s of separators) {
+    const count = (firstLine.match(new RegExp(`\\${s.char}`, 'g')) || []).length;
+    if (count > maxCount) {
+      maxCount = count;
+      separator = s.char;
+      sepName = s.name;
     }
   }
 
-  if (!hasHeader) {
-    console.log('[BulkEmail] 📋 No header — treating all lines as data');
+  // ─── DETECT HEADER ───
+  const firstCols = firstLine.split(separator).map(c => c.trim().replace(/^["']|["']$/g, ''));
+  const firstColHasEmail = firstCols.some(c => EMAIL_VALIDATE_REGEX.test(c) || EMAIL_EXTRACT_REGEX.test(c));
+  EMAIL_EXTRACT_REGEX.lastIndex = 0; // reset global regex
+
+  let hasHeader = false;
+  if (!firstColHasEmail) {
+    const headerKeywords = ['email', 'e-mail', 'mail', 'name', 'first', 'last', 'contact', 'address'];
+    hasHeader = firstCols.some(c => headerKeywords.includes(c.toLowerCase().trim()));
   }
 
-  const dataLines = hasHeader ? allLines.slice(1) : allLines;
+  if (hasHeader) {
+    console.log(`[BulkEmail] 📋 Header detected: "${firstLine.substring(0, 100)}"`);
+  } else {
+    console.log('[BulkEmail] 📋 No header — all lines treated as data');
+  }
 
-  let emailColIdx = 0;
+  const dataLines = hasHeader ? nonEmptyLines.slice(1) : nonEmptyLines;
+
+  // ─── DETECT EMAIL/NAME COLUMNS (from header or by scanning) ───
+  let emailColIdx = -1;
   let nameColIdx = -1;
 
   if (hasHeader) {
     for (let i = 0; i < firstCols.length; i++) {
-      const lc = firstCols[i].toLowerCase();
-      if (lc.includes('email') || lc.includes('mail')) emailColIdx = i;
-      if (lc.includes('name') || lc.includes('first')) nameColIdx = i;
+      const lc = firstCols[i].toLowerCase().trim();
+      if (emailColIdx === -1 && (lc === 'email' || lc === 'e-mail' || lc === 'mail' || lc.includes('email'))) {
+        emailColIdx = i;
+      }
+      if (nameColIdx === -1 && (lc === 'name' || lc.includes('name') || lc === 'first' || lc === 'contact')) {
+        nameColIdx = i;
+      }
     }
   } else {
-    const sampleLines = dataLines.slice(0, Math.min(5, dataLines.length));
-    for (let col = 0; col < 5; col++) {
-      let emailHits = 0;
-      for (const line of sampleLines) {
-        const cols = line.split(separator).map(c => c.trim().replace(/^["']|["']$/g, ''));
-        if (cols[col] && emailRegex.test(cols[col])) emailHits++;
-        else if (cols[col] && angleBracketRegex.test(cols[col])) emailHits++;
-      }
-      if (emailHits >= Math.ceil(sampleLines.length * 0.5)) {
-        emailColIdx = col;
-        break;
+    // Scan first 10 data lines to detect which column holds emails
+    const sampleCount = Math.min(10, dataLines.length);
+    const colEmailHits = {};
+    for (let li = 0; li < sampleCount; li++) {
+      const cols = dataLines[li].split(separator);
+      for (let ci = 0; ci < cols.length; ci++) {
+        const cell = cols[ci].trim().replace(/^["']|["']$/g, '');
+        if (EMAIL_VALIDATE_REGEX.test(cell)) {
+          colEmailHits[ci] = (colEmailHits[ci] || 0) + 1;
+        }
       }
     }
-    if (emailColIdx === 0 && firstCols.length > 1) {
-      nameColIdx = 1;
-    } else if (emailColIdx === 1) {
-      nameColIdx = 0;
+    // Pick column with most email hits
+    let bestCol = -1, bestHits = 0;
+    for (const [ci, hits] of Object.entries(colEmailHits)) {
+      if (hits > bestHits) {
+        bestHits = hits;
+        bestCol = parseInt(ci);
+      }
+    }
+    if (bestCol >= 0) {
+      emailColIdx = bestCol;
+      // Name column = adjacent column
+      if (emailColIdx === 0 && firstCols.length > 1) nameColIdx = 1;
+      else if (emailColIdx > 0) nameColIdx = 0;
     }
   }
 
-  console.log(`[BulkEmail] 📊 Format: csv-${sepName}, Separator: ${sepName}`);
+  console.log(`[BulkEmail] 📊 Separator: ${sepName}, EmailCol: ${emailColIdx}, NameCol: ${nameColIdx}`);
 
-  const valid = [];
+  // ============================================================
+  // PASS 1 + PASS 2 COMBINED: Extract every email from every line
+  // ============================================================
+  const emailMap = new Map(); // email(lower) -> { email, name, firstSeenRow }
   const invalid = [];
-  const seenEmails = new Set();
-  let duplicates = 0;
-  let hasNames = false;
+  let duplicatesSkipped = 0;
+  let totalEmailsExtracted = 0;
 
-  for (const line of dataLines) {
-    const cols = line.split(separator).map(c => c.trim().replace(/^["']|["']$/g, ''));
+  dataLines.forEach((line, rowIdx) => {
+    // ─── PASS 1: Structured column extraction (preserves name) ───
+    let structuredEmail = null;
+    let structuredName = '';
 
-    let currentEmail = '';
-    let currentName = '';
+    if (emailColIdx >= 0) {
+      const cols = line.split(separator);
+      const rawEmailCell = (cols[emailColIdx] || '').trim().replace(/^["']|["']$/g, '');
 
-    const rawEmail = cols[emailColIdx] || '';
-    const angleMatch = rawEmail.match(angleBracketRegex);
-    if (angleMatch) {
-      currentEmail = angleMatch[1].toLowerCase().trim();
-    } else if (emailRegex.test(rawEmail)) {
-      currentEmail = rawEmail.toLowerCase().trim();
+      // Handle "Name <email@x.com>" format
+      const angleMatch = rawEmailCell.match(/<\s*([^<>\s]+@[^<>\s]+)\s*>/);
+      if (angleMatch) {
+        const candidate = angleMatch[1].toLowerCase().trim();
+        if (EMAIL_VALIDATE_REGEX.test(candidate)) {
+          structuredEmail = candidate;
+          const namePart = rawEmailCell.replace(/<[^>]+>/, '').trim().replace(/^["']|["']$/g, '');
+          if (namePart) structuredName = cleanName(namePart);
+        }
+      } else if (EMAIL_VALIDATE_REGEX.test(rawEmailCell)) {
+        structuredEmail = rawEmailCell.toLowerCase().trim();
+      }
+
+      // Name from name column
+      if (!structuredName && nameColIdx >= 0 && cols[nameColIdx]) {
+        structuredName = cleanName(cols[nameColIdx]);
+      }
     }
 
-    if (nameColIdx >= 0 && cols[nameColIdx]) {
-      currentName = cleanName(cols[nameColIdx]);
-    } else if (angleBracketRegex.test(rawEmail)) {
-      const namePart = rawEmail.replace(/<[^>]+>/, '').trim().replace(/^["']|["']$/g, '');
-      if (namePart) currentName = cleanName(namePart);
+    // ─── PASS 2: Regex scan of ENTIRE line (catches anything missed) ───
+    const matches = line.match(EMAIL_EXTRACT_REGEX) || [];
+
+    if (matches.length === 0 && !structuredEmail) {
+      // Line has no email at all
+      invalid.push({
+        email: line.substring(0, 80),
+        name: '',
+        isValid: false,
+        invalidReason: 'no-email-found',
+        row: rowIdx + (hasHeader ? 2 : 1),
+      });
+      return;
     }
 
-    if (currentName) hasNames = true;
-
-    if (!currentEmail || !emailRegex.test(currentEmail)) {
-      invalid.push({ email: rawEmail || line.substring(0, 50), reason: 'invalid-email' });
-      continue;
+    // Process structured email first (has name context)
+    if (structuredEmail) {
+      totalEmailsExtracted++;
+      if (!EMAIL_VALIDATE_REGEX.test(structuredEmail)) {
+        invalid.push({
+          email: structuredEmail,
+          name: structuredName,
+          isValid: false,
+          invalidReason: 'invalid-format',
+          row: rowIdx + (hasHeader ? 2 : 1),
+        });
+      } else if (emailMap.has(structuredEmail)) {
+        duplicatesSkipped++;
+      } else {
+        emailMap.set(structuredEmail, {
+          email: structuredEmail,
+          name: structuredName,
+          row: rowIdx + (hasHeader ? 2 : 1),
+        });
+      }
     }
 
-    if (seenEmails.has(currentEmail)) {
-      duplicates++;
-      continue;
+    // Process ALL other emails found in this line (via regex)
+    for (const match of matches) {
+      const emailLower = match.toLowerCase().trim();
+      totalEmailsExtracted++;
+
+      // Skip if this is the structured email we already processed
+      if (structuredEmail && emailLower === structuredEmail) continue;
+
+      if (!EMAIL_VALIDATE_REGEX.test(emailLower)) {
+        invalid.push({
+          email: match,
+          name: '',
+          isValid: false,
+          invalidReason: 'invalid-format',
+          row: rowIdx + (hasHeader ? 2 : 1),
+        });
+        continue;
+      }
+
+      if (emailMap.has(emailLower)) {
+        duplicatesSkipped++;
+        continue;
+      }
+
+      // Try to infer a name from the line context for this additional email
+      let inferredName = '';
+      // Look for "Name <email>" pattern around this email
+      const contextRegex = new RegExp(
+        `([^,;|\\t<]+)<\\s*${emailLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*>`,
+        'i'
+      );
+      const ctxMatch = line.match(contextRegex);
+      if (ctxMatch && ctxMatch[1]) {
+        inferredName = cleanName(ctxMatch[1]);
+      }
+
+      emailMap.set(emailLower, {
+        email: emailLower,
+        name: inferredName,
+        row: rowIdx + (hasHeader ? 2 : 1),
+      });
     }
-    seenEmails.add(currentEmail);
 
-    valid.push({ email: currentEmail, name: currentName });
-  }
+    EMAIL_EXTRACT_REGEX.lastIndex = 0; // reset global regex each iteration
+  });
 
-  console.log(`[BulkEmail] ✅ Parse complete:`);
-  console.log(`[BulkEmail]    Total data rows: ${dataLines.length}`);
-  console.log(`[BulkEmail]    Valid: ${valid.length}`);
-  console.log(`[BulkEmail]    Invalid: ${invalid.length}`);
-  console.log(`[BulkEmail]    Duplicates: ${duplicates}`);
-  console.log(`[BulkEmail]    Has names: ${hasNames}`);
-  console.log(`[BulkEmail]    Format: csv-${sepName}`);
+  // Convert map to array
+  const valid = Array.from(emailMap.values()).map(r => ({
+    email: r.email,
+    name: r.name || '',
+    isValid: true,
+    row: r.row,
+  }));
+
+  const hasNames = valid.some(r => r.name && r.name.length > 0);
+
+  console.log(`[BulkEmail] ✅ PARSE COMPLETE:`);
+  console.log(`[BulkEmail]    Total data lines: ${dataLines.length}`);
+  console.log(`[BulkEmail]    Total emails extracted (raw): ${totalEmailsExtracted}`);
+  console.log(`[BulkEmail]    ✅ Valid unique emails: ${valid.length}`);
+  console.log(`[BulkEmail]    ❌ Invalid entries: ${invalid.length}`);
+  console.log(`[BulkEmail]    🔁 Duplicates skipped: ${duplicatesSkipped}`);
+  console.log(`[BulkEmail]    👤 Has names: ${hasNames}`);
+  console.log(`[BulkEmail]    📊 Format: csv-${sepName}`);
   if (valid.length > 0) {
-    console.log(`[BulkEmail]    Sample: ${valid[0].email} (${valid[0].name || 'no name'})`);
+    console.log(`[BulkEmail]    📧 First valid: ${valid[0].email} (${valid[0].name || 'no name'})`);
+    console.log(`[BulkEmail]    📧 Last valid: ${valid[valid.length - 1].email}`);
   }
 
   return {
     valid,
     invalid,
-    duplicates,
+    duplicates: duplicatesSkipped,
     hasNames,
     format: `csv-${sepName}`,
+    separator: sepName,
+    hasHeader,
+    totalLinesScanned: dataLines.length,
+    totalEmailsFound: totalEmailsExtracted,
     error: null,
   };
 }
@@ -284,7 +448,7 @@ async function processJob(jobId) {
 
     if (job.status === 'cancelled') return;
 
-    job.status = 'processing';
+    job.status = 'running';
     job.startedAt = new Date();
     await job.save();
 
@@ -304,6 +468,7 @@ async function processJob(jobId) {
         console.log(`[BulkEmail] ⛔ Job ${jobId} cancelled at ${i}/${job.recipients.length}`);
         job.status = 'cancelled';
         job.completedAt = new Date();
+        job.durationMs = job.startedAt ? Date.now() - job.startedAt.getTime() : 0;
         await job.save();
         return;
       }
@@ -326,22 +491,27 @@ async function processJob(jobId) {
           sentCount++;
         } else if (result.skipped || result.fake) {
           recipient.status = 'skipped';
-          recipient.error = result.message || 'filtered';
+          recipient.errorMessage = result.message || 'filtered';
           skippedCount++;
         } else {
           recipient.status = 'failed';
-          recipient.error = result.message || 'unknown error';
+          recipient.errorMessage = result.message || 'unknown error';
           failedCount++;
+          if (!job.failures) job.failures = [];
+          job.failures.push({ email: recipient.email, errorMessage: recipient.errorMessage });
         }
       } catch (err) {
         recipient.status = 'failed';
-        recipient.error = err.message;
+        recipient.errorMessage = err.message;
         failedCount++;
+        if (!job.failures) job.failures = [];
+        job.failures.push({ email: recipient.email, errorMessage: err.message });
       }
 
-      job.sentCount = sentCount;
-      job.failedCount = failedCount;
-      job.skippedCount = skippedCount;
+      job.sent = sentCount;
+      job.failed = failedCount;
+      job.skipped = skippedCount;
+      job.progress = Math.round(((sentCount + failedCount + skippedCount) / job.totalRecipients) * 100);
 
       if ((i + 1) % 5 === 0 || i === job.recipients.length - 1) {
         await job.save();
@@ -357,11 +527,13 @@ async function processJob(jobId) {
       }
     }
 
-    job.status = 'completed';
+    job.status = failedCount > 0 ? 'completed_with_errors' : 'completed';
     job.completedAt = new Date();
-    job.sentCount = sentCount;
-    job.failedCount = failedCount;
-    job.skippedCount = skippedCount;
+    job.durationMs = job.startedAt ? Date.now() - job.startedAt.getTime() : 0;
+    job.sent = sentCount;
+    job.failed = failedCount;
+    job.skipped = skippedCount;
+    job.progress = 100;
     await job.save();
 
     activeJobs.delete(jobId.toString());
@@ -383,7 +555,7 @@ async function processJob(jobId) {
 }
 
 // ============================================================
-// CONTROLLERS — Export names MUST match route file
+// CONTROLLERS
 // ============================================================
 
 // POST /preview
@@ -396,7 +568,8 @@ exports.previewUpload = async (req, res) => {
     }
 
     console.log(`[BulkEmail] 📄 File: ${req.file.originalname}, size: ${req.file.size} bytes`);
-    console.log(`[BulkEmail] 📝 Content preview (first 500 chars):\n${req.file.buffer.toString('utf-8').substring(0, 500)}`);
+    const preview500 = req.file.buffer.toString('utf-8').substring(0, 500);
+    console.log(`[BulkEmail] 📝 Content preview (first 500 chars):\n${preview500}`);
 
     const parsed = parseEmailFile(req.file.buffer, req.file.originalname);
 
@@ -404,19 +577,56 @@ exports.previewUpload = async (req, res) => {
       return res.status(400).json({ success: false, message: parsed.error });
     }
 
+    // Build normalized recipients list — ALL recipients, not sample
+    const allRecipients = [
+      ...parsed.valid.map(r => ({
+        email: r.email,
+        name: r.name || null,
+        isValid: true,
+        row: r.row,
+      })),
+      ...parsed.invalid.map(r => ({
+        email: r.email,
+        name: r.name || null,
+        isValid: false,
+        invalidReason: r.invalidReason,
+        row: r.row,
+      })),
+    ];
+
+    const totalRows = parsed.valid.length + parsed.invalid.length + parsed.duplicates;
+
     return res.json({
       success: true,
       data: {
         fileName: req.file.originalname,
-        fileSize: req.file.size,
+        fileSizeBytes: req.file.size,
+        fileSize: req.file.size, // alias
         format: parsed.format,
-        totalRows: parsed.valid.length + parsed.invalid.length + parsed.duplicates,
+        detectedFormat: parsed.format,
+        detectedSeparator: parsed.separator,
+        separator: parsed.separator,
+        hasHeaderRow: parsed.hasHeader,
+        headerRow: parsed.hasHeader ? 'detected' : null,
+        totalRows,
+        totalLinesScanned: parsed.totalLinesScanned,
+        totalEmailsFound: parsed.totalEmailsFound,
+
+        // Both naming conventions for frontend compatibility
+        validRecipients: parsed.valid.length,
+        invalidRecipients: parsed.invalid.length,
+        duplicateRecipients: parsed.duplicates,
         validCount: parsed.valid.length,
         invalidCount: parsed.invalid.length,
         duplicateCount: parsed.duplicates,
+
         hasNames: parsed.hasNames,
-        sampleRecipients: parsed.valid.slice(0, 10),
-        sampleInvalid: parsed.invalid.slice(0, 5),
+        hasNameColumn: parsed.hasNames,
+
+        // ✅ RETURN ALL RECIPIENTS (not just sample)
+        sampleRecipients: allRecipients,
+        allRecipients,
+        invalidSamples: parsed.invalid.slice(0, 20),
       },
     });
   } catch (err) {
@@ -435,7 +645,7 @@ exports.startBulkSend = async (req, res) => {
       return res.status(400).json({ success: false, message: 'No file uploaded' });
     }
 
-    const { subject, htmlBody } = req.body;
+    const { subject, htmlBody, textBody } = req.body;
     if (!subject || !subject.trim()) {
       return res.status(400).json({ success: false, message: 'Subject is required' });
     }
@@ -463,13 +673,21 @@ exports.startBulkSend = async (req, res) => {
       adminId: req.admin?.adminId || req.admin?._id || 'system',
       adminEmail: req.admin?.email || '',
       fileName: req.file.originalname,
+      fileSizeBytes: req.file.size,
       subject: subject.trim(),
       htmlBody: htmlBody,
+      textBody: textBody || '',
       totalRecipients: parsed.valid.length,
-      validCount: parsed.valid.length,
-      invalidCount: parsed.invalid.length,
-      duplicateCount: parsed.duplicates,
+      validRecipients: parsed.valid.length,
+      invalidRecipients: parsed.invalid.length,
+      duplicateRecipients: parsed.duplicates,
       status: 'queued',
+      progress: 0,
+      createdBy: {
+        adminId: req.admin?._id || null,
+        email: req.admin?.email || '',
+        name: req.admin?.name || '',
+      },
       recipients: parsed.valid.map(r => ({
         email: r.email,
         name: r.name || '',
@@ -489,8 +707,11 @@ exports.startBulkSend = async (req, res) => {
       data: {
         jobId: job._id,
         totalRecipients: parsed.valid.length,
+        validRecipients: parsed.valid.length,
         validCount: parsed.valid.length,
+        invalidRecipients: parsed.invalid.length,
         invalidCount: parsed.invalid.length,
+        duplicateRecipients: parsed.duplicates,
         duplicateCount: parsed.duplicates,
         status: 'queued',
         message: `Job queued. ${parsed.valid.length} emails will be sent shortly.`,
@@ -506,16 +727,36 @@ exports.startBulkSend = async (req, res) => {
 exports.listJobs = async (req, res) => {
   try {
     const Model = getJobModel();
-    if (!Model) return res.json({ success: true, data: [] });
+    if (!Model) return res.json({ success: true, data: { jobs: [] } });
 
-    const jobs = await Model.find({})
-      .select('-recipients')
-      .sort({ createdAt: -1 })
-      .limit(50)
-      .lean();
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 50;
+    const skip = (page - 1) * limit;
 
-    return res.json({ success: true, data: jobs });
+    const [jobs, total] = await Promise.all([
+      Model.find({})
+        .select('-recipients -failures')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Model.countDocuments({}),
+    ]);
+
+    return res.json({
+      success: true,
+      data: {
+        jobs,
+        pagination: {
+          total,
+          page,
+          pages: Math.ceil(total / limit),
+          limit,
+        },
+      },
+    });
   } catch (err) {
+    console.error('[BulkEmail] listJobs error:', err);
     return res.status(500).json({ success: false, message: err.message });
   }
 };
@@ -529,7 +770,7 @@ exports.getJob = async (req, res) => {
     const job = await Model.findById(req.params.id).lean();
     if (!job) return res.status(404).json({ success: false, message: 'Job not found' });
 
-    return res.json({ success: true, data: job });
+    return res.json({ success: true, data: { job } });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -542,25 +783,32 @@ exports.getJobProgress = async (req, res) => {
     if (!Model) return res.status(404).json({ success: false, message: 'DB not ready' });
 
     const job = await Model.findById(req.params.id)
-      .select('status totalRecipients sentCount failedCount skippedCount startedAt completedAt errorMessage')
+      .select('status totalRecipients validRecipients sent failed skipped progress startedAt completedAt durationMs errorMessage')
       .lean();
 
     if (!job) return res.status(404).json({ success: false, message: 'Job not found' });
+
+    const sent = job.sent || 0;
+    const failed = job.failed || 0;
+    const skipped = job.skipped || 0;
+    const total = job.totalRecipients || job.validRecipients || 0;
+    const progress = job.progress || (total > 0 ? Math.round(((sent + failed + skipped) / total) * 100) : 0);
 
     return res.json({
       success: true,
       data: {
         jobId: job._id || req.params.id,
         status: job.status,
-        totalRecipients: job.totalRecipients,
-        sentCount: job.sentCount || 0,
-        failedCount: job.failedCount || 0,
-        skippedCount: job.skippedCount || 0,
-        progress: job.totalRecipients > 0
-          ? Math.round(((job.sentCount + job.failedCount + job.skippedCount) / job.totalRecipients) * 100)
-          : 0,
+        totalRecipients: total,
+        validRecipients: job.validRecipients || total,
+        sent,
+        failed,
+        skipped,
+        progress,
         startedAt: job.startedAt,
         completedAt: job.completedAt,
+        durationMs: job.durationMs || 0,
+        error: job.errorMessage,
         errorMessage: job.errorMessage,
       },
     });
