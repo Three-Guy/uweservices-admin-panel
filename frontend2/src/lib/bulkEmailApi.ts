@@ -15,14 +15,19 @@ export interface PreviewUploadResult {
   fileName: string;
   fileSizeBytes: number;
   totalRows: number;
+  totalLinesScanned?: number;
+  totalEmailsFound?: number;
   validRecipients: number;
   invalidRecipients: number;
   duplicateRecipients: number;
   hasNameColumn: boolean;
+  hasHeaderRow?: boolean;
   detectedFormat: string;
   detectedSeparator: string | null;
+  separator?: string | null;
   headerRow: string | null;
-  sampleRecipients: ParsedRecipient[];
+  sampleRecipients: ParsedRecipient[];  // Backend now returns ALL
+  allRecipients?: ParsedRecipient[];
   invalidSamples: ParsedRecipient[];
 }
 
@@ -58,15 +63,41 @@ export interface JobProgress {
   progress: number;
   sent: number;
   failed: number;
+  skipped?: number;
   validRecipients: number;
   totalRecipients: number;
   durationMs: number;
   startedAt?: string;
   completedAt?: string;
   error?: string;
+  errorMessage?: string;
 }
 
 const BASE = '/admin/bulk-email';
+
+// Normalize backend response to frontend shape
+function normalizePreview(raw: any, file: File): PreviewUploadResult {
+  const d = raw || {};
+  return {
+    fileName: d.fileName || file.name,
+    fileSizeBytes: d.fileSizeBytes || d.fileSize || file.size,
+    totalRows: d.totalRows ?? 0,
+    totalLinesScanned: d.totalLinesScanned,
+    totalEmailsFound: d.totalEmailsFound,
+    validRecipients: d.validRecipients ?? d.validCount ?? 0,
+    invalidRecipients: d.invalidRecipients ?? d.invalidCount ?? 0,
+    duplicateRecipients: d.duplicateRecipients ?? d.duplicateCount ?? 0,
+    hasNameColumn: d.hasNameColumn ?? d.hasNames ?? false,
+    hasHeaderRow: d.hasHeaderRow,
+    detectedFormat: d.detectedFormat || d.format || 'unknown',
+    detectedSeparator: d.detectedSeparator ?? d.separator ?? null,
+    separator: d.separator,
+    headerRow: d.headerRow ?? null,
+    sampleRecipients: d.sampleRecipients || d.allRecipients || [],
+    allRecipients: d.allRecipients || d.sampleRecipients || [],
+    invalidSamples: d.invalidSamples || [],
+  };
+}
 
 export const bulkEmailApi = {
   // Preview upload — parse file and return stats
@@ -77,33 +108,16 @@ export const bulkEmailApi = {
       const res = await apiClient.post(`${BASE}/preview`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
-      // Handle both { success, data: {...} } and { success, ...fields }
       const body = res.data;
-      if (body.data) {
-        return { success: true, data: body.data };
-      }
-      // Fallback: body IS the data
-      return { success: true, data: body };
+      const raw = body.data || body;
+      return { success: true, data: normalizePreview(raw, file) };
     } catch (err: any) {
       const msg = err.response?.data?.message || err.message || 'Preview failed';
       console.error('[bulkEmailApi] previewUpload error:', msg);
       return {
         success: false,
         message: msg,
-        data: {
-          fileName: file.name,
-          fileSizeBytes: file.size,
-          totalRows: 0,
-          validRecipients: 0,
-          invalidRecipients: 0,
-          duplicateRecipients: 0,
-          hasNameColumn: false,
-          detectedFormat: 'unknown',
-          detectedSeparator: null,
-          headerRow: null,
-          sampleRecipients: [],
-          invalidSamples: [],
-        },
+        data: normalizePreview({}, file),
       };
     }
   },
@@ -126,7 +140,19 @@ export const bulkEmailApi = {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
       const body = res.data;
-      return { success: true, data: body.data || body };
+      const d = body.data || body;
+      return {
+        success: true,
+        data: {
+          jobId: d.jobId,
+          validRecipients: d.validRecipients ?? d.validCount ?? 0,
+          invalidRecipients: d.invalidRecipients ?? d.invalidCount ?? 0,
+          duplicateRecipients: d.duplicateRecipients ?? d.duplicateCount ?? 0,
+          totalRecipients: d.totalRecipients ?? d.validRecipients ?? 0,
+          status: d.status,
+          message: d.message,
+        },
+      };
     } catch (err: any) {
       const msg = err.response?.data?.message || err.message || 'Send failed';
       return { success: false, data: {}, message: msg };
@@ -138,11 +164,38 @@ export const bulkEmailApi = {
     try {
       const res = await apiClient.get(`${BASE}/jobs/${jobId}/progress`);
       const body = res.data;
-      return { success: true, data: body.data || body };
+      const d = body.data || body;
+      return {
+        success: true,
+        data: {
+          jobId: d.jobId || jobId,
+          status: d.status || 'unknown',
+          progress: d.progress ?? 0,
+          sent: d.sent ?? 0,
+          failed: d.failed ?? 0,
+          skipped: d.skipped ?? 0,
+          validRecipients: d.validRecipients ?? d.totalRecipients ?? 0,
+          totalRecipients: d.totalRecipients ?? 0,
+          durationMs: d.durationMs ?? 0,
+          startedAt: d.startedAt,
+          completedAt: d.completedAt,
+          error: d.error || d.errorMessage,
+          errorMessage: d.errorMessage,
+        },
+      };
     } catch (err: any) {
       return {
         success: false,
-        data: { jobId, status: 'unknown', progress: 0, sent: 0, failed: 0, validRecipients: 0, totalRecipients: 0, durationMs: 0 },
+        data: {
+          jobId,
+          status: 'unknown',
+          progress: 0,
+          sent: 0,
+          failed: 0,
+          validRecipients: 0,
+          totalRecipients: 0,
+          durationMs: 0,
+        },
       };
     }
   },
@@ -152,7 +205,9 @@ export const bulkEmailApi = {
     try {
       const res = await apiClient.get(`${BASE}/jobs/${jobId}`);
       const body = res.data;
-      return { success: true, data: body.data || { job: body } };
+      const d = body.data || body;
+      const job = d.job || d;
+      return { success: true, data: { job } };
     } catch (err: any) {
       return { success: false, data: { job: {} as any } };
     }
@@ -167,7 +222,17 @@ export const bulkEmailApi = {
       const res = await apiClient.get(`${BASE}/jobs`, { params });
       const body = res.data;
       const d = body.data || body;
-      return { success: true, data: { jobs: d.jobs || [], ...d.pagination } };
+      const jobs = Array.isArray(d) ? d : (d.jobs || []);
+      const pagination = d.pagination || {};
+      return {
+        success: true,
+        data: {
+          jobs,
+          total: pagination.total,
+          page: pagination.page,
+          pages: pagination.pages,
+        },
+      };
     } catch (err: any) {
       return { success: false, data: { jobs: [] } };
     }

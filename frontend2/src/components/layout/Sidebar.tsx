@@ -1,6 +1,6 @@
 // src/components/layout/Sidebar.tsx
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { NavLink, useLocation, useNavigate } from 'react-router-dom';
+import { NavLink, useLocation } from 'react-router-dom';
 import {
   LayoutDashboard,
   Users,
@@ -30,20 +30,24 @@ import {
   ShoppingCart,
   Gift,
   Receipt,
-  Palette,
   TrendingUp,
   Menu,
   X,
   Home,
   Calendar,
-  Activity,
-  Clock,
   Zap,
   Radar,
   Radio,
   Target,
-  Mail,      // ✅ NEW — Bulk Email icon
-  Rocket,    // ✅ NEW — Direct Push icon
+  Mail,
+  Rocket,
+  Palette,
+  Moon,
+  Sun,
+  Monitor,
+  Waves,
+  TreePine,
+  Sunset,
 } from 'lucide-react';
 import { useAuth } from '../../store/AuthContext';
 import { usersApi, providersApi, bookingsApi } from '../../lib/api';
@@ -55,25 +59,21 @@ interface UserStats {
   todaySignups: number;
   verifiedUsers: number;
 }
-
 interface ProviderStatsSimple {
   pendingVerifications: number;
 }
-
 interface BookingStatsSimple {
   pendingBookings: number;
   todayBookings: number;
   inProgressBookings: number;
 }
-
 interface NavItem {
   name: string;
   href: string;
   icon: React.ElementType;
   hasBadge?: boolean;
   badgeType?: string;
-  isHot?: boolean;
-  isPinned?: boolean;
+  isNew?: boolean;
   isCritical?: boolean;
 }
 
@@ -81,170 +81,219 @@ interface NavItem {
 const useIsMobile = () => {
   const [isMobile, setIsMobile] = useState(false);
   useEffect(() => {
-    const checkMobile = () => setIsMobile(window.innerWidth < 768);
-    checkMobile();
-    window.addEventListener('resize', checkMobile);
-    return () => window.removeEventListener('resize', checkMobile);
+    const check = () => setIsMobile(window.innerWidth < 768);
+    check();
+    window.addEventListener('resize', check);
+    return () => window.removeEventListener('resize', check);
   }, []);
   return isMobile;
 };
 
-const useSwipe = (onSwipeLeft: () => void, onSwipeRight: () => void) => {
-  const touchStartX = useRef(0);
-  const touchEndX = useRef(0);
-  const onTouchStart = (e: React.TouchEvent) => { touchStartX.current = e.touches[0].clientX; };
-  const onTouchMove = (e: React.TouchEvent) => { touchEndX.current = e.touches[0].clientX; };
-  const onTouchEnd = () => {
-    const diff = touchStartX.current - touchEndX.current;
-    if (Math.abs(diff) > 50) diff > 0 ? onSwipeLeft() : onSwipeRight();
+const useSwipe = (onLeft: () => void, onRight: () => void) => {
+  const startX = useRef(0);
+  const endX = useRef(0);
+  return {
+    onTouchStart: (e: React.TouchEvent) => { startX.current = e.touches[0].clientX; },
+    onTouchMove: (e: React.TouchEvent) => { endX.current = e.touches[0].clientX; },
+    onTouchEnd: () => {
+      const d = startX.current - endX.current;
+      if (Math.abs(d) > 50) d > 0 ? onLeft() : onRight();
+    },
   };
-  return { onTouchStart, onTouchMove, onTouchEnd };
 };
 
 // ─── Themes ───
 const themes = {
   light: {
     name: 'Light',
+    icon: Sun,
     sidebar: 'bg-white',
-    text: 'text-gray-700',
-    textMuted: 'text-gray-500',
-    textActive: 'text-indigo-600',
-    border: 'border-gray-200',
-    hover: 'hover:bg-gray-100 active:bg-gray-200',
-    active: 'bg-gradient-to-r from-indigo-50 to-purple-50 text-indigo-700 border-r-[3px] border-indigo-600',
+    text: 'text-gray-600',
+    textMuted: 'text-gray-400',
+    textActive: 'text-gray-900',
+    border: 'border-gray-200/80',
+    hover: 'hover:bg-gray-50 active:bg-gray-100',
+    active: 'bg-indigo-50 text-indigo-700 font-semibold',
+    activeBar: 'bg-indigo-600',
     cardBg: 'bg-gray-50',
     accent: 'bg-indigo-600',
-    accentHover: 'hover:bg-indigo-700',
+    accentText: 'text-indigo-600',
     badge: 'bg-indigo-100 text-indigo-700',
-    badgeHot: 'bg-gradient-to-r from-pink-500 to-rose-500 text-white',
-    badgeCritical: 'bg-gradient-to-r from-red-600 to-orange-600 text-white',
-    badgeLive: 'bg-emerald-100 text-emerald-700',
-    shadow: 'shadow-xl shadow-gray-200/50',
-    overlay: 'bg-black/50',
+    badgeHot: 'bg-rose-500 text-white',
+    badgeCritical: 'bg-red-600 text-white',
+    badgeNew: 'bg-emerald-500 text-white',
+    sectionLabel: 'text-gray-400',
+    scrollThumb: 'rgba(0,0,0,0.12)',
+    shadow: 'shadow-lg shadow-gray-200/60',
+    overlay: 'bg-black/40',
+    footerBg: 'bg-gray-50',
+    divider: 'bg-gray-200/70',
+    avatarRing: 'ring-indigo-200',
   },
   dark: {
     name: 'Dark',
-    sidebar: 'bg-gray-900',
-    text: 'text-gray-300',
-    textMuted: 'text-gray-500',
+    icon: Moon,
+    sidebar: 'bg-[#0f1117]',
+    text: 'text-gray-400',
+    textMuted: 'text-gray-600',
     textActive: 'text-white',
-    border: 'border-gray-800',
-    hover: 'hover:bg-gray-800 active:bg-gray-700',
-    active: 'bg-gradient-to-r from-indigo-600/30 to-purple-600/20 text-white border-r-[3px] border-indigo-500',
-    cardBg: 'bg-gray-800',
+    border: 'border-white/[0.06]',
+    hover: 'hover:bg-white/[0.04] active:bg-white/[0.08]',
+    active: 'bg-white/[0.08] text-white font-semibold',
+    activeBar: 'bg-indigo-500',
+    cardBg: 'bg-white/[0.03]',
     accent: 'bg-indigo-600',
-    accentHover: 'hover:bg-indigo-700',
+    accentText: 'text-indigo-400',
     badge: 'bg-indigo-500/20 text-indigo-300',
-    badgeHot: 'bg-gradient-to-r from-pink-500 to-rose-500 text-white',
-    badgeCritical: 'bg-gradient-to-r from-red-600 to-orange-600 text-white',
-    badgeLive: 'bg-emerald-500/20 text-emerald-400',
-    shadow: 'shadow-xl shadow-black/50',
-    overlay: 'bg-black/70',
+    badgeHot: 'bg-rose-500 text-white',
+    badgeCritical: 'bg-red-600 text-white',
+    badgeNew: 'bg-emerald-500 text-white',
+    sectionLabel: 'text-gray-600',
+    scrollThumb: 'rgba(255,255,255,0.08)',
+    shadow: 'shadow-lg shadow-black/40',
+    overlay: 'bg-black/60',
+    footerBg: 'bg-white/[0.02]',
+    divider: 'bg-white/[0.06]',
+    avatarRing: 'ring-indigo-500/30',
   },
   purple: {
     name: 'Purple',
-    sidebar: 'bg-gradient-to-b from-purple-900 via-purple-800 to-indigo-900',
-    text: 'text-purple-100',
-    textMuted: 'text-purple-300/60',
+    icon: Sparkles,
+    sidebar: 'bg-gradient-to-b from-[#1a1035] via-[#1e1145] to-[#150d30]',
+    text: 'text-purple-200/70',
+    textMuted: 'text-purple-400/40',
     textActive: 'text-white',
-    border: 'border-purple-700/50',
-    hover: 'hover:bg-white/10 active:bg-white/20',
-    active: 'bg-gradient-to-r from-white/20 to-pink-500/20 text-white border-r-[3px] border-pink-400',
-    cardBg: 'bg-white/10',
-    accent: 'bg-pink-500',
-    accentHover: 'hover:bg-pink-600',
-    badge: 'bg-pink-500/20 text-pink-200',
-    badgeHot: 'bg-gradient-to-r from-pink-500 to-rose-500 text-white',
-    badgeCritical: 'bg-gradient-to-r from-red-500 to-orange-500 text-white',
-    badgeLive: 'bg-emerald-500/20 text-emerald-300',
-    shadow: 'shadow-xl shadow-purple-900/50',
-    overlay: 'bg-purple-900/80',
+    border: 'border-purple-500/10',
+    hover: 'hover:bg-white/[0.05] active:bg-white/[0.1]',
+    active: 'bg-white/[0.1] text-white font-semibold',
+    activeBar: 'bg-purple-400',
+    cardBg: 'bg-white/[0.04]',
+    accent: 'bg-purple-500',
+    accentText: 'text-purple-300',
+    badge: 'bg-purple-500/20 text-purple-200',
+    badgeHot: 'bg-pink-500 text-white',
+    badgeCritical: 'bg-red-500 text-white',
+    badgeNew: 'bg-emerald-400 text-white',
+    sectionLabel: 'text-purple-400/40',
+    scrollThumb: 'rgba(168,85,247,0.15)',
+    shadow: 'shadow-lg shadow-purple-900/40',
+    overlay: 'bg-purple-950/70',
+    footerBg: 'bg-white/[0.02]',
+    divider: 'bg-purple-500/10',
+    avatarRing: 'ring-purple-400/30',
   },
   ocean: {
     name: 'Ocean',
-    sidebar: 'bg-gradient-to-b from-slate-900 via-blue-900 to-cyan-900',
-    text: 'text-blue-100',
-    textMuted: 'text-blue-300/60',
+    icon: Waves,
+    sidebar: 'bg-gradient-to-b from-[#0a1628] via-[#0d1f3c] to-[#0a1929]',
+    text: 'text-blue-200/70',
+    textMuted: 'text-blue-400/40',
     textActive: 'text-white',
-    border: 'border-blue-700/50',
-    hover: 'hover:bg-white/10 active:bg-white/20',
-    active: 'bg-gradient-to-r from-white/20 to-cyan-500/20 text-white border-r-[3px] border-cyan-400',
-    cardBg: 'bg-white/10',
+    border: 'border-blue-500/10',
+    hover: 'hover:bg-white/[0.05] active:bg-white/[0.1]',
+    active: 'bg-white/[0.1] text-white font-semibold',
+    activeBar: 'bg-cyan-400',
+    cardBg: 'bg-white/[0.04]',
     accent: 'bg-cyan-500',
-    accentHover: 'hover:bg-cyan-600',
+    accentText: 'text-cyan-300',
     badge: 'bg-cyan-500/20 text-cyan-200',
-    badgeHot: 'bg-gradient-to-r from-cyan-400 to-blue-500 text-white',
-    badgeCritical: 'bg-gradient-to-r from-red-500 to-orange-500 text-white',
-    badgeLive: 'bg-emerald-500/20 text-emerald-300',
-    shadow: 'shadow-xl shadow-blue-900/50',
-    overlay: 'bg-blue-900/80',
+    badgeHot: 'bg-cyan-400 text-white',
+    badgeCritical: 'bg-red-500 text-white',
+    badgeNew: 'bg-emerald-400 text-white',
+    sectionLabel: 'text-blue-400/40',
+    scrollThumb: 'rgba(34,211,238,0.12)',
+    shadow: 'shadow-lg shadow-blue-950/40',
+    overlay: 'bg-blue-950/70',
+    footerBg: 'bg-white/[0.02]',
+    divider: 'bg-blue-500/10',
+    avatarRing: 'ring-cyan-400/30',
   },
   forest: {
     name: 'Forest',
-    sidebar: 'bg-gradient-to-b from-gray-900 via-emerald-900 to-teal-900',
-    text: 'text-emerald-100',
-    textMuted: 'text-emerald-300/60',
+    icon: TreePine,
+    sidebar: 'bg-gradient-to-b from-[#0a1a14] via-[#0d2418] to-[#0a1a12]',
+    text: 'text-emerald-200/70',
+    textMuted: 'text-emerald-400/40',
     textActive: 'text-white',
-    border: 'border-emerald-700/50',
-    hover: 'hover:bg-white/10 active:bg-white/20',
-    active: 'bg-gradient-to-r from-white/20 to-emerald-500/20 text-white border-r-[3px] border-emerald-400',
-    cardBg: 'bg-white/10',
+    border: 'border-emerald-500/10',
+    hover: 'hover:bg-white/[0.05] active:bg-white/[0.1]',
+    active: 'bg-white/[0.1] text-white font-semibold',
+    activeBar: 'bg-emerald-400',
+    cardBg: 'bg-white/[0.04]',
     accent: 'bg-emerald-500',
-    accentHover: 'hover:bg-emerald-600',
+    accentText: 'text-emerald-300',
     badge: 'bg-emerald-500/20 text-emerald-200',
-    badgeHot: 'bg-gradient-to-r from-emerald-400 to-teal-500 text-white',
-    badgeCritical: 'bg-gradient-to-r from-red-500 to-orange-500 text-white',
-    badgeLive: 'bg-lime-500/20 text-lime-300',
-    shadow: 'shadow-xl shadow-emerald-900/50',
-    overlay: 'bg-emerald-900/80',
+    badgeHot: 'bg-emerald-400 text-white',
+    badgeCritical: 'bg-red-500 text-white',
+    badgeNew: 'bg-lime-400 text-white',
+    sectionLabel: 'text-emerald-400/40',
+    scrollThumb: 'rgba(52,211,153,0.12)',
+    shadow: 'shadow-lg shadow-emerald-950/40',
+    overlay: 'bg-emerald-950/70',
+    footerBg: 'bg-white/[0.02]',
+    divider: 'bg-emerald-500/10',
+    avatarRing: 'ring-emerald-400/30',
   },
   sunset: {
     name: 'Sunset',
-    sidebar: 'bg-gradient-to-b from-orange-900 via-red-900 to-pink-900',
-    text: 'text-orange-100',
-    textMuted: 'text-orange-300/60',
+    icon: Sunset,
+    sidebar: 'bg-gradient-to-b from-[#1a0f08] via-[#2a1510] to-[#1a0c0a]',
+    text: 'text-orange-200/70',
+    textMuted: 'text-orange-400/40',
     textActive: 'text-white',
-    border: 'border-orange-700/50',
-    hover: 'hover:bg-white/10 active:bg-white/20',
-    active: 'bg-gradient-to-r from-white/20 to-yellow-500/20 text-white border-r-[3px] border-yellow-400',
-    cardBg: 'bg-white/10',
+    border: 'border-orange-500/10',
+    hover: 'hover:bg-white/[0.05] active:bg-white/[0.1]',
+    active: 'bg-white/[0.1] text-white font-semibold',
+    activeBar: 'bg-orange-400',
+    cardBg: 'bg-white/[0.04]',
     accent: 'bg-orange-500',
-    accentHover: 'hover:bg-orange-600',
+    accentText: 'text-orange-300',
     badge: 'bg-orange-500/20 text-orange-200',
-    badgeHot: 'bg-gradient-to-r from-yellow-400 to-orange-500 text-white',
-    badgeCritical: 'bg-gradient-to-r from-red-600 to-pink-600 text-white',
-    badgeLive: 'bg-yellow-500/20 text-yellow-300',
-    shadow: 'shadow-xl shadow-orange-900/50',
-    overlay: 'bg-orange-900/80',
+    badgeHot: 'bg-orange-400 text-white',
+    badgeCritical: 'bg-red-500 text-white',
+    badgeNew: 'bg-yellow-400 text-gray-900',
+    sectionLabel: 'text-orange-400/40',
+    scrollThumb: 'rgba(251,146,60,0.12)',
+    shadow: 'shadow-lg shadow-orange-950/40',
+    overlay: 'bg-orange-950/70',
+    footerBg: 'bg-white/[0.02]',
+    divider: 'bg-orange-500/10',
+    avatarRing: 'ring-orange-400/30',
   },
 };
-
 type ThemeKey = keyof typeof themes;
 
-// ─── Navigation Structure ───
-const navigation: NavItem[] = [
+// ─── Navigation Data ───
+const mainNav: NavItem[] = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
-  { name: 'Bookings', href: '/bookings', icon: Calendar, hasBadge: true, badgeType: 'booking', isHot: true, isPinned: true },
-  { name: 'Live Tracking', href: '/tracking', icon: Radar, hasBadge: true, badgeType: 'tracking', isHot: true, isPinned: true },
-  // ✅ DISPATCH SYSTEM
-  { name: 'Dispatch Monitor', href: '/dispatch', icon: Zap, isHot: true, isPinned: true },
-  { name: '🚨 Manual Dispatch', href: '/manual-dispatch', icon: Target, isCritical: true, isPinned: true },
+  { name: 'Bookings', href: '/bookings', icon: Calendar, hasBadge: true, badgeType: 'booking' },
+  { name: 'Live Tracking', href: '/tracking', icon: Radar, hasBadge: true, badgeType: 'tracking', isNew: true },
+];
+
+const dispatchNav: NavItem[] = [
+  { name: 'Dispatch Monitor', href: '/dispatch', icon: Zap, isNew: true },
+  { name: 'Manual Dispatch', href: '/manual-dispatch', icon: Target, isCritical: true },
   { name: 'Offer History', href: '/provider-offers', icon: Send },
   { name: 'Alerts Center', href: '/notifications', icon: Radio },
-  // ✅ NEW — Direct Push + Bulk Email (Communication Tools)
-  { name: 'Direct Push', href: '/direct-push', icon: Rocket, isHot: true, isPinned: true },
-  { name: 'Bulk Email', href: '/bulk-email', icon: Mail, isHot: true, isPinned: true },
+];
+
+const commNav: NavItem[] = [
+  { name: 'Direct Push', href: '/direct-push', icon: Rocket, isNew: true },
+  { name: 'Bulk Email', href: '/bulk-email', icon: Mail, isNew: true },
+];
+
+const entityNav: NavItem[] = [
   { name: 'Providers', href: '/providers', icon: Briefcase, hasBadge: true, badgeType: 'provider' },
   { name: 'Verifications', href: '/verifications', icon: ClipboardCheck },
   { name: 'Users', href: '/users', icon: UserPlus, hasBadge: true, badgeType: 'user' },
 ];
 
-const locationSubMenu: NavItem[] = [
+const locationSub: NavItem[] = [
   { name: 'Cities', href: '/locations/cities', icon: Building2 },
   { name: 'Zones', href: '/locations/zones', icon: Map },
 ];
 
-const sduiMenuItems: NavItem[] = [
+const sduiSub: NavItem[] = [
   { name: 'Dashboard', href: '/sdui', icon: Smartphone },
   { name: 'Categories', href: '/sdui/categories', icon: Grid },
   { name: 'Subservices', href: '/sdui/subservices', icon: Package },
@@ -257,285 +306,237 @@ const sduiMenuItems: NavItem[] = [
   { name: 'Feature Flags', href: '/sdui/feature-flags', icon: ToggleLeft },
 ];
 
-const checkoutMenuItems: NavItem[] = [
+const checkoutSub: NavItem[] = [
   { name: 'Coupons', href: '/checkout/coupons', icon: Gift },
   { name: 'Checkout Settings', href: '/checkout/settings', icon: Receipt },
 ];
 
-const otherNavigation: NavItem[] = [
+const systemNav: NavItem[] = [
   { name: 'Pricing', href: '/pricing', icon: DollarSign },
   { name: 'Analytics', href: '/analytics', icon: BarChart2 },
   { name: 'Settings', href: '/settings', icon: Settings },
 ];
 
-const bottomNavItems: NavItem[] = [
+const bottomMobileNav: NavItem[] = [
   { name: 'Home', href: '/', icon: Home },
   { name: 'Bookings', href: '/bookings', icon: Calendar },
   { name: 'Dispatch', href: '/manual-dispatch', icon: Target },
   { name: 'Providers', href: '/providers', icon: Briefcase },
 ];
 
+// ═══════════════════════════════════════════
+// COMPONENT
+// ═══════════════════════════════════════════
 export default function Sidebar() {
   const { admin, logout } = useAuth();
   const location = useLocation();
-  const navigate = useNavigate();
   const isMobile = useIsMobile();
 
   const navRef = useRef<HTMLElement>(null);
-  const scrollPositionRef = useRef<number>(0);
-  const isInitialMountRef = useRef(true);
-  const preventScrollRef = useRef(false);
+  const scrollPos = useRef(0);
+  const preventScroll = useRef(false);
+  const mounted = useRef(true);
 
   const [isOpen, setIsOpen] = useState(false);
-  const [isCollapsed, setIsCollapsed] = useState(false);
-  const [currentTheme, setCurrentTheme] = useState<ThemeKey>('purple');
-  const [showThemePicker, setShowThemePicker] = useState(false);
-  const [isLocationMenuExpanded, setIsLocationMenuExpanded] = useState(false);
-  const [isSDUIMenuExpanded, setIsSDUIMenuExpanded] = useState(false);
-  const [isCheckoutMenuExpanded, setIsCheckoutMenuExpanded] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
+  const [theme, setThemeKey] = useState<ThemeKey>('purple');
+  const [showThemes, setShowThemes] = useState(false);
+  const [expandLoc, setExpandLoc] = useState(false);
+  const [expandSDUI, setExpandSDUI] = useState(false);
+  const [expandCheckout, setExpandCheckout] = useState(false);
 
   const [userStats, setUserStats] = useState<UserStats | null>(null);
   const [providerStats, setProviderStats] = useState<ProviderStatsSimple | null>(null);
   const [bookingStats, setBookingStats] = useState<BookingStatsSimple | null>(null);
-  const [trackingActiveNow, setTrackingActiveNow] = useState<number>(0);
+  const [trackingActive, setTrackingActive] = useState(0);
 
-  const theme = themes[currentTheme];
-  const swipeHandlers = useSwipe(() => setIsOpen(false), () => setIsOpen(true));
-
-  const isLocationRoute = location.pathname.startsWith('/locations');
+  const t = themes[theme];
+  const swipe = useSwipe(() => setIsOpen(false), () => setIsOpen(true));
+  const isLocRoute = location.pathname.startsWith('/locations');
   const isSDUIRoute = location.pathname.startsWith('/sdui');
   const isCheckoutRoute = location.pathname.startsWith('/checkout');
+  const isCollapsedView = collapsed && !isMobile;
 
+  // ─── Init ───
   useEffect(() => {
-    const savedTheme = localStorage.getItem('sidebarTheme') as ThemeKey;
-    if (savedTheme && themes[savedTheme]) setCurrentTheme(savedTheme);
+    const saved = localStorage.getItem('sidebarTheme') as ThemeKey;
+    if (saved && themes[saved]) setThemeKey(saved);
+    if (isLocRoute) setExpandLoc(true);
+    if (isSDUIRoute) setExpandSDUI(true);
+    if (isCheckoutRoute) setExpandCheckout(true);
+    mounted.current = false;
   }, []);
 
-  const changeTheme = (newTheme: ThemeKey) => {
-    setCurrentTheme(newTheme);
-    localStorage.setItem('sidebarTheme', newTheme);
-    setShowThemePicker(false);
-  };
-
-  const saveScrollPosition = useCallback(() => {
-    if (navRef.current) scrollPositionRef.current = navRef.current.scrollTop;
-  }, []);
-
-  const restoreScrollPosition = useCallback(() => {
-    if (navRef.current && preventScrollRef.current) {
-      requestAnimationFrame(() => {
-        if (navRef.current) navRef.current.scrollTop = scrollPositionRef.current;
-        preventScrollRef.current = false;
-      });
-    }
-  }, []);
-
-  useEffect(() => {
-    if (isInitialMountRef.current) {
-      if (isLocationRoute) setIsLocationMenuExpanded(true);
-      if (isSDUIRoute) setIsSDUIMenuExpanded(true);
-      if (isCheckoutRoute) setIsCheckoutMenuExpanded(true);
-      isInitialMountRef.current = false;
-    }
-  }, []);
-
-  useEffect(() => { restoreScrollPosition(); }, [location.pathname, restoreScrollPosition]);
-
-  useEffect(() => {
-    if (isMobile) setIsOpen(false);
-  }, [location.pathname, isMobile]);
-
+  useEffect(() => { if (isMobile) setIsOpen(false); }, [location.pathname, isMobile]);
   useEffect(() => {
     document.body.style.overflow = isMobile && isOpen ? 'hidden' : '';
     return () => { document.body.style.overflow = ''; };
   }, [isMobile, isOpen]);
 
-  const fetchUserStats = async () => {
+  useEffect(() => {
+    if (preventScroll.current && navRef.current) {
+      requestAnimationFrame(() => {
+        if (navRef.current) navRef.current.scrollTop = scrollPos.current;
+        preventScroll.current = false;
+      });
+    }
+  }, [location.pathname]);
+
+  const changeTheme = (k: ThemeKey) => {
+    setThemeKey(k);
+    localStorage.setItem('sidebarTheme', k);
+    setShowThemes(false);
+  };
+
+  // ─── Badge Data ───
+  const fetchBadges = useCallback(async () => {
     try {
-      const res = await usersApi.getStats();
-      if (res.success) {
-        setUserStats({
-          totalUsers: res.data.totalUsers,
-          activeUsers: res.data.activeUsers,
-          todaySignups: res.data.todaySignups,
-          verifiedUsers: res.data.verifiedUsers,
-        });
+      const [u, p, b] = await Promise.allSettled([
+        usersApi.getStats(),
+        providersApi.getStats(),
+        bookingsApi.getStats(),
+      ]);
+      if (u.status === 'fulfilled' && u.value?.success) {
+        setUserStats(u.value.data as UserStats);
       }
-    } catch (e) { console.error('user stats:', e); }
-  };
-
-  const fetchProviderStats = async () => {
-    try {
-      const res = await providersApi.getStats();
-      if (res.success) setProviderStats({ pendingVerifications: res.data.pendingVerifications || 0 });
-    } catch (e) { console.error('provider stats:', e); }
-  };
-
-  const fetchBookingStats = async () => {
-    try {
-      const res = await bookingsApi.getStats();
-      if (res?.success && res?.data) {
-        const statusStats = res.data.statusStats || [];
-        const pendingCount = statusStats
-          .filter((s: any) => ['pending', 'searching', 'assigned'].includes(s._id))
-          .reduce((sum: number, s: any) => sum + (s.count || 0), 0);
-        const inProgressCount = statusStats
-          .filter((s: any) => ['accepted', 'en-route', 'arrived', 'in-progress'].includes(s._id))
-          .reduce((sum: number, s: any) => sum + (s.count || 0), 0);
+      if (p.status === 'fulfilled' && p.value?.success) {
+        setProviderStats({ pendingVerifications: p.value.data?.pendingVerifications || 0 });
+      }
+      if (b.status === 'fulfilled' && b.value?.success) {
+        const d = b.value.data as any;
+        const ss = d?.statusStats || [];
         setBookingStats({
-          pendingBookings: pendingCount,
-          todayBookings: res.data.todayBookings || 0,
-          inProgressBookings: inProgressCount,
+          pendingBookings: ss.filter((s: any) => ['pending', 'searching', 'assigned'].includes(s._id)).reduce((a: number, s: any) => a + (s.count || 0), 0),
+          todayBookings: d?.todayBookings || 0,
+          inProgressBookings: ss.filter((s: any) => ['accepted', 'en-route', 'arrived', 'in-progress'].includes(s._id)).reduce((a: number, s: any) => a + (s.count || 0), 0),
         });
       }
-    } catch (e) { console.error('booking stats:', e); }
-  };
-
-  const fetchTrackingStats = async () => {
+    } catch {}
     try {
       const mod: any = await import('../../lib/api');
-      if (mod && mod.trackingApi && typeof mod.trackingApi.getStats === 'function') {
+      if (mod?.trackingApi?.getStats) {
         const data = await mod.trackingApi.getStats();
-        setTrackingActiveNow(data?.activeNow || 0);
+        setTrackingActive(data?.activeNow || 0);
       }
-    } catch (e) {
-      console.debug('tracking stats skipped:', e);
-    }
-  };
-
-  const fetchBadgeData = useCallback(async () => {
-    await Promise.all([
-      fetchUserStats(),
-      fetchProviderStats(),
-      fetchBookingStats(),
-      fetchTrackingStats(),
-    ]);
+    } catch {}
   }, []);
 
   useEffect(() => {
-    fetchBadgeData();
-    const interval = setInterval(fetchBadgeData, 60000);
-    return () => clearInterval(interval);
-  }, [fetchBadgeData]);
+    fetchBadges();
+    const iv = setInterval(fetchBadges, 60000);
+    return () => clearInterval(iv);
+  }, [fetchBadges]);
 
-  const getBadgeCount = (badgeType?: string) => {
-    if (badgeType === 'user' && userStats?.todaySignups) return userStats.todaySignups;
-    if (badgeType === 'provider' && providerStats?.pendingVerifications) return providerStats.pendingVerifications;
-    if (badgeType === 'booking' && bookingStats?.pendingBookings) return bookingStats.pendingBookings;
-    if (badgeType === 'tracking' && trackingActiveNow) return trackingActiveNow;
+  const badge = (type?: string) => {
+    if (type === 'user') return userStats?.todaySignups || 0;
+    if (type === 'provider') return providerStats?.pendingVerifications || 0;
+    if (type === 'booking') return bookingStats?.pendingBookings || 0;
+    if (type === 'tracking') return trackingActive;
     return 0;
   };
 
-  const handleNavClick = useCallback(() => {
-    saveScrollPosition();
-    preventScrollRef.current = true;
-    if (isMobile) setIsOpen(false);
-  }, [isMobile, saveScrollPosition]);
+  const saveScroll = () => { if (navRef.current) scrollPos.current = navRef.current.scrollTop; };
+  const onNav = () => { saveScroll(); preventScroll.current = true; if (isMobile) setIsOpen(false); };
+  const onSubmenu = (set: React.Dispatch<React.SetStateAction<boolean>>, val: boolean) => {
+    saveScroll();
+    preventScroll.current = true;
+    set(!val);
+    requestAnimationFrame(() => { if (navRef.current) navRef.current.scrollTop = scrollPos.current; });
+  };
 
-  const handleSubmenuToggle = useCallback((
-    setter: React.Dispatch<React.SetStateAction<boolean>>,
-    currentValue: boolean
-  ) => {
-    saveScrollPosition();
-    preventScrollRef.current = true;
-    setter(!currentValue);
-    requestAnimationFrame(() => {
-      if (navRef.current) navRef.current.scrollTop = scrollPositionRef.current;
-    });
-  }, [saveScrollPosition]);
-
-  // ─── Render Navigation Item ───
-  const renderNavItem = (item: NavItem, compact = false) => {
-    const badgeCount = getBadgeCount(item.badgeType);
-    const isCollapsedView = isCollapsed && !isMobile;
-
+  // ═══════════ RENDER NAV ITEM ═══════════
+  const NavItemRow = ({ item }: { item: NavItem }) => {
+    const count = badge(item.badgeType);
     return (
       <NavLink
-        key={item.name}
         to={item.href}
-        onClick={handleNavClick}
-        preventScrollReset={true}
+        onClick={onNav}
+        preventScrollReset
         className={({ isActive }) =>
-          `flex items-center gap-3 px-3 py-2.5 rounded-lg mb-0.5 transition-all duration-200 relative group
-          ${isActive ? theme.active : `${theme.text} ${theme.hover}`}
-          ${isCollapsedView ? 'justify-center' : ''}
-          ${item.isPinned && !isActive ? 'bg-gradient-to-r from-pink-500/5 to-rose-500/5' : ''}
-          ${item.isCritical && !isActive ? 'bg-gradient-to-r from-red-500/10 to-orange-500/10 ring-1 ring-red-500/20' : ''}
-          touch-manipulation select-none`
+          `group relative flex items-center gap-3 rounded-lg transition-all duration-200 select-none
+          ${isCollapsedView ? 'justify-center px-2 py-2.5 mx-1' : 'px-3 py-[9px] mx-2'}
+          ${isActive ? t.active : `${t.text} ${t.hover}`}
+          ${item.isCritical && !isActive ? 'ring-1 ring-red-500/20 bg-red-500/5' : ''}`
         }
       >
         {({ isActive }) => (
           <>
-            {isActive && !isCollapsedView && (
-              <span className={`absolute left-0 top-1/2 -translate-y-1/2 w-1 h-6 rounded-r-full ${item.isCritical ? 'bg-red-500' : theme.accent}`} />
+            {/* Active indicator bar */}
+            {isActive && (
+              <span className={`absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-r-full ${t.activeBar}`} />
             )}
 
-            <div className={`transition-transform duration-200 flex-shrink-0 relative ${isActive ? 'scale-110' : 'group-hover:scale-105'}`}>
-              <item.icon size={compact ? 17 : 18} strokeWidth={isActive ? 2.5 : 2} className={item.isCritical ? 'text-red-400' : ''} />
-              {item.isHot && isCollapsedView && (
-                <span className="absolute -top-1 -right-1 flex h-2.5 w-2.5">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-pink-400 opacity-75" />
-                  <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-pink-500" />
+            {/* Icon */}
+            <div className="relative flex-shrink-0">
+              <item.icon
+                size={isCollapsedView ? 20 : 18}
+                strokeWidth={isActive ? 2.2 : 1.8}
+                className={`transition-transform duration-200 ${isActive ? 'scale-105' : 'group-hover:scale-105'}
+                  ${item.isCritical ? 'text-red-400' : ''}`}
+              />
+              {/* Collapsed badge dot */}
+              {isCollapsedView && count > 0 && (
+                <span className={`absolute -top-1 -right-1.5 min-w-[16px] h-[16px] px-1 rounded-full
+                  ${item.isCritical ? t.badgeCritical : t.badgeHot}
+                  text-[8px] font-bold flex items-center justify-center shadow-sm`}>
+                  {count > 9 ? '9+' : count}
                 </span>
               )}
-              {item.isCritical && isCollapsedView && (
-                <span className="absolute -top-1 -right-1 flex h-2.5 w-2.5">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-500 opacity-75" />
-                  <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-red-600" />
-                </span>
+              {isCollapsedView && !count && item.isNew && (
+                <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-emerald-400 shadow-sm" />
               )}
-              {item.hasBadge && badgeCount > 0 && isCollapsedView && !item.isHot && !item.isCritical && (
-                <span className={`absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-1 rounded-full ${theme.accent} text-white text-[9px] font-bold flex items-center justify-center`}>
-                  {badgeCount > 9 ? '9+' : badgeCount}
-                </span>
+              {isCollapsedView && !count && item.isCritical && (
+                <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-red-500 animate-pulse shadow-sm" />
               )}
             </div>
 
-            {(!isCollapsedView || isMobile) && (
+            {/* Label + badges (expanded) */}
+            {!isCollapsedView && (
               <>
-                <span className={`flex-1 text-[13.5px] ${isActive ? 'font-semibold' : 'font-medium'} ${item.isCritical ? 'font-bold' : ''}`}>
+                <span className={`flex-1 text-[13px] leading-tight truncate
+                  ${isActive ? 'font-semibold' : 'font-medium'}
+                  ${item.isCritical ? 'font-semibold' : ''}`}>
                   {item.name}
                 </span>
 
                 {item.isCritical && (
-                  <span className={`px-1.5 py-0.5 rounded-md text-[9px] font-black ${theme.badgeCritical} shadow-sm uppercase tracking-wider flex-shrink-0 animate-pulse`}>
+                  <span className={`px-1.5 py-[2px] rounded text-[8px] font-extrabold uppercase tracking-wider
+                    ${t.badgeCritical} shadow-sm animate-pulse`}>
                     SOS
                   </span>
                 )}
 
-                {item.isHot && !badgeCount && !item.isCritical && (
-                  <span className={`px-1.5 py-0.5 rounded-md text-[9px] font-black ${theme.badgeHot} shadow-sm uppercase tracking-wider flex-shrink-0`}>
+                {item.isNew && !count && !item.isCritical && (
+                  <span className={`px-1.5 py-[2px] rounded text-[8px] font-extrabold uppercase tracking-wider
+                    ${t.badgeNew} shadow-sm`}>
                     NEW
                   </span>
                 )}
 
-                {item.hasBadge && badgeCount > 0 && (
-                  <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                    item.isHot ? theme.badgeHot : theme.badge
-                  } flex-shrink-0 shadow-sm`}>
-                    {item.isHot && <span className="w-1 h-1 rounded-full bg-white animate-pulse" />}
-                    {badgeCount > 99 ? '99+' : badgeCount}
+                {count > 0 && !item.isCritical && (
+                  <span className={`min-w-[20px] h-5 px-1.5 rounded-full text-[10px] font-bold
+                    flex items-center justify-center ${t.badgeHot} shadow-sm`}>
+                    {count > 99 ? '99+' : count}
                   </span>
                 )}
               </>
             )}
 
-            {isCollapsedView && !isMobile && (
-              <div className={`absolute left-full ml-3 px-3 py-2 ${theme.cardBg} backdrop-blur-xl text-xs rounded-lg 
-                opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-150 
-                whitespace-nowrap z-[100] border ${theme.border} ${theme.shadow}`}
-              >
-                <span className={`font-semibold ${theme.text}`}>{item.name}</span>
+            {/* Collapsed tooltip */}
+            {isCollapsedView && (
+              <div className={`absolute left-full ml-3 px-3 py-2 rounded-lg z-[200]
+                ${t.cardBg} backdrop-blur-xl border ${t.border} ${t.shadow}
+                opacity-0 invisible group-hover:opacity-100 group-hover:visible
+                transition-all duration-150 whitespace-nowrap pointer-events-none`}>
+                <span className={`text-xs font-semibold ${t.textActive}`}>{item.name}</span>
+                {count > 0 && (
+                  <span className={`ml-2 px-1.5 py-0.5 rounded text-[9px] font-bold ${t.badgeHot}`}>{count}</span>
+                )}
+                {item.isNew && !count && (
+                  <span className={`ml-2 px-1.5 py-0.5 rounded text-[9px] font-bold ${t.badgeNew}`}>NEW</span>
+                )}
                 {item.isCritical && (
-                  <span className={`ml-2 px-1.5 py-0.5 ${theme.badgeCritical} rounded-md text-[9px] font-black uppercase`}>SOS</span>
-                )}
-                {item.isHot && !item.isCritical && (
-                  <span className={`ml-2 px-1.5 py-0.5 ${theme.badgeHot} rounded-md text-[9px] font-black uppercase`}>NEW</span>
-                )}
-                {item.hasBadge && badgeCount > 0 && (
-                  <span className={`ml-2 px-1.5 py-0.5 ${item.isHot ? theme.badgeHot : theme.badge} rounded-md text-[10px] font-bold`}>
-                    {badgeCount}
-                  </span>
+                  <span className={`ml-2 px-1.5 py-0.5 rounded text-[9px] font-bold ${t.badgeCritical}`}>SOS</span>
                 )}
               </div>
             )}
@@ -545,405 +546,176 @@ export default function Sidebar() {
     );
   };
 
-  // ─── Render Submenu ───
-  const renderSubMenu = (
-    title: string,
-    icon: React.ElementType,
-    items: NavItem[],
-    isExpanded: boolean,
-    setIsExpanded: React.Dispatch<React.SetStateAction<boolean>>,
-    isActiveRoute: boolean
-  ) => {
-    const Icon = icon;
-    const isCollapsedView = isCollapsed && !isMobile;
-
-    return (
-      <div className="mb-0.5">
-        <button
-          onClick={() => !isCollapsedView && handleSubmenuToggle(setIsExpanded, isExpanded)}
-          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all duration-200 relative group
-            ${isActiveRoute ? theme.active : `${theme.text} ${theme.hover}`}
-            ${isCollapsedView ? 'justify-center' : ''}
-            touch-manipulation select-none`}
-        >
-          {isActiveRoute && !isCollapsedView && (
-            <span className={`absolute left-0 top-1/2 -translate-y-1/2 w-1 h-6 rounded-r-full ${theme.accent}`} />
-          )}
-          <div className={`transition-transform duration-200 flex-shrink-0 ${isActiveRoute ? 'scale-110' : 'group-hover:scale-105'}`}>
-            <Icon size={18} strokeWidth={isActiveRoute ? 2.5 : 2} />
-          </div>
-          {(!isCollapsedView || isMobile) && (
-            <>
-              <span className={`flex-1 text-left text-[13.5px] ${isActiveRoute ? 'font-semibold' : 'font-medium'}`}>
-                {title}
-              </span>
-              <div className={`transition-transform duration-300 flex-shrink-0 ${isExpanded ? 'rotate-180' : ''}`}>
-                <ChevronDown size={14} className={theme.textMuted} />
-              </div>
-            </>
-          )}
-
-          {isCollapsedView && !isMobile && (
-            <div className={`absolute left-full ml-3 px-3 py-2.5 ${theme.cardBg} backdrop-blur-xl text-xs rounded-lg 
-              opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-150 
-              whitespace-nowrap z-[100] border ${theme.border} ${theme.shadow} min-w-[170px]`}
-            >
-              <p className={`font-semibold mb-2 ${theme.text}`}>{title}</p>
-              <div className="space-y-0.5">
-                {items.map((subItem) => (
-                  <NavLink key={subItem.name} to={subItem.href} onClick={handleNavClick} preventScrollReset={true}
-                    className={({ isActive }) =>
-                      `flex items-center gap-2 px-2.5 py-1.5 rounded-md text-[11px] transition-colors
-                      ${isActive ? theme.active : `${theme.text} ${theme.hover}`}`
-                    }>
-                    <subItem.icon size={13} />
-                    <span className="font-medium">{subItem.name}</span>
-                  </NavLink>
-                ))}
-              </div>
-            </div>
-          )}
-        </button>
-
-        {(!isCollapsedView || isMobile) && (
-          <div className={`overflow-hidden transition-all duration-300 ease-in-out ${
-            isExpanded ? 'max-h-[600px] opacity-100 mt-1' : 'max-h-0 opacity-0'
-          }`}>
-            <div className="ml-3 space-y-0.5 pl-3 border-l border-white/10">
-              {items.map((subItem) => (
-                <NavLink key={subItem.name} to={subItem.href} onClick={handleNavClick} preventScrollReset={true}
-                  className={({ isActive }) =>
-                    `flex items-center gap-2.5 px-2.5 py-2 rounded-md transition-all duration-200 touch-manipulation select-none
-                    ${isActive ? `${theme.accent} text-white shadow-md` : `${theme.text} ${theme.hover}`}`
-                  }>
-                  {({ isActive }) => (
-                    <>
-                      <subItem.icon size={14} strokeWidth={isActive ? 2.5 : 2} className="flex-shrink-0" />
-                      <span className={`text-[12.5px] ${isActive ? 'font-semibold' : 'font-medium'}`}>
-                        {subItem.name}
-                      </span>
-                    </>
-                  )}
-                </NavLink>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-    );
-  };
-
-  const SectionDivider = ({ label }: { label: string }) => (
-    (!isCollapsed || isMobile) ? (
-      <div className="mt-4 mb-1.5 px-3">
-        <p className={`text-[9.5px] font-black uppercase tracking-[0.15em] ${theme.textMuted}`}>
-          {label}
-        </p>
-      </div>
-    ) : (
-      <div className="my-2 mx-3">
-        <div className={`h-px bg-current opacity-20 ${theme.textMuted}`} />
-      </div>
-    )
-  );
-
-  const MobileMenuButton = () => {
-    const pendingBookings = bookingStats?.pendingBookings || 0;
-    return (
+  // ═══════════ RENDER SUBMENU ═══════════
+  const SubMenu = ({
+    title, icon: Icon, items, expanded, setExpanded, isRoute,
+  }: {
+    title: string; icon: React.ElementType; items: NavItem[];
+    expanded: boolean; setExpanded: React.Dispatch<React.SetStateAction<boolean>>; isRoute: boolean;
+  }) => (
+    <div>
       <button
-        onClick={() => setIsOpen(true)}
-        className={`md:hidden fixed top-4 left-4 z-40 p-2.5 rounded-xl ${theme.sidebar} ${theme.shadow} ${theme.text}
-          transition-all duration-200 active:scale-95 touch-manipulation relative border ${theme.border}`}
-        aria-label="Open menu"
+        onClick={() => !isCollapsedView && onSubmenu(setExpanded, expanded)}
+        className={`group relative w-full flex items-center gap-3 rounded-lg transition-all duration-200 select-none
+          ${isCollapsedView ? 'justify-center px-2 py-2.5 mx-1' : 'px-3 py-[9px] mx-2'}
+          ${isRoute ? t.active : `${t.text} ${t.hover}`}`}
       >
-        <Menu size={22} />
-        {pendingBookings > 0 && (
-          <span className="absolute -top-1 -right-1 flex h-3 w-3">
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-pink-400 opacity-75" />
-            <span className="relative inline-flex rounded-full h-3 w-3 bg-pink-500" />
-          </span>
+        {isRoute && (
+          <span className={`absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-r-full ${t.activeBar}`} />
+        )}
+        <Icon size={isCollapsedView ? 20 : 18} strokeWidth={isRoute ? 2.2 : 1.8} className="flex-shrink-0" />
+        {!isCollapsedView && (
+          <>
+            <span className={`flex-1 text-left text-[13px] leading-tight truncate ${isRoute ? 'font-semibold' : 'font-medium'}`}>
+              {title}
+            </span>
+            <ChevronDown
+              size={14}
+              className={`flex-shrink-0 transition-transform duration-300 ${t.textMuted} ${expanded ? 'rotate-180' : ''}`}
+            />
+          </>
+        )}
+
+        {/* Collapsed flyout */}
+        {isCollapsedView && (
+          <div className={`absolute left-full ml-3 py-2 px-1 rounded-xl z-[200] min-w-[180px]
+            ${t.cardBg} backdrop-blur-xl border ${t.border} ${t.shadow}
+            opacity-0 invisible group-hover:opacity-100 group-hover:visible
+            transition-all duration-150 pointer-events-auto`}>
+            <p className={`px-3 pb-1.5 text-[10px] font-bold uppercase tracking-wider ${t.sectionLabel}`}>{title}</p>
+            {items.map(sub => (
+              <NavLink
+                key={sub.name}
+                to={sub.href}
+                onClick={onNav}
+                preventScrollReset
+                className={({ isActive }) =>
+                  `flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md text-[11px] transition-colors
+                  ${isActive ? `${t.active}` : `${t.text} ${t.hover}`}`
+                }
+              >
+                <sub.icon size={13} className="flex-shrink-0" />
+                <span className="font-medium">{sub.name}</span>
+              </NavLink>
+            ))}
+          </div>
         )}
       </button>
-    );
-  };
 
-  const MobileBottomNav = () => (
-    <div className={`md:hidden fixed bottom-0 left-0 right-0 z-30 ${theme.sidebar} border-t ${theme.border} backdrop-blur-xl`}
-      style={{ paddingBottom: 'env(safe-area-inset-bottom, 0)' }}
-    >
-      <div className="flex items-center justify-around px-1 py-1.5">
-        {bottomNavItems.map((item) => {
-          const isActive = location.pathname === item.href ||
-            (item.href !== '/' && location.pathname.startsWith(item.href));
-          const badgeCount =
-            item.name === 'Bookings' ? (bookingStats?.pendingBookings || 0) :
-            item.name === 'Tracking' ? trackingActiveNow :
-            0;
-
-          return (
-            <NavLink
-              key={item.name}
-              to={item.href}
-              preventScrollReset={true}
-              className={`flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-xl transition-all duration-200 
-                touch-manipulation min-w-[60px] relative
-                ${isActive ? theme.textActive : theme.textMuted}`}
-            >
-              <div className="relative">
-                <item.icon size={21} strokeWidth={isActive ? 2.5 : 2} />
-                {badgeCount > 0 && (
-                  <span className={`absolute -top-1.5 -right-2 min-w-[16px] h-4 px-1 rounded-full 
-                    ${theme.badgeHot} text-[9px] font-bold flex items-center justify-center shadow-md`}>
-                    {badgeCount > 99 ? '99+' : badgeCount}
-                  </span>
+      {/* Expanded sub-items */}
+      {!isCollapsedView && (
+        <div className={`overflow-hidden transition-all duration-300 ease-in-out
+          ${expanded ? 'max-h-[600px] opacity-100 mt-0.5' : 'max-h-0 opacity-0'}`}>
+          <div className={`ml-5 mr-2 pl-3 border-l-[2px] ${t.divider} space-y-[1px] py-0.5`}>
+            {items.map(sub => (
+              <NavLink
+                key={sub.name}
+                to={sub.href}
+                onClick={onNav}
+                preventScrollReset
+                className={({ isActive }) =>
+                  `flex items-center gap-2.5 px-2.5 py-[7px] rounded-md transition-all duration-200 select-none
+                  ${isActive ? `${t.accent} text-white shadow-sm` : `${t.text} ${t.hover}`}`
+                }
+              >
+                {({ isActive }) => (
+                  <>
+                    <sub.icon size={14} strokeWidth={isActive ? 2.2 : 1.8} className="flex-shrink-0" />
+                    <span className={`text-[12px] ${isActive ? 'font-semibold' : 'font-medium'}`}>{sub.name}</span>
+                  </>
                 )}
-              </div>
-              <span className={`text-[9.5px] ${isActive ? 'font-bold' : 'font-medium'}`}>
-                {item.name}
-              </span>
-              {isActive && (
-                <span className={`absolute bottom-0 left-1/2 -translate-x-1/2 w-6 h-0.5 rounded-full ${theme.accent}`} />
-              )}
-            </NavLink>
-          );
-        })}
-        <button
-          onClick={() => setIsOpen(true)}
-          className={`flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-xl transition-all duration-200 
-            touch-manipulation min-w-[60px] ${theme.textMuted}`}
-        >
-          <Menu size={21} />
-          <span className="text-[9.5px] font-medium">More</span>
-        </button>
-      </div>
+              </NavLink>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 
-  const SidebarContent = () => (
+  // ═══════════ SECTION DIVIDER ═══════════
+  const Section = ({ label }: { label: string }) =>
+    isCollapsedView ? (
+      <div className="my-2 mx-3"><div className={`h-px ${t.divider}`} /></div>
+    ) : (
+      <div className="mt-5 mb-1.5 mx-5">
+        <p className={`text-[9px] font-extrabold uppercase tracking-[0.2em] ${t.sectionLabel}`}>{label}</p>
+      </div>
+    );
+
+  // ═══════════ SIDEBAR CONTENT ═══════════
+  const Content = () => (
     <>
-      <div className={`px-3 py-3 flex items-center justify-between border-b ${theme.border} flex-shrink-0`}>
-        {(!isCollapsed || isMobile) ? (
-          <div className="flex items-center gap-2.5 min-w-0">
-            <div className={`w-9 h-9 rounded-lg ${theme.accent} flex items-center justify-center shadow-md flex-shrink-0`}>
-              <Sparkles className="w-4.5 h-4.5 text-white" strokeWidth={2.5} />
-            </div>
-            <div className="min-w-0">
-              <h1 className={`text-sm font-black ${theme.textActive} truncate leading-tight`}>Admin Panel</h1>
-              <p className={`text-[10px] ${theme.textMuted} truncate leading-tight`}>Control Center</p>
-            </div>
+      {/* ─── Header ─── */}
+      <div className={`flex items-center justify-between border-b ${t.border} flex-shrink-0
+        ${isCollapsedView ? 'px-2 py-3' : 'px-4 py-3.5'}`}>
+        {isCollapsedView ? (
+          <div className={`w-9 h-9 rounded-xl ${t.accent} flex items-center justify-center mx-auto shadow-lg`}>
+            <Sparkles className="w-[18px] h-[18px] text-white" strokeWidth={2.5} />
           </div>
         ) : (
-          <div className={`w-9 h-9 rounded-lg ${theme.accent} flex items-center justify-center mx-auto shadow-md`}>
-            <Sparkles className="w-4.5 h-4.5 text-white" strokeWidth={2.5} />
+          <div className="flex items-center gap-3 min-w-0">
+            <div className={`w-9 h-9 rounded-xl ${t.accent} flex items-center justify-center shadow-lg flex-shrink-0`}>
+              <Sparkles className="w-[18px] h-[18px] text-white" strokeWidth={2.5} />
+            </div>
+            <div className="min-w-0">
+              <h1 className={`text-[14px] font-extrabold ${t.textActive} truncate leading-tight tracking-tight`}>
+                Admin Panel
+              </h1>
+              <p className={`text-[10px] ${t.textMuted} truncate`}>Control Center</p>
+            </div>
           </div>
         )}
 
         {isMobile ? (
-          <button onClick={() => setIsOpen(false)}
-            className={`p-1.5 ${theme.text} ${theme.hover} rounded-lg transition-all duration-200 touch-manipulation flex-shrink-0`}
-            aria-label="Close menu">
-            <X size={20} />
+          <button
+            onClick={() => setIsOpen(false)}
+            className={`p-1.5 ${t.text} ${t.hover} rounded-lg flex-shrink-0`}
+          >
+            <X size={18} />
           </button>
         ) : (
-          <button onClick={() => setIsCollapsed(!isCollapsed)}
-            className={`p-1.5 ${theme.text} ${theme.hover} rounded-lg transition-all duration-200 hover:scale-110 flex-shrink-0`}>
-            {isCollapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
+          <button
+            onClick={() => setCollapsed(!collapsed)}
+            className={`p-1.5 ${t.text} ${t.hover} rounded-lg flex-shrink-0 transition-transform hover:scale-110`}
+          >
+            {collapsed ? <ChevronRight size={15} /> : <ChevronLeft size={15} />}
           </button>
         )}
       </div>
 
-      {/* ─── Manual Dispatch Quick Access Card (CRITICAL) ─── */}
-      {(!isCollapsed || isMobile) && bookingStats && bookingStats.pendingBookings > 0 && (
+      {/* ─── Theme Picker (compact) ─── */}
+      {!isCollapsedView && (
         <div className="px-3 pt-3 pb-1 flex-shrink-0">
-          <NavLink
-            to="/manual-dispatch"
-            onClick={handleNavClick}
-            className={`block p-2.5 rounded-xl bg-gradient-to-r from-red-500/20 to-orange-500/20 border-2 border-red-500/40 relative overflow-hidden
-              hover:scale-[1.02] transition-transform duration-200 group animate-pulse-slow`}
-          >
-            <div className="absolute -top-4 -right-4 w-20 h-20 bg-red-500 opacity-20 rounded-full blur-2xl animate-pulse" />
-            <div className="relative flex items-center gap-2.5">
-              <div className={`w-9 h-9 rounded-lg bg-gradient-to-br from-red-500 to-orange-500 flex items-center justify-center shadow-lg flex-shrink-0`}>
-                <Target className="w-5 h-5 text-white" strokeWidth={2.5} />
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-1.5">
-                  <p className={`text-[10px] font-bold uppercase tracking-wider text-red-200`}>🚨 Manual Dispatch</p>
-                  <span className="flex h-1.5 w-1.5">
-                    <span className="animate-ping absolute inline-flex h-1.5 w-1.5 rounded-full bg-red-400 opacity-75" />
-                    <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-red-500" />
-                  </span>
-                </div>
-                <div className="flex items-baseline gap-2 mt-0.5">
-                  <span className={`text-lg font-black text-white leading-none`}>
-                    {bookingStats.pendingBookings}
-                  </span>
-                  <span className={`text-[10px] text-red-200`}>stuck bookings</span>
-                </div>
-              </div>
-              <div className={`px-1.5 py-0.5 rounded-md bg-red-600 text-white text-[9px] font-black shadow-sm uppercase`}>
-                SOS
-              </div>
-            </div>
-          </NavLink>
-        </div>
-      )}
-
-      {/* ─── Live Bookings Card ─── */}
-      {(!isCollapsed || isMobile) && bookingStats && (
-        <div className="px-3 pt-3 pb-1 flex-shrink-0">
-          <NavLink
-            to="/bookings"
-            onClick={handleNavClick}
-            className={`block p-2.5 rounded-xl ${theme.cardBg} border ${theme.border} relative overflow-hidden
-              hover:scale-[1.02] transition-transform duration-200 group`}
-          >
-            <div className={`absolute -top-4 -right-4 w-20 h-20 ${theme.accent} opacity-10 rounded-full blur-2xl`} />
-            <div className="relative flex items-center gap-2.5">
-              <div className={`w-8 h-8 rounded-lg bg-gradient-to-br from-pink-500 to-rose-500 flex items-center justify-center shadow-sm flex-shrink-0`}>
-                <Activity className="w-4 h-4 text-white" strokeWidth={2.5} />
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-1.5">
-                  <p className={`text-[10px] font-bold uppercase tracking-wider ${theme.textMuted}`}>Live Bookings</p>
-                  <span className="flex h-1.5 w-1.5">
-                    <span className="animate-ping absolute inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400 opacity-75" />
-                    <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500" />
-                  </span>
-                </div>
-                <div className="flex items-baseline gap-2 mt-0.5">
-                  <span className={`text-lg font-black ${theme.textActive} leading-none`}>
-                    {bookingStats.todayBookings}
-                  </span>
-                  <span className={`text-[10px] ${theme.textMuted}`}>today</span>
-                </div>
-              </div>
-              {bookingStats.pendingBookings > 0 && (
-                <div className={`px-1.5 py-0.5 rounded-md ${theme.badgeHot} text-[10px] font-black shadow-sm`}>
-                  {bookingStats.pendingBookings}
-                </div>
-              )}
-            </div>
-            <div className={`mt-2 pt-2 border-t ${theme.border} flex items-center justify-between text-[10px]`}>
-              <div className="flex items-center gap-1">
-                <Clock size={10} className={theme.textMuted} />
-                <span className={theme.textMuted}>Pending</span>
-                <span className={`font-bold ${theme.textActive}`}>{bookingStats.pendingBookings}</span>
-              </div>
-              <div className="flex items-center gap-1">
-                <Zap size={10} className={theme.textMuted} />
-                <span className={theme.textMuted}>Active</span>
-                <span className={`font-bold ${theme.textActive}`}>{bookingStats.inProgressBookings}</span>
-              </div>
-            </div>
-          </NavLink>
-        </div>
-      )}
-
-      {/* ─── Live Tracking Mini Card ─── */}
-      {(!isCollapsed || isMobile) && (
-        <div className="px-3 pt-1 pb-1 flex-shrink-0">
-          <NavLink
-            to="/tracking"
-            onClick={handleNavClick}
-            className={`block p-2.5 rounded-xl ${theme.cardBg} border ${theme.border} relative overflow-hidden
-              hover:scale-[1.02] transition-transform duration-200 group`}
-          >
-            <div className={`absolute -top-4 -right-4 w-20 h-20 bg-emerald-500 opacity-10 rounded-full blur-2xl`} />
-            <div className="relative flex items-center gap-2.5">
-              <div className={`w-8 h-8 rounded-lg bg-gradient-to-br from-emerald-500 to-teal-500 flex items-center justify-center shadow-sm flex-shrink-0`}>
-                <Radar className="w-4 h-4 text-white" strokeWidth={2.5} />
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-1.5">
-                  <p className={`text-[10px] font-bold uppercase tracking-wider ${theme.textMuted}`}>Live Tracking</p>
-                  <span className="flex h-1.5 w-1.5 relative">
-                    <span className="animate-ping absolute inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400 opacity-75" />
-                    <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500" />
-                  </span>
-                </div>
-                <div className="flex items-baseline gap-2 mt-0.5">
-                  <span className={`text-lg font-black ${theme.textActive} leading-none`}>
-                    {trackingActiveNow.toLocaleString()}
-                  </span>
-                  <span className={`text-[10px] ${theme.textMuted}`}>active now</span>
-                </div>
-              </div>
-              <div className={`px-1.5 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 text-[9px] font-black uppercase tracking-wider shadow-sm`}>
-                NEW
-              </div>
-            </div>
-          </NavLink>
-        </div>
-      )}
-
-      {/* ✅ ─── Communication Tools Quick Access Card (NEW) ─── */}
-      {(!isCollapsed || isMobile) && (
-        <div className="px-3 pt-1 pb-1 flex-shrink-0">
-          <div className="grid grid-cols-2 gap-1.5">
-            <NavLink
-              to="/direct-push"
-              onClick={handleNavClick}
-              className={`block p-2 rounded-xl ${theme.cardBg} border ${theme.border} relative overflow-hidden
-                hover:scale-[1.02] transition-transform duration-200 group`}
-            >
-              <div className={`absolute -top-3 -right-3 w-14 h-14 bg-indigo-500 opacity-10 rounded-full blur-xl`} />
-              <div className="relative flex flex-col items-start gap-1">
-                <div className={`w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500 to-blue-500 flex items-center justify-center shadow-sm`}>
-                  <Rocket className="w-3.5 h-3.5 text-white" strokeWidth={2.5} />
-                </div>
-                <div className="min-w-0 w-full">
-                  <p className={`text-[9.5px] font-bold uppercase tracking-wider ${theme.textMuted} truncate`}>Direct Push</p>
-                  <p className={`text-[10px] font-semibold ${theme.textActive} truncate leading-tight`}>FCM Sender</p>
-                </div>
-              </div>
-            </NavLink>
-
-            <NavLink
-              to="/bulk-email"
-              onClick={handleNavClick}
-              className={`block p-2 rounded-xl ${theme.cardBg} border ${theme.border} relative overflow-hidden
-                hover:scale-[1.02] transition-transform duration-200 group`}
-            >
-              <div className={`absolute -top-3 -right-3 w-14 h-14 bg-purple-500 opacity-10 rounded-full blur-xl`} />
-              <div className="relative flex flex-col items-start gap-1">
-                <div className={`w-7 h-7 rounded-lg bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center shadow-sm`}>
-                  <Mail className="w-3.5 h-3.5 text-white" strokeWidth={2.5} />
-                </div>
-                <div className="min-w-0 w-full">
-                  <p className={`text-[9.5px] font-bold uppercase tracking-wider ${theme.textMuted} truncate`}>Bulk Email</p>
-                  <p className={`text-[10px] font-semibold ${theme.textActive} truncate leading-tight`}>CSV Upload</p>
-                </div>
-              </div>
-            </NavLink>
-          </div>
-        </div>
-      )}
-
-      {/* ─── Theme Picker ─── */}
-      {(!isCollapsed || isMobile) && (
-        <div className="px-3 py-2 flex-shrink-0">
           <div className="relative">
-            <button onClick={() => setShowThemePicker(!showThemePicker)}
-              className={`w-full flex items-center gap-2 px-2.5 py-2 rounded-lg ${theme.cardBg} ${theme.text} 
-                ${theme.hover} transition-all duration-200 touch-manipulation`}>
-              <Palette size={14} className="flex-shrink-0" />
-              <span className="flex-1 text-left text-[11.5px] font-medium truncate">{theme.name} Theme</span>
-              <ChevronDown size={13} className={`transition-transform flex-shrink-0 ${showThemePicker ? 'rotate-180' : ''}`} />
+            <button
+              onClick={() => setShowThemes(!showThemes)}
+              className={`w-full flex items-center gap-2 px-2.5 py-2 rounded-lg ${t.cardBg}
+                ${t.text} ${t.hover} transition-all duration-200`}
+            >
+              {React.createElement(themes[theme].icon, { size: 13, className: 'flex-shrink-0' })}
+              <span className="flex-1 text-left text-[11px] font-medium">{t.name}</span>
+              <ChevronDown size={12} className={`transition-transform ${showThemes ? 'rotate-180' : ''} ${t.textMuted}`} />
             </button>
 
-            {showThemePicker && (
-              <div className={`absolute top-full left-0 right-0 mt-1.5 p-2 ${theme.cardBg} backdrop-blur-xl 
-                rounded-xl border ${theme.border} ${theme.shadow} z-[100]`}>
-                <div className="grid grid-cols-3 gap-1.5">
-                  {(Object.keys(themes) as ThemeKey[]).map((themeKey) => (
-                    <button key={themeKey} onClick={() => changeTheme(themeKey)}
-                      className={`p-1.5 rounded-lg transition-all duration-200 touch-manipulation
-                        ${currentTheme === themeKey ? `ring-2 ring-white/60 ${themes[themeKey].accent}` : theme.hover}`}>
-                      <div className={`w-full h-6 rounded ${themes[themeKey].sidebar} mb-1 shadow-inner`} />
-                      <span className={`text-[9px] font-semibold ${theme.text}`}>{themes[themeKey].name}</span>
-                    </button>
-                  ))}
+            {showThemes && (
+              <div className={`absolute top-full left-0 right-0 mt-1 p-2 rounded-xl z-[200]
+                ${t.cardBg} backdrop-blur-xl border ${t.border} ${t.shadow}`}>
+                <div className="grid grid-cols-3 gap-1">
+                  {(Object.keys(themes) as ThemeKey[]).map(k => {
+                    const th = themes[k];
+                    const active = theme === k;
+                    return (
+                      <button
+                        key={k}
+                        onClick={() => changeTheme(k)}
+                        className={`flex flex-col items-center gap-1 p-1.5 rounded-lg transition-all
+                          ${active ? `ring-2 ring-white/40 ${th.accent}` : t.hover}`}
+                      >
+                        <div className={`w-full h-5 rounded ${th.sidebar} shadow-inner`} />
+                        <span className={`text-[8px] font-bold ${active ? 'text-white' : t.text}`}>{th.name}</span>
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -952,135 +724,197 @@ export default function Sidebar() {
       )}
 
       {/* ─── Navigation ─── */}
-      <nav ref={navRef} className="flex-1 px-2 py-2 overflow-y-auto custom-scrollbar overscroll-contain" style={{ scrollBehavior: 'auto' }}>
-        <SectionDivider label="Main" />
-        {navigation.map((item) => renderNavItem(item))}
+      <nav
+        ref={navRef}
+        className="flex-1 py-1 overflow-y-auto sidebar-scroll overscroll-contain"
+        style={{ scrollBehavior: 'auto' }}
+      >
+        <Section label="Overview" />
+        {mainNav.map(i => <NavItemRow key={i.name} item={i} />)}
 
-        {renderSubMenu('Locations', MapPin, locationSubMenu, isLocationMenuExpanded, setIsLocationMenuExpanded, isLocationRoute)}
+        <Section label="Dispatch" />
+        {dispatchNav.map(i => <NavItemRow key={i.name} item={i} />)}
 
-        <SectionDivider label="Server-Driven UI" />
-        {renderSubMenu('SDUI Manager', Smartphone, sduiMenuItems, isSDUIMenuExpanded, setIsSDUIMenuExpanded, isSDUIRoute)}
+        <Section label="Communication" />
+        {commNav.map(i => <NavItemRow key={i.name} item={i} />)}
 
-        <SectionDivider label="Checkout" />
-        {renderSubMenu('Checkout', ShoppingCart, checkoutMenuItems, isCheckoutMenuExpanded, setIsCheckoutMenuExpanded, isCheckoutRoute)}
+        <Section label="People" />
+        {entityNav.map(i => <NavItemRow key={i.name} item={i} />)}
 
-        <SectionDivider label="System" />
-        {otherNavigation.map((item) => renderNavItem(item))}
+        <Section label="Locations" />
+        <SubMenu title="Locations" icon={MapPin} items={locationSub} expanded={expandLoc} setExpanded={setExpandLoc} isRoute={isLocRoute} />
+
+        <Section label="App Builder" />
+        <SubMenu title="SDUI Manager" icon={Smartphone} items={sduiSub} expanded={expandSDUI} setExpanded={setExpandSDUI} isRoute={isSDUIRoute} />
+
+        <Section label="Commerce" />
+        <SubMenu title="Checkout" icon={ShoppingCart} items={checkoutSub} expanded={expandCheckout} setExpanded={setExpandCheckout} isRoute={isCheckoutRoute} />
+
+        <Section label="System" />
+        {systemNav.map(i => <NavItemRow key={i.name} item={i} />)}
       </nav>
 
       {/* ─── Footer ─── */}
-      <div className={`p-2.5 border-t ${theme.border} flex-shrink-0 ${isMobile ? 'pb-5' : ''}`}>
-        {(!isCollapsed || isMobile) ? (
-          <div className="space-y-1.5">
-            <div className={`flex items-center gap-2.5 p-2 ${theme.cardBg} rounded-lg`}>
-              <div className={`h-9 w-9 rounded-lg ${theme.accent} flex items-center justify-center text-white 
-                font-black shadow-md flex-shrink-0 text-sm`}>
+      <div className={`border-t ${t.border} flex-shrink-0 ${t.footerBg} ${isMobile ? 'pb-6' : ''}`}>
+        {isCollapsedView ? (
+          <div className="flex flex-col items-center gap-2 py-3">
+            <div className={`w-9 h-9 rounded-xl ${t.accent} flex items-center justify-center
+              text-white font-bold text-sm shadow-md ring-2 ${t.avatarRing} group relative`}>
+              {admin?.name?.charAt(0).toUpperCase() || 'A'}
+              <div className={`absolute left-full ml-3 px-3 py-2 rounded-lg z-[200]
+                ${t.cardBg} backdrop-blur-xl border ${t.border} ${t.shadow}
+                opacity-0 invisible group-hover:opacity-100 group-hover:visible
+                transition-all duration-150 whitespace-nowrap pointer-events-none`}>
+                <p className={`font-bold text-xs ${t.textActive}`}>{admin?.name}</p>
+                <p className={`text-[10px] ${t.textMuted}`}>{admin?.role}</p>
+              </div>
+            </div>
+            <button
+              onClick={logout}
+              className={`p-2 rounded-lg ${t.text} hover:text-red-400 ${t.hover} transition-all group relative`}
+            >
+              <LogOut size={15} />
+              <div className={`absolute left-full ml-3 px-3 py-1.5 rounded-lg z-[200]
+                ${t.cardBg} backdrop-blur-xl border ${t.border} ${t.shadow}
+                opacity-0 invisible group-hover:opacity-100 group-hover:visible
+                transition-all duration-150 whitespace-nowrap pointer-events-none`}>
+                <span className={`text-xs ${t.text}`}>Sign Out</span>
+              </div>
+            </button>
+          </div>
+        ) : (
+          <div className="p-3">
+            <div className={`flex items-center gap-2.5 p-2.5 rounded-xl ${t.cardBg}`}>
+              <div className={`w-9 h-9 rounded-xl ${t.accent} flex items-center justify-center
+                text-white font-bold text-sm shadow-md ring-2 ${t.avatarRing} flex-shrink-0`}>
                 {admin?.name?.charAt(0).toUpperCase() || 'A'}
               </div>
               <div className="flex-1 min-w-0">
-                <p className={`text-[12.5px] font-bold ${theme.textActive} truncate leading-tight`}>{admin?.name}</p>
-                <p className={`text-[10px] ${theme.textMuted} truncate leading-tight mt-0.5`}>{admin?.role}</p>
+                <p className={`text-[12px] font-bold ${t.textActive} truncate leading-tight`}>{admin?.name}</p>
+                <p className={`text-[10px] ${t.textMuted} truncate`}>{admin?.role || 'Admin'}</p>
               </div>
-              <button onClick={logout}
-                className={`p-1.5 rounded-md ${theme.text} hover:text-red-400 ${theme.hover} transition-all duration-200 flex-shrink-0`}
-                title="Sign Out">
+              <button
+                onClick={logout}
+                className={`p-1.5 rounded-lg ${t.text} hover:text-red-400 ${t.hover} transition-all flex-shrink-0`}
+                title="Sign Out"
+              >
                 <LogOut size={15} />
               </button>
             </div>
-          </div>
-        ) : (
-          <div className="flex flex-col items-center gap-2">
-            <div className={`h-9 w-9 rounded-lg ${theme.accent} flex items-center justify-center text-white 
-              font-black group relative shadow-md text-sm`}>
-              {admin?.name?.charAt(0).toUpperCase() || 'A'}
-              <div className={`absolute left-full ml-3 px-3 py-2 ${theme.cardBg} backdrop-blur-xl text-xs 
-                rounded-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all 
-                duration-150 whitespace-nowrap z-[100] border ${theme.border} ${theme.shadow}`}>
-                <p className={`font-bold ${theme.textActive}`}>{admin?.name}</p>
-                <p className={theme.textMuted}>{admin?.role}</p>
-              </div>
-            </div>
-            <button onClick={logout}
-              className={`p-2 ${theme.text} hover:text-red-400 ${theme.hover} rounded-lg transition-all duration-200 group relative hover:scale-110`}>
-              <LogOut size={15} />
-              <div className={`absolute left-full ml-3 px-3 py-1.5 ${theme.cardBg} backdrop-blur-xl text-xs 
-                rounded-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all 
-                duration-150 whitespace-nowrap z-[100] border ${theme.border} ${theme.shadow}`}>
-                <span className={theme.text}>Sign Out</span>
-              </div>
-            </button>
           </div>
         )}
       </div>
     </>
   );
 
+  // ═══════════ MOBILE BOTTOM NAV ═══════════
+  const BottomNav = () => (
+    <div
+      className={`md:hidden fixed bottom-0 left-0 right-0 z-30 ${t.sidebar} border-t ${t.border} backdrop-blur-xl`}
+      style={{ paddingBottom: 'env(safe-area-inset-bottom, 0)' }}
+    >
+      <div className="flex items-center justify-around px-1 py-1">
+        {bottomMobileNav.map(item => {
+          const isActive = location.pathname === item.href || (item.href !== '/' && location.pathname.startsWith(item.href));
+          const count = item.name === 'Bookings' ? (bookingStats?.pendingBookings || 0) : 0;
+          return (
+            <NavLink
+              key={item.name}
+              to={item.href}
+              preventScrollReset
+              className={`flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-xl transition-all min-w-[56px] relative select-none
+                ${isActive ? t.textActive : t.textMuted}`}
+            >
+              <div className="relative">
+                <item.icon size={20} strokeWidth={isActive ? 2.3 : 1.8} />
+                {count > 0 && (
+                  <span className={`absolute -top-1 -right-2 min-w-[14px] h-[14px] px-0.5 rounded-full
+                    ${t.badgeHot} text-[8px] font-bold flex items-center justify-center shadow`}>
+                    {count > 99 ? '99+' : count}
+                  </span>
+                )}
+              </div>
+              <span className={`text-[9px] ${isActive ? 'font-bold' : 'font-medium'}`}>{item.name}</span>
+              {isActive && (
+                <span className={`absolute bottom-0 left-1/2 -translate-x-1/2 w-5 h-[2px] rounded-full ${t.activeBar}`} />
+              )}
+            </NavLink>
+          );
+        })}
+        <button
+          onClick={() => setIsOpen(true)}
+          className={`flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-xl min-w-[56px] ${t.textMuted} select-none`}
+        >
+          <Menu size={20} strokeWidth={1.8} />
+          <span className="text-[9px] font-medium">More</span>
+        </button>
+      </div>
+    </div>
+  );
+
+  // ═══════════ RENDER ═══════════
   return (
     <>
-      {isMobile && !isOpen && <MobileMenuButton />}
+      {/* Mobile hamburger */}
+      {isMobile && !isOpen && (
+        <button
+          onClick={() => setIsOpen(true)}
+          className={`md:hidden fixed top-4 left-4 z-40 p-2.5 rounded-xl ${t.sidebar} ${t.shadow}
+            ${t.text} border ${t.border} active:scale-95 transition-all relative select-none`}
+          aria-label="Open menu"
+        >
+          <Menu size={20} />
+          {(bookingStats?.pendingBookings || 0) > 0 && (
+            <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-rose-500 shadow-sm">
+              <span className="absolute inset-0 rounded-full bg-rose-400 animate-ping" />
+            </span>
+          )}
+        </button>
+      )}
 
+      {/* Mobile overlay */}
       {isMobile && (
         <div
-          className={`fixed inset-0 z-40 transition-all duration-300 ${
-            isOpen ? `${theme.overlay} opacity-100` : 'opacity-0 pointer-events-none'
-          }`}
+          className={`fixed inset-0 z-40 transition-opacity duration-300
+            ${isOpen ? `${t.overlay} opacity-100` : 'opacity-0 pointer-events-none'}`}
           onClick={() => setIsOpen(false)}
-          aria-hidden="true"
         />
       )}
 
+      {/* Sidebar container */}
       <div
-        {...(isMobile ? swipeHandlers : {})}
+        {...(isMobile ? swipe : {})}
         className={`
           ${isMobile
-            ? `fixed inset-y-0 left-0 z-50 w-[82vw] max-w-[300px] transform transition-transform duration-300 ease-out
+            ? `fixed inset-y-0 left-0 z-50 w-[80vw] max-w-[280px] transform transition-transform duration-300 ease-out
                ${isOpen ? 'translate-x-0' : '-translate-x-full'}`
-            : `${isCollapsed ? 'w-[68px]' : 'w-[248px]'} relative transition-all duration-300`
+            : `${collapsed ? 'w-[64px]' : 'w-[240px]'} relative transition-all duration-300`
           }
-          ${theme.sidebar} min-h-screen flex flex-col ${theme.shadow}
+          ${t.sidebar} min-h-screen flex flex-col ${t.shadow}
         `}
       >
-        <SidebarContent />
+        <Content />
       </div>
 
-      {isMobile && <MobileBottomNav />}
-      {isMobile && <div className="h-16 flex-shrink-0" />}
+      {isMobile && <BottomNav />}
+      {isMobile && <div className="h-14 flex-shrink-0" />}
 
       <style>{`
-        .custom-scrollbar {
+        .sidebar-scroll {
           scrollbar-width: thin;
-          scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
+          scrollbar-color: ${t.scrollThumb} transparent;
         }
-        .custom-scrollbar::-webkit-scrollbar { width: 3px; }
-        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
-        .custom-scrollbar::-webkit-scrollbar-thumb {
-          background: rgba(255, 255, 255, 0.15);
+        .sidebar-scroll::-webkit-scrollbar { width: 3px; }
+        .sidebar-scroll::-webkit-scrollbar-track { background: transparent; }
+        .sidebar-scroll::-webkit-scrollbar-thumb {
+          background: ${t.scrollThumb};
           border-radius: 3px;
         }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-          background: rgba(255, 255, 255, 0.3);
-        }
-        .touch-manipulation {
-          touch-action: manipulation;
-          -webkit-tap-highlight-color: transparent;
+        .sidebar-scroll::-webkit-scrollbar-thumb:hover {
+          background: ${t.scrollThumb.replace(/[\d.]+\)$/, (m: string) => `${Math.min(parseFloat(m) * 2, 1)})`)}
         }
         @media (max-width: 767px) {
-          .custom-scrollbar { -webkit-overflow-scrolling: touch; }
-        }
-        [data-focus-guard] { position: fixed; }
-        @keyframes gentle-pulse {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.7; }
-        }
-        .animate-pulse {
-          animation: gentle-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-        }
-        @keyframes pulse-slow {
-          0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
-          50% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
-        }
-        .animate-pulse-slow {
-          animation: pulse-slow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+          .sidebar-scroll { -webkit-overflow-scrolling: touch; }
         }
       `}</style>
     </>

@@ -30,6 +30,12 @@ import {
   Copy,
   Check,
   Ban,
+  Download,
+  Info,
+  Zap,
+  BarChart3,
+  ArrowRight,
+  Shield,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import {
@@ -59,7 +65,8 @@ const formatDuration = (ms?: number) => {
   return `${m}m ${s}s`;
 };
 
-const formatBytes = (bytes: number) => {
+const formatBytes = (bytes?: number) => {
+  if (!bytes || bytes <= 0) return '0 B';
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
@@ -75,11 +82,31 @@ const statusColor = (status: string) => {
     case 'cancelled':
       return 'bg-red-100 text-red-700 border-red-200';
     case 'running':
+    case 'processing':
       return 'bg-blue-100 text-blue-700 border-blue-200';
     case 'queued':
       return 'bg-purple-100 text-purple-700 border-purple-200';
     default:
       return 'bg-gray-100 text-gray-700 border-gray-200';
+  }
+};
+
+const statusIcon = (status: string) => {
+  switch (status) {
+    case 'completed':
+      return <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />;
+    case 'completed_with_errors':
+      return <AlertTriangle className="w-3.5 h-3.5 text-amber-500" />;
+    case 'failed':
+    case 'cancelled':
+      return <XCircle className="w-3.5 h-3.5 text-red-500" />;
+    case 'running':
+    case 'processing':
+      return <Loader2 className="w-3.5 h-3.5 text-blue-500 animate-spin" />;
+    case 'queued':
+      return <Clock className="w-3.5 h-3.5 text-purple-500" />;
+    default:
+      return <Info className="w-3.5 h-3.5 text-gray-400" />;
   }
 };
 
@@ -143,6 +170,7 @@ export default function BulkEmailCenter() {
     setRecipientSearch('');
     setRecipientFilter('all');
     setRecipientPage(1);
+    setShowSampleExpanded(false);
     if (!f) {
       setFile(null);
       return;
@@ -166,7 +194,13 @@ export default function BulkEmailCenter() {
       const res = await bulkEmailApi.previewUpload(f);
       if (res.success) {
         setPreview(res.data);
-        toast.success(`Parsed ${res.data.validRecipients} valid recipients`);
+        const validCount = res.data.validRecipients ?? 0;
+        const invalidCount = res.data.invalidRecipients ?? 0;
+        const dupeCount = res.data.duplicateRecipients ?? 0;
+        const totalFound = (res.data as any).totalEmailsFound ?? (validCount + invalidCount + dupeCount);
+        toast.success(
+          `✅ Extracted ${totalFound} emails → ${validCount} valid, ${invalidCount} invalid, ${dupeCount} duplicates`
+        );
       } else {
         toast.error(res.message || 'Preview failed');
       }
@@ -199,23 +233,27 @@ export default function BulkEmailCenter() {
     setFile(null);
     setPreview(null);
     setShowAllRecipients(false);
+    setShowSampleExpanded(false);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
-  // ─── Filtered + searched recipients ───
-  const allRecipients: ParsedRecipient[] = preview?.sampleRecipients || [];
+  // ─── ALL recipients from preview (backend now returns ALL, not just 10) ───
+  const allRecipients: ParsedRecipient[] = useMemo(() => {
+    if (!preview) return [];
+    // Use allRecipients if available, fallback to sampleRecipients
+    return (preview as any).allRecipients || preview.sampleRecipients || [];
+  }, [preview]);
 
+  // ─── Filtered + searched recipients ───
   const filteredRecipients = useMemo(() => {
     let list = allRecipients;
 
-    // Filter by valid/invalid
     if (recipientFilter === 'valid') {
       list = list.filter((r) => r.isValid);
     } else if (recipientFilter === 'invalid') {
       list = list.filter((r) => !r.isValid);
     }
 
-    // Search
     if (recipientSearch.trim()) {
       const q = recipientSearch.trim().toLowerCase();
       list = list.filter(
@@ -239,6 +277,14 @@ export default function BulkEmailCenter() {
     setRecipientPage(1);
   }, [recipientSearch, recipientFilter]);
 
+  // Count helpers
+  const validCount = useMemo(() => allRecipients.filter((r) => r.isValid).length, [allRecipients]);
+  const invalidCount = useMemo(() => allRecipients.filter((r) => !r.isValid).length, [allRecipients]);
+
+  // Extraction metadata
+  const totalEmailsFound = (preview as any)?.totalEmailsFound ?? 0;
+  const totalLinesScanned = (preview as any)?.totalLinesScanned ?? preview?.totalRows ?? 0;
+
   // Copy email
   const copyEmail = (email: string, idx: number) => {
     navigator.clipboard.writeText(email).then(() => {
@@ -258,22 +304,50 @@ export default function BulkEmailCenter() {
       return;
     }
     navigator.clipboard.writeText(validEmails).then(() => {
-      toast.success(`Copied ${allRecipients.filter((r) => r.isValid).length} valid emails`);
+      toast.success(`Copied ${validCount} valid emails to clipboard`);
     });
+  };
+
+  // Download valid emails as CSV
+  const downloadValidEmailsCsv = () => {
+    const validList = allRecipients.filter((r) => r.isValid);
+    if (validList.length === 0) {
+      toast.error('No valid emails to download');
+      return;
+    }
+    const hasNames = validList.some((r) => r.name);
+    let csv = hasNames ? 'email,name\n' : 'email\n';
+    validList.forEach((r) => {
+      if (hasNames) {
+        csv += `"${r.email}","${(r.name || '').replace(/"/g, '""')}"\n`;
+      } else {
+        csv += `${r.email}\n`;
+      }
+    });
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `valid-emails-${validList.length}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast.success(`Downloaded ${validList.length} valid emails`);
   };
 
   // ─── Start Send ───
   const handleStartSend = async () => {
     if (!file) return toast.error('Please upload a file first');
     if (!preview) return toast.error('Please wait for preview to load');
-    if (preview.validRecipients === 0) return toast.error('No valid recipients to send to');
+    if ((preview.validRecipients ?? 0) === 0) return toast.error('No valid recipients to send to');
     if (!subject.trim()) return toast.error('Subject is required');
     if (!htmlBody.trim()) return toast.error('Email body is required');
 
     const confirm = window.confirm(
-      `You are about to send bulk email to ${preview.validRecipients} recipients.\n\n` +
-        `Subject: ${subject}\n\n` +
-        `Proceed?`
+      `📧 BULK EMAIL CONFIRMATION\n\n` +
+        `You are about to send bulk email to ${preview.validRecipients} recipients.\n\n` +
+        `Subject: ${subject}\n` +
+        `File: ${file.name}\n\n` +
+        `This action cannot be undone. Proceed?`
     );
     if (!confirm) return;
 
@@ -281,7 +355,7 @@ export default function BulkEmailCenter() {
     try {
       const res = await bulkEmailApi.startBulkSend(file, subject.trim(), htmlBody, textBody.trim() || undefined);
       if (res.success) {
-        toast.success(`Job started! Sending to ${res.data.validRecipients} recipients...`);
+        toast.success(`🚀 Job started! Sending to ${res.data.validRecipients} recipients...`);
         setActiveJobId(res.data.jobId);
       } else {
         toast.error(res.message || 'Failed to start job');
@@ -297,7 +371,7 @@ export default function BulkEmailCenter() {
   // ─── Cancel active job ───
   const handleCancelJob = async () => {
     if (!activeJobId) return;
-    const ok = window.confirm('Cancel this bulk email job? Emails already sent cannot be undone.');
+    const ok = window.confirm('⛔ Cancel this bulk email job?\n\nEmails already sent cannot be undone.');
     if (!ok) return;
     try {
       const res = await bulkEmailApi.cancelJob(activeJobId);
@@ -321,14 +395,10 @@ export default function BulkEmailCenter() {
         const res = await bulkEmailApi.getJobProgress(activeJobId);
         if (!cancelled && res.success) {
           setActiveProgress(res.data);
-          if (
-            res.data.status === 'completed' ||
-            res.data.status === 'completed_with_errors' ||
-            res.data.status === 'failed' ||
-            res.data.status === 'cancelled'
-          ) {
+          const finalStatuses = ['completed', 'completed_with_errors', 'failed', 'cancelled'];
+          if (finalStatuses.includes(res.data.status)) {
             if (res.data.status === 'completed') {
-              toast.success(`✅ Job completed: ${res.data.sent} sent`);
+              toast.success(`✅ Job completed: ${res.data.sent} sent successfully`);
             } else if (res.data.status === 'completed_with_errors') {
               toast(`⚠️ Completed with errors: ${res.data.sent} sent, ${res.data.failed} failed`, {
                 icon: '⚠️',
@@ -336,11 +406,13 @@ export default function BulkEmailCenter() {
             } else if (res.data.status === 'cancelled') {
               toast.error(`Job cancelled: ${res.data.sent} sent before cancel`);
             } else {
-              toast.error(`Job failed: ${res.data.failed} failures`);
+              toast.error(`Job failed: ${res.data.error || 'Unknown error'}`);
             }
             return; // stop polling
           }
           setTimeout(poll, 2500);
+        } else if (!cancelled) {
+          setTimeout(poll, 5000);
         }
       } catch (e: any) {
         if (!cancelled) setTimeout(poll, 5000);
@@ -358,7 +430,7 @@ export default function BulkEmailCenter() {
     setLoadingJobs(true);
     try {
       const res = await bulkEmailApi.listJobs({ page: 1, limit: 50 });
-      if (res.success) setJobs(res.data.jobs);
+      if (res.success) setJobs(res.data.jobs || []);
     } catch (e: any) {
       toast.error('Failed to load jobs');
     } finally {
@@ -382,8 +454,10 @@ export default function BulkEmailCenter() {
   };
 
   // ─── Rendered preview (uses first valid recipient as sample) ───
-  const sampleRecipient: ParsedRecipient | null =
-    preview?.sampleRecipients?.find((r) => r.isValid) || null;
+  const sampleRecipient: ParsedRecipient | null = useMemo(
+    () => allRecipients.find((r) => r.isValid) || null,
+    [allRecipients]
+  );
 
   const renderedSubject = sampleRecipient
     ? renderTemplate(subject, { name: sampleRecipient.name || 'Friend', email: sampleRecipient.email })
@@ -399,15 +473,20 @@ export default function BulkEmailCenter() {
       const doc = iframeRef.current.contentDocument;
       if (doc) {
         doc.open();
-        doc.write(renderedHtml);
+        doc.write(`
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="utf-8"/>
+            <style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:16px;color:#333;line-height:1.6;}</style>
+          </head>
+          <body>${renderedHtml}</body>
+          </html>
+        `);
         doc.close();
       }
     }
   }, [showRenderedPreview, renderedHtml]);
-
-  // Count helpers
-  const validCount = allRecipients.filter((r) => r.isValid).length;
-  const invalidCount = allRecipients.filter((r) => !r.isValid).length;
 
   return (
     <div className="p-6 bg-gray-50 min-h-screen">
@@ -492,6 +571,20 @@ export default function BulkEmailCenter() {
                 <p className="text-xs text-gray-500 mt-1">
                   Supports .csv (email,name columns) or .txt (one email per line) · Max 10 MB
                 </p>
+                <div className="mt-3 flex items-center justify-center gap-4 text-[10px] text-gray-400">
+                  <span className="flex items-center gap-1">
+                    <Shield className="w-3 h-3" />
+                    Auto-detects format
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <Zap className="w-3 h-3" />
+                    Extracts all emails
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <Filter className="w-3 h-3" />
+                    Removes duplicates
+                  </span>
+                </div>
               </div>
             ) : (
               <div className="p-4 bg-gradient-to-br from-purple-50 to-pink-50 border border-purple-200 rounded-xl">
@@ -504,7 +597,7 @@ export default function BulkEmailCenter() {
                       {previewing && (
                         <div className="flex items-center gap-1.5 mt-1.5 text-xs text-purple-600">
                           <Loader2 className="w-3 h-3 animate-spin" />
-                          Parsing file...
+                          Scanning file for emails...
                         </div>
                       )}
                     </div>
@@ -520,11 +613,14 @@ export default function BulkEmailCenter() {
 
                 {preview && (
                   <>
-                    {/* Stats row */}
+                    {/* ═══ STATS ROW ═══ */}
                     <div className="mt-4 grid grid-cols-4 gap-2">
                       <div className="p-2 bg-white rounded-lg text-center border border-gray-100">
-                        <p className="text-[10px] font-bold uppercase text-gray-500">Total</p>
+                        <p className="text-[10px] font-bold uppercase text-gray-500">Scanned</p>
                         <p className="text-lg font-black text-gray-900">{preview.totalRows}</p>
+                        {totalEmailsFound > 0 && (
+                          <p className="text-[9px] text-gray-400">{totalEmailsFound} emails found</p>
+                        )}
                       </div>
                       <div className="p-2 bg-white rounded-lg text-center border border-emerald-100">
                         <p className="text-[10px] font-bold uppercase text-emerald-600">Valid</p>
@@ -540,20 +636,57 @@ export default function BulkEmailCenter() {
                       </div>
                     </div>
 
-                    {/* Name column detected */}
-                    {preview.hasNameColumn && (
-                      <div className="mt-3 p-2 bg-emerald-100 border border-emerald-200 rounded text-xs text-emerald-800 flex items-center gap-2">
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                        Name column detected — <code className="bg-white px-1 rounded">{'{{name}}'}</code> will be personalized
+                    {/* ═══ EXTRACTION SUMMARY ═══ */}
+                    {totalEmailsFound > 0 && (
+                      <div className="mt-2 p-2.5 bg-blue-50 border border-blue-200 rounded-lg text-[11px] text-blue-800">
+                        <div className="flex items-start gap-2">
+                          <BarChart3 className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+                          <div>
+                            <p className="font-semibold">
+                              Extracted <strong>{totalEmailsFound}</strong> emails from{' '}
+                              <strong>{totalLinesScanned}</strong> lines
+                              <ArrowRight className="w-3 h-3 inline mx-1" />
+                              <strong className="text-emerald-700">{preview.validRecipients} unique valid</strong>
+                            </p>
+                            <p className="text-blue-600 mt-0.5">
+                              {preview.duplicateRecipients > 0 && (
+                                <span>{preview.duplicateRecipients} duplicates removed · </span>
+                              )}
+                              {preview.invalidRecipients > 0 && (
+                                <span>{preview.invalidRecipients} invalid filtered · </span>
+                              )}
+                              Format: {preview.detectedFormat || 'auto'}
+                              {preview.detectedSeparator && ` (${preview.detectedSeparator})`}
+                            </p>
+                          </div>
+                        </div>
                       </div>
                     )}
 
-                    {/* Quick sample: first 5 + expand button */}
-                    {preview.sampleRecipients && preview.sampleRecipients.length > 0 && (
+                    {/* ═══ NAME COLUMN DETECTED ═══ */}
+                    {preview.hasNameColumn && (
+                      <div className="mt-2 p-2 bg-emerald-100 border border-emerald-200 rounded text-xs text-emerald-800 flex items-center gap-2">
+                        <CheckCircle2 className="w-3.5 h-3.5 flex-shrink-0" />
+                        <span>
+                          Name column detected — <code className="bg-white px-1 rounded">{'{{name}}'}</code> will be personalized
+                        </span>
+                      </div>
+                    )}
+
+                    {/* ═══ HEADER ROW DETECTED ═══ */}
+                    {preview.hasHeaderRow && (
+                      <div className="mt-2 p-2 bg-indigo-50 border border-indigo-200 rounded text-xs text-indigo-700 flex items-center gap-2">
+                        <Info className="w-3.5 h-3.5 flex-shrink-0" />
+                        <span>Header row detected and excluded from recipients</span>
+                      </div>
+                    )}
+
+                    {/* ═══ RECIPIENTS PREVIEW ═══ */}
+                    {allRecipients.length > 0 && (
                       <div className="mt-3">
                         <div className="flex items-center justify-between mb-1.5">
                           <p className="text-xs font-bold text-gray-700">
-                            Recipients Preview ({preview.sampleRecipients.length} total)
+                            Recipients ({allRecipients.length} total — showing {Math.min(showSampleExpanded ? 20 : 5, allRecipients.length)})
                           </p>
                           <div className="flex gap-1">
                             <button
@@ -561,7 +694,14 @@ export default function BulkEmailCenter() {
                               className="text-[10px] px-2 py-0.5 bg-white border border-gray-200 rounded text-gray-600 hover:bg-gray-50 flex items-center gap-1"
                             >
                               <Copy className="w-2.5 h-2.5" />
-                              Copy All Valid
+                              Copy Valid
+                            </button>
+                            <button
+                              onClick={downloadValidEmailsCsv}
+                              className="text-[10px] px-2 py-0.5 bg-white border border-gray-200 rounded text-gray-600 hover:bg-gray-50 flex items-center gap-1"
+                            >
+                              <Download className="w-2.5 h-2.5" />
+                              CSV
                             </button>
                             <button
                               onClick={() => setShowAllRecipients(true)}
@@ -573,8 +713,8 @@ export default function BulkEmailCenter() {
                           </div>
                         </div>
 
-                        <div className="space-y-1 max-h-40 overflow-y-auto">
-                          {preview.sampleRecipients
+                        <div className="space-y-1 max-h-48 overflow-y-auto">
+                          {allRecipients
                             .slice(0, showSampleExpanded ? 20 : 5)
                             .map((r, idx) => (
                               <div
@@ -595,8 +735,11 @@ export default function BulkEmailCenter() {
                                 {r.name && (
                                   <span className="text-gray-500 truncate max-w-[120px]">· {r.name}</span>
                                 )}
+                                {r.row && (
+                                  <span className="text-[9px] text-gray-400">row {r.row}</span>
+                                )}
                                 {!r.isValid && r.invalidReason && (
-                                  <span className="text-[9px] text-red-500 truncate max-w-[100px]">
+                                  <span className="text-[9px] text-red-500 truncate max-w-[120px]">
                                     ({r.invalidReason})
                                   </span>
                                 )}
@@ -604,7 +747,7 @@ export default function BulkEmailCenter() {
                             ))}
                         </div>
 
-                        {preview.sampleRecipients.length > 5 && (
+                        {allRecipients.length > 5 && (
                           <button
                             onClick={() => setShowSampleExpanded(!showSampleExpanded)}
                             className="mt-1.5 text-[10px] text-purple-600 hover:text-purple-700 font-semibold flex items-center gap-1"
@@ -617,7 +760,8 @@ export default function BulkEmailCenter() {
                             ) : (
                               <>
                                 <ChevronDown className="w-3 h-3" />
-                                Show More ({preview.sampleRecipients.length - 5} more)
+                                Show More ({Math.min(20, allRecipients.length) - 5} more
+                                {allRecipients.length > 20 && ` · ${allRecipients.length - 20} in full view`})
                               </>
                             )}
                           </button>
@@ -625,17 +769,21 @@ export default function BulkEmailCenter() {
                       </div>
                     )}
 
-                    {/* Invalid samples */}
+                    {/* ═══ INVALID SAMPLES ═══ */}
                     {preview.invalidSamples && preview.invalidSamples.length > 0 && (
                       <details className="mt-3">
                         <summary className="text-xs font-bold text-red-700 cursor-pointer hover:text-red-800">
-                          ⚠️ Invalid Email Samples ({preview.invalidSamples.length})
+                          ⚠️ Invalid Email Details ({preview.invalidSamples.length})
                         </summary>
-                        <div className="mt-2 space-y-1 max-h-32 overflow-y-auto">
-                          {preview.invalidSamples.slice(0, 10).map((r, idx) => (
+                        <div className="mt-2 space-y-1 max-h-40 overflow-y-auto">
+                          {preview.invalidSamples.map((r, idx) => (
                             <div key={idx} className="p-1.5 bg-red-50 border border-red-100 rounded text-[10px]">
-                              <p className="font-mono text-red-700 truncate">{r.email || '(empty)'}</p>
-                              <p className="text-red-600">{r.invalidReason}</p>
+                              <div className="flex items-center gap-2">
+                                <XCircle className="w-3 h-3 text-red-500 flex-shrink-0" />
+                                <p className="font-mono text-red-700 truncate flex-1">{r.email || '(empty line)'}</p>
+                                {r.row && <span className="text-red-400">row {r.row}</span>}
+                              </div>
+                              <p className="text-red-600 ml-5 mt-0.5">{r.invalidReason}</p>
                             </div>
                           ))}
                         </div>
@@ -647,7 +795,7 @@ export default function BulkEmailCenter() {
             )}
           </div>
 
-          {/* Compose */}
+          {/* ═══ COMPOSE ═══ */}
           <div className="bg-white rounded-xl border border-gray-200 p-5">
             <div className="flex items-center gap-2 mb-4">
               <div className="w-7 h-7 rounded-lg bg-indigo-100 flex items-center justify-center">
@@ -716,7 +864,7 @@ export default function BulkEmailCenter() {
             </div>
           </div>
 
-          {/* Inline HTML Preview (below compose) */}
+          {/* ═══ INLINE HTML PREVIEW ═══ */}
           {htmlBody.trim() && (
             <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
               <div className="p-3 border-b border-gray-100 bg-gradient-to-r from-purple-50 to-pink-50 flex items-center justify-between">
@@ -757,7 +905,7 @@ export default function BulkEmailCenter() {
 
         {/* ─── RIGHT: Actions + Live Job ─── */}
         <div className="lg:col-span-1 space-y-4">
-          {/* Action card */}
+          {/* ═══ ACTION CARD ═══ */}
           <div className="bg-white rounded-xl border border-gray-200 overflow-hidden sticky top-4">
             <div className="p-4 border-b border-gray-100 bg-gradient-to-br from-purple-50 to-pink-50">
               <div className="flex items-center gap-2">
@@ -775,16 +923,21 @@ export default function BulkEmailCenter() {
                   ) : (
                     <XCircle className="w-3.5 h-3.5 text-gray-300" />
                   )}
-                  <span className={file ? 'text-gray-700' : 'text-gray-400'}>File uploaded</span>
+                  <span className={file ? 'text-gray-700' : 'text-gray-400'}>
+                    File uploaded {file && <span className="text-gray-400">({formatBytes(file.size)})</span>}
+                  </span>
                 </div>
                 <div className="flex items-center gap-2 text-xs">
-                  {preview && preview.validRecipients > 0 ? (
+                  {preview && (preview.validRecipients ?? 0) > 0 ? (
                     <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
                   ) : (
                     <XCircle className="w-3.5 h-3.5 text-gray-300" />
                   )}
-                  <span className={preview && preview.validRecipients > 0 ? 'text-gray-700' : 'text-gray-400'}>
+                  <span className={preview && (preview.validRecipients ?? 0) > 0 ? 'text-gray-700' : 'text-gray-400'}>
                     Valid recipients found
+                    {preview && (preview.validRecipients ?? 0) > 0 && (
+                      <span className="text-emerald-600 font-semibold ml-1">({preview.validRecipients})</span>
+                    )}
                   </span>
                 </div>
                 <div className="flex items-center gap-2 text-xs">
@@ -811,18 +964,18 @@ export default function BulkEmailCenter() {
                   <Users className="w-3.5 h-3.5 text-gray-400" />
                 </div>
                 <p className="text-2xl font-black text-gray-900 mt-1">
-                  {preview?.validRecipients?.toLocaleString() || 0}
+                  {(preview?.validRecipients ?? 0).toLocaleString()}
                 </p>
                 <p className="text-[11px] text-gray-500 mt-0.5">
                   {preview
-                    ? `${preview.invalidRecipients} invalid, ${preview.duplicateRecipients} duplicates skipped`
+                    ? `${preview.invalidRecipients ?? 0} invalid, ${preview.duplicateRecipients ?? 0} duplicates skipped`
                     : 'Upload file to begin'}
                 </p>
               </div>
 
               <button
                 onClick={handleStartSend}
-                disabled={sending || !preview || preview.validRecipients === 0 || !subject.trim() || !htmlBody.trim()}
+                disabled={sending || !preview || (preview.validRecipients ?? 0) === 0 || !subject.trim() || !htmlBody.trim()}
                 className="w-full flex items-center justify-center gap-2 py-2.5 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-300 disabled:cursor-not-allowed text-white font-semibold text-sm rounded-lg transition shadow-md"
               >
                 {sending ? (
@@ -844,7 +997,7 @@ export default function BulkEmailCenter() {
             </div>
           </div>
 
-          {/* Live progress */}
+          {/* ═══ LIVE PROGRESS ═══ */}
           {activeProgress && (
             <div className="bg-white rounded-xl border border-gray-200 p-4">
               <div className="flex items-center justify-between mb-3">
@@ -863,7 +1016,7 @@ export default function BulkEmailCenter() {
               <div className="mb-3">
                 <div className="flex items-center justify-between text-xs mb-1">
                   <span className="font-semibold text-gray-700">Progress</span>
-                  <span className="font-mono text-gray-600">{activeProgress.progress}%</span>
+                  <span className="font-mono text-gray-600">{activeProgress.progress ?? 0}%</span>
                 </div>
                 <div className="h-3 bg-gray-200 rounded-full overflow-hidden">
                   <div
@@ -876,7 +1029,7 @@ export default function BulkEmailCenter() {
                         ? 'bg-amber-500'
                         : 'bg-gradient-to-r from-purple-500 to-pink-500'
                     }`}
-                    style={{ width: `${activeProgress.progress}%` }}
+                    style={{ width: `${activeProgress.progress ?? 0}%` }}
                   />
                 </div>
               </div>
@@ -884,20 +1037,29 @@ export default function BulkEmailCenter() {
               <div className="grid grid-cols-3 gap-2">
                 <div className="p-2 bg-emerald-50 border border-emerald-200 rounded text-center">
                   <p className="text-[10px] font-bold uppercase text-emerald-600">Sent</p>
-                  <p className="text-xl font-black text-emerald-700">{activeProgress.sent}</p>
+                  <p className="text-xl font-black text-emerald-700">{activeProgress.sent ?? 0}</p>
                 </div>
                 <div className="p-2 bg-red-50 border border-red-200 rounded text-center">
                   <p className="text-[10px] font-bold uppercase text-red-600">Failed</p>
-                  <p className="text-xl font-black text-red-700">{activeProgress.failed}</p>
+                  <p className="text-xl font-black text-red-700">{activeProgress.failed ?? 0}</p>
                 </div>
                 <div className="p-2 bg-gray-50 border border-gray-200 rounded text-center">
                   <p className="text-[10px] font-bold uppercase text-gray-600">Total</p>
-                  <p className="text-xl font-black text-gray-700">{activeProgress.validRecipients}</p>
+                  <p className="text-xl font-black text-gray-700">{activeProgress.validRecipients ?? activeProgress.totalRecipients ?? 0}</p>
                 </div>
               </div>
 
+              {/* Skipped count if > 0 */}
+              {(activeProgress.skipped ?? 0) > 0 && (
+                <div className="mt-2 p-1.5 bg-amber-50 border border-amber-200 rounded text-center">
+                  <p className="text-[10px] font-bold text-amber-600">
+                    {activeProgress.skipped} skipped (filtered/fake)
+                  </p>
+                </div>
+              )}
+
               {/* Cancel button for running jobs */}
-              {(activeProgress.status === 'running' || activeProgress.status === 'queued') && (
+              {(activeProgress.status === 'running' || activeProgress.status === 'processing' || activeProgress.status === 'queued') && (
                 <button
                   onClick={handleCancelJob}
                   className="w-full mt-3 flex items-center justify-center gap-2 py-2 bg-red-50 border border-red-200 text-red-700 font-semibold text-xs rounded-lg hover:bg-red-100 transition"
@@ -908,19 +1070,30 @@ export default function BulkEmailCenter() {
               )}
 
               <p className="text-[10px] text-gray-500 mt-2 text-center">
-                {activeProgress.status === 'running' || activeProgress.status === 'queued' ? (
+                {activeProgress.status === 'running' || activeProgress.status === 'processing' || activeProgress.status === 'queued' ? (
                   <>Polling every 2.5s · </>
                 ) : (
                   <>Final result · </>
                 )}
-                Job ID: <span className="font-mono">{activeProgress.jobId?.substring(0, 12) || '—'}...</span>
+                Job ID: <span className="font-mono">{(activeProgress.jobId || '—').substring(0, 12)}...</span>
               </p>
 
+              {/* Duration */}
+              {activeProgress.durationMs && activeProgress.durationMs > 0 && (
+                <p className="text-[10px] text-gray-400 text-center mt-1">
+                  Duration: {formatDuration(activeProgress.durationMs)}
+                </p>
+              )}
+
+              {/* Error message */}
+              {activeProgress.error && (
+                <div className="mt-2 p-2 bg-red-50 border border-red-200 rounded text-[10px] text-red-700">
+                  <strong>Error:</strong> {activeProgress.error}
+                </div>
+              )}
+
               {/* Clear completed job */}
-              {(activeProgress.status === 'completed' ||
-                activeProgress.status === 'completed_with_errors' ||
-                activeProgress.status === 'failed' ||
-                activeProgress.status === 'cancelled') && (
+              {(['completed', 'completed_with_errors', 'failed', 'cancelled'].includes(activeProgress.status)) && (
                 <button
                   onClick={() => {
                     setActiveJobId(null);
@@ -934,7 +1107,7 @@ export default function BulkEmailCenter() {
             </div>
           )}
 
-          {/* Quick stats card */}
+          {/* ═══ FILE SUMMARY CARD ═══ */}
           {preview && (
             <div className="bg-white rounded-xl border border-gray-200 p-4">
               <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wide mb-3">File Summary</h3>
@@ -948,12 +1121,28 @@ export default function BulkEmailCenter() {
                   <span className="font-mono text-gray-900">{file ? formatBytes(file.size) : '—'}</span>
                 </div>
                 <div className="flex items-center justify-between text-xs">
-                  <span className="text-gray-600">Total Rows</span>
+                  <span className="text-gray-600">Total Rows/Lines</span>
                   <span className="font-mono text-gray-900">{preview.totalRows}</span>
+                </div>
+                {totalLinesScanned > 0 && totalLinesScanned !== preview.totalRows && (
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-gray-600">Data Lines Scanned</span>
+                    <span className="font-mono text-gray-900">{totalLinesScanned}</span>
+                  </div>
+                )}
+                {totalEmailsFound > 0 && (
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-gray-600">Total Emails Found</span>
+                    <span className="font-mono text-purple-700 font-bold">{totalEmailsFound}</span>
+                  </div>
+                )}
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-gray-600">Format</span>
+                  <span className="font-mono text-gray-900">{preview.detectedFormat || 'auto'}</span>
                 </div>
                 <div className="flex items-center justify-between text-xs">
                   <span className="text-gray-600">Separator</span>
-                  <span className="font-mono text-gray-900">{preview.separator || 'auto'}</span>
+                  <span className="font-mono text-gray-900">{preview.detectedSeparator || preview.separator || 'auto'}</span>
                 </div>
                 <div className="flex items-center justify-between text-xs">
                   <span className="text-gray-600">Has Name Column</span>
@@ -961,14 +1150,28 @@ export default function BulkEmailCenter() {
                     {preview.hasNameColumn ? 'Yes' : 'No'}
                   </span>
                 </div>
-                {preview.hasHeaderRow !== undefined && (
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-gray-600">Header Row</span>
+                  <span className={`font-semibold ${preview.hasHeaderRow ? 'text-emerald-600' : 'text-gray-400'}`}>
+                    {preview.hasHeaderRow ? 'Detected' : 'None'}
+                  </span>
+                </div>
+
+                {/* Breakdown */}
+                <div className="mt-2 pt-2 border-t border-gray-100 space-y-1">
                   <div className="flex items-center justify-between text-xs">
-                    <span className="text-gray-600">Header Row</span>
-                    <span className={`font-semibold ${preview.hasHeaderRow ? 'text-emerald-600' : 'text-gray-400'}`}>
-                      {preview.hasHeaderRow ? 'Detected' : 'None'}
-                    </span>
+                    <span className="text-emerald-600 font-semibold">✅ Valid Unique</span>
+                    <span className="font-black text-emerald-700">{preview.validRecipients}</span>
                   </div>
-                )}
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-red-600 font-semibold">❌ Invalid</span>
+                    <span className="font-black text-red-700">{preview.invalidRecipients}</span>
+                  </div>
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-amber-600 font-semibold">🔁 Duplicates</span>
+                    <span className="font-black text-amber-700">{preview.duplicateRecipients}</span>
+                  </div>
+                </div>
               </div>
             </div>
           )}
@@ -999,7 +1202,14 @@ export default function BulkEmailCenter() {
                     className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-gray-200 rounded-lg text-xs font-medium text-gray-700 hover:bg-gray-50"
                   >
                     <Copy className="w-3 h-3" />
-                    Copy All Valid
+                    Copy Valid
+                  </button>
+                  <button
+                    onClick={downloadValidEmailsCsv}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-gray-200 rounded-lg text-xs font-medium text-gray-700 hover:bg-gray-50"
+                  >
+                    <Download className="w-3 h-3" />
+                    Download CSV
                   </button>
                   <button
                     onClick={() => setShowAllRecipients(false)}
@@ -1019,7 +1229,7 @@ export default function BulkEmailCenter() {
                     value={recipientSearch}
                     onChange={(e) => setRecipientSearch(e.target.value)}
                     placeholder="Search by email or name..."
-                    className="w-full pl-8 pr-3 py-2 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+                    className="w-full pl-8 pr-8 py-2 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-purple-500 focus:border-transparent"
                   />
                   {recipientSearch && (
                     <button
@@ -1052,23 +1262,31 @@ export default function BulkEmailCenter() {
                   ))}
                 </div>
               </div>
+
+              {/* Search results info */}
+              {recipientSearch && (
+                <p className="mt-2 text-[10px] text-gray-500">
+                  Found {filteredRecipients.length} match{filteredRecipients.length !== 1 ? 'es' : ''} for "{recipientSearch}"
+                </p>
+              )}
             </div>
 
             {/* Recipients list */}
             <div className="flex-1 overflow-y-auto">
               {filteredRecipients.length === 0 ? (
                 <div className="p-8 text-center text-gray-500 text-sm">
-                  {recipientSearch ? 'No recipients match your search' : 'No recipients found'}
+                  {recipientSearch ? `No recipients match "${recipientSearch}"` : 'No recipients found'}
                 </div>
               ) : (
                 <>
                   {/* Table header */}
-                  <div className="sticky top-0 bg-gray-50 border-b border-gray-200 px-4 py-2 grid grid-cols-[40px_40px_1fr_180px_80px] gap-2 text-[10px] font-bold uppercase text-gray-500">
+                  <div className="sticky top-0 bg-gray-50 border-b border-gray-200 px-4 py-2 grid grid-cols-[40px_32px_1fr_150px_50px_60px] gap-2 text-[10px] font-bold uppercase text-gray-500">
                     <span>#</span>
                     <span>✓</span>
                     <span>Email</span>
                     <span>Name</span>
-                    <span className="text-right">Actions</span>
+                    <span>Row</span>
+                    <span className="text-right">Copy</span>
                   </div>
 
                   {/* Rows */}
@@ -1077,7 +1295,7 @@ export default function BulkEmailCenter() {
                     return (
                       <div
                         key={globalIdx}
-                        className={`px-4 py-2 grid grid-cols-[40px_40px_1fr_180px_80px] gap-2 items-center border-b border-gray-50 text-xs hover:bg-gray-50 transition ${
+                        className={`px-4 py-2 grid grid-cols-[40px_32px_1fr_150px_50px_60px] gap-2 items-center border-b border-gray-50 text-xs hover:bg-gray-50 transition ${
                           !r.isValid ? 'bg-red-50/50' : ''
                         }`}
                       >
@@ -1096,6 +1314,7 @@ export default function BulkEmailCenter() {
                           )}
                         </div>
                         <span className="text-gray-600 truncate">{r.name || '—'}</span>
+                        <span className="text-gray-400 font-mono text-[10px]">{r.row || '—'}</span>
                         <div className="flex justify-end">
                           <button
                             onClick={() => copyEmail(r.email, globalIdx)}
@@ -1132,7 +1351,6 @@ export default function BulkEmailCenter() {
                   >
                     Prev
                   </button>
-                  {/* Page numbers (show max 7) */}
                   {Array.from({ length: Math.min(7, totalPages) }, (_, i) => {
                     let page: number;
                     if (totalPages <= 7) {
@@ -1182,10 +1400,13 @@ export default function BulkEmailCenter() {
             className="relative w-full max-w-2xl bg-white shadow-2xl overflow-hidden flex flex-col"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="p-4 border-b border-gray-200 flex items-center justify-between">
+            <div className="p-4 border-b border-gray-200 flex items-center justify-between bg-gradient-to-r from-purple-50 to-pink-50">
               <div className="flex items-center gap-2">
                 <History className="w-5 h-5 text-purple-600" />
                 <h2 className="text-lg font-bold text-gray-900">Email Job History</h2>
+                {jobs.length > 0 && (
+                  <span className="text-xs text-gray-500">({jobs.length} jobs)</span>
+                )}
               </div>
               <div className="flex gap-2">
                 <button
@@ -1210,7 +1431,11 @@ export default function BulkEmailCenter() {
                   <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
                 </div>
               ) : jobs.length === 0 ? (
-                <div className="p-8 text-center text-gray-500 text-sm">No email jobs yet</div>
+                <div className="p-8 text-center text-gray-500">
+                  <Mail className="w-10 h-10 text-gray-300 mx-auto mb-3" />
+                  <p className="text-sm font-medium">No email jobs yet</p>
+                  <p className="text-xs text-gray-400 mt-1">Start your first bulk send above</p>
+                </div>
               ) : (
                 <div className="divide-y divide-gray-100">
                   {jobs.map((j) => (
@@ -1224,18 +1449,21 @@ export default function BulkEmailCenter() {
                           <p className="text-sm font-semibold text-gray-900 truncate">{j.subject}</p>
                           <p className="text-xs text-gray-500 truncate mt-0.5">{j.fileName}</p>
                           <div className="flex items-center gap-2 mt-2 flex-wrap">
-                            <span
-                              className={`px-1.5 py-0.5 rounded text-[9px] font-bold border ${statusColor(j.status)}`}
-                            >
-                              {j.status}
+                            <span className="flex items-center gap-1">
+                              {statusIcon(j.status)}
+                              <span
+                                className={`px-1.5 py-0.5 rounded text-[9px] font-bold border ${statusColor(j.status)}`}
+                              >
+                                {j.status}
+                              </span>
                             </span>
                             <span className="text-[10px] text-gray-500">
-                              <span className="font-bold text-emerald-600">{j.sent}</span> /{' '}
-                              <span className="font-bold text-red-600">{j.failed}</span> /{' '}
-                              <span className="font-bold text-gray-700">{j.validRecipients}</span>
+                              <span className="font-bold text-emerald-600">{j.sent ?? 0}</span> sent /{' '}
+                              <span className="font-bold text-red-600">{j.failed ?? 0}</span> failed /{' '}
+                              <span className="font-bold text-gray-700">{j.validRecipients ?? j.totalRecipients ?? 0}</span> total
                             </span>
-                            {j.status === 'running' && (
-                              <span className="text-[10px] text-blue-600 font-bold">{j.progress}%</span>
+                            {(j.status === 'running' || j.status === 'processing') && (
+                              <span className="text-[10px] text-blue-600 font-bold">{j.progress ?? 0}%</span>
                             )}
                             <span className="text-[10px] text-gray-400">
                               <Clock className="w-2.5 h-2.5 inline mr-0.5" />
@@ -1270,8 +1498,11 @@ export default function BulkEmailCenter() {
             className="relative w-full max-w-4xl max-h-[85vh] bg-white rounded-xl shadow-2xl overflow-hidden flex flex-col"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="p-4 border-b border-gray-200 flex items-center justify-between">
-              <h2 className="text-lg font-bold text-gray-900">Email Job Detail</h2>
+            <div className="p-4 border-b border-gray-200 flex items-center justify-between bg-gradient-to-r from-purple-50 to-pink-50">
+              <div className="flex items-center gap-2">
+                <Mail className="w-5 h-5 text-purple-600" />
+                <h2 className="text-lg font-bold text-gray-900">Email Job Detail</h2>
+              </div>
               <button
                 onClick={() => {
                   setJobDetailId(null);
@@ -1290,54 +1521,79 @@ export default function BulkEmailCenter() {
                 </div>
               ) : (
                 <div className="space-y-4">
+                  {/* Subject */}
                   <div>
                     <p className="text-xs font-bold uppercase text-gray-500">Subject</p>
-                    <p className="text-sm text-gray-900 mt-0.5">{jobDetail.subject}</p>
+                    <p className="text-sm text-gray-900 mt-0.5 font-medium">{jobDetail.subject}</p>
                   </div>
 
+                  {/* Status badge */}
+                  <div className="flex items-center gap-2">
+                    {statusIcon(jobDetail.status)}
+                    <span className={`px-2 py-0.5 rounded text-xs font-bold border ${statusColor(jobDetail.status)}`}>
+                      {jobDetail.status}
+                    </span>
+                    {jobDetail.progress !== undefined && jobDetail.progress < 100 && (
+                      <span className="text-xs text-blue-600 font-bold">{jobDetail.progress}%</span>
+                    )}
+                  </div>
+
+                  {/* Stats grid */}
                   <div className="grid grid-cols-5 gap-2">
-                    <div className="p-2 bg-gray-50 rounded text-center">
+                    <div className="p-2 bg-gray-50 rounded text-center border border-gray-100">
                       <p className="text-[10px] uppercase font-bold text-gray-500">Total</p>
-                      <p className="text-lg font-black text-gray-900">{jobDetail.totalRecipients}</p>
+                      <p className="text-lg font-black text-gray-900">{jobDetail.totalRecipients ?? 0}</p>
                     </div>
-                    <div className="p-2 bg-blue-50 rounded text-center">
+                    <div className="p-2 bg-blue-50 rounded text-center border border-blue-100">
                       <p className="text-[10px] uppercase font-bold text-blue-600">Valid</p>
-                      <p className="text-lg font-black text-blue-700">{jobDetail.validRecipients}</p>
+                      <p className="text-lg font-black text-blue-700">{jobDetail.validRecipients ?? 0}</p>
                     </div>
-                    <div className="p-2 bg-emerald-50 rounded text-center">
+                    <div className="p-2 bg-emerald-50 rounded text-center border border-emerald-100">
                       <p className="text-[10px] uppercase font-bold text-emerald-600">Sent</p>
-                      <p className="text-lg font-black text-emerald-700">{jobDetail.sent}</p>
+                      <p className="text-lg font-black text-emerald-700">{jobDetail.sent ?? 0}</p>
                     </div>
-                    <div className="p-2 bg-red-50 rounded text-center">
+                    <div className="p-2 bg-red-50 rounded text-center border border-red-100">
                       <p className="text-[10px] uppercase font-bold text-red-600">Failed</p>
-                      <p className="text-lg font-black text-red-700">{jobDetail.failed}</p>
+                      <p className="text-lg font-black text-red-700">{jobDetail.failed ?? 0}</p>
                     </div>
-                    <div className="p-2 bg-amber-50 rounded text-center">
+                    <div className="p-2 bg-amber-50 rounded text-center border border-amber-100">
                       <p className="text-[10px] uppercase font-bold text-amber-600">Skipped</p>
-                      <p className="text-lg font-black text-amber-700">{jobDetail.skipped}</p>
+                      <p className="text-lg font-black text-amber-700">{jobDetail.skipped ?? 0}</p>
                     </div>
                   </div>
 
-                  <div className="text-xs text-gray-500 space-y-1">
-                    <p>
-                      File:{' '}
-                      <span className="font-semibold text-gray-700">{jobDetail.fileName}</span>{' '}
-                      ({formatBytes(jobDetail.fileSizeBytes)})
-                    </p>
-                    <p>
-                      Status:{' '}
-                      <span
-                        className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${statusColor(
-                          jobDetail.status
-                        )}`}
-                      >
-                        {jobDetail.status}
+                  {/* Metadata */}
+                  <div className="text-xs text-gray-500 space-y-1.5 p-3 bg-gray-50 rounded-lg">
+                    <div className="flex justify-between">
+                      <span>File:</span>
+                      <span className="font-semibold text-gray-700">
+                        {jobDetail.fileName} ({formatBytes(jobDetail.fileSizeBytes)})
                       </span>
-                    </p>
-                    <p>Started: {formatDate(jobDetail.startedAt)}</p>
-                    <p>Completed: {formatDate(jobDetail.completedAt)}</p>
-                    <p>Duration: {formatDuration(jobDetail.durationMs)}</p>
-                    <p>Created By: {jobDetail.createdBy?.email || '—'}</p>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Started:</span>
+                      <span className="text-gray-700">{formatDate(jobDetail.startedAt)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Completed:</span>
+                      <span className="text-gray-700">{formatDate(jobDetail.completedAt)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Duration:</span>
+                      <span className="text-gray-700">{formatDuration(jobDetail.durationMs)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Created By:</span>
+                      <span className="text-gray-700">{jobDetail.createdBy?.email || '—'}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Created At:</span>
+                      <span className="text-gray-700">{formatDate(jobDetail.createdAt)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Job ID:</span>
+                      <span className="font-mono text-gray-700 text-[10px]">{jobDetail._id}</span>
+                    </div>
                   </div>
 
                   {/* HTML preview in job detail */}
@@ -1358,16 +1614,21 @@ export default function BulkEmailCenter() {
                     </details>
                   )}
 
+                  {/* Failures detail */}
                   {jobDetail.failures && jobDetail.failures.length > 0 && (
                     <div>
-                      <h4 className="text-sm font-bold text-red-700 mb-2">
+                      <h4 className="text-sm font-bold text-red-700 mb-2 flex items-center gap-2">
+                        <XCircle className="w-4 h-4" />
                         Failures ({jobDetail.failures.length})
                       </h4>
                       <div className="max-h-64 overflow-y-auto space-y-1">
                         {jobDetail.failures.map((f, idx) => (
-                          <div key={idx} className="p-2 bg-red-50 border border-red-100 rounded text-[10px]">
-                            <p className="font-mono text-red-700">{f.email}</p>
-                            <p className="text-red-600">{f.errorMessage}</p>
+                          <div key={idx} className="p-2 bg-red-50 border border-red-100 rounded text-[10px] flex items-start gap-2">
+                            <XCircle className="w-3 h-3 text-red-500 flex-shrink-0 mt-0.5" />
+                            <div>
+                              <p className="font-mono text-red-700">{f.email}</p>
+                              <p className="text-red-600">{f.errorMessage}</p>
+                            </div>
                           </div>
                         ))}
                       </div>
@@ -1399,15 +1660,12 @@ export default function BulkEmailCenter() {
                 <Eye className="w-5 h-5 text-purple-600" />
                 <h2 className="text-lg font-bold text-gray-900">Email Preview</h2>
               </div>
-              <div className="flex gap-2">
-                {/* Device toggles - future enhancement */}
-                <button
-                  onClick={() => setShowRenderedPreview(false)}
-                  className="p-1.5 text-gray-600 hover:bg-gray-100 rounded"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
+              <button
+                onClick={() => setShowRenderedPreview(false)}
+                className="p-1.5 text-gray-600 hover:bg-gray-100 rounded"
+              >
+                <X className="w-4 h-4" />
+              </button>
             </div>
 
             {/* Sample recipient info */}
@@ -1424,6 +1682,9 @@ export default function BulkEmailCenter() {
                 <p className="text-[10px] text-gray-500 mt-0.5">
                   <code className="bg-white px-1 rounded border border-gray-200">{'{{name}}'}</code> ={' '}
                   <span className="text-purple-600 font-semibold">{sampleRecipient?.name || 'Friend'}</span>
+                  <br />
+                  <code className="bg-white px-1 rounded border border-gray-200">{'{{email}}'}</code> ={' '}
+                  <span className="text-purple-600 font-semibold">{sampleRecipient?.email || 'test@example.com'}</span>
                 </p>
               </div>
             </div>
